@@ -10,25 +10,33 @@ def home():
 
 
 def run_bot():
+    print("🧪 Entered bot thread...")
+
     try:
-        from bot import start_bot
-        print("🤖 Starting Telegram bot...")
-        start_bot()
+        import bot
+        print("✅ bot.py imported successfully")
+
+        print("🚀 Starting Telegram bot...")
+        bot.start_bot()
+
     except Exception as e:
-        print("❌ Bot crashed:", e)
+        print("❌ BOT ERROR:", e)
 
 
 if __name__ == "__main__":
-    # 🌍 Print Render IP
+    print("🟢 App starting...")
+
+    # 🌍 Print IP
     try:
         ip = requests.get("https://api.ipify.org").text
         print(f"🌍 Render Public IP: {ip}")
     except Exception as e:
         print("IP fetch failed:", e)
 
-    # 🚀 START BOT THREAD (IMPORTANT)
+    print("🧵 Starting bot thread...")
+
     bot_thread = threading.Thread(target=run_bot)
-    bot_thread.daemon = True   # 👈 VERY IMPORTANT
+    bot_thread.daemon = True
     bot_thread.start()
 
     print("🚀 Starting Flask server...")
