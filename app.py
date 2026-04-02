@@ -8,13 +8,15 @@ app = Flask(__name__)
 def home():
     return "Bot is running"
 
+
 def run_bot():
     try:
         from bot import start_bot
         print("🤖 Starting Telegram bot...")
         start_bot()
     except Exception as e:
-        print("❌ Bot error:", e)
+        print("❌ Bot crashed:", e)
+
 
 if __name__ == "__main__":
     # 🌍 Print Render IP
@@ -24,9 +26,11 @@ if __name__ == "__main__":
     except Exception as e:
         print("IP fetch failed:", e)
 
-    # 🚀 Run bot in background thread
+    # 🚀 START BOT THREAD (IMPORTANT)
     bot_thread = threading.Thread(target=run_bot)
+    bot_thread.daemon = True   # 👈 VERY IMPORTANT
     bot_thread.start()
 
     print("🚀 Starting Flask server...")
+
     app.run(host="0.0.0.0", port=3000)
