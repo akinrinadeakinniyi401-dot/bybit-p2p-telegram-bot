@@ -1,6 +1,8 @@
 from flask import Flask
 import requests
 import threading
+import sys
+import os
 
 app = Flask(__name__)
 
@@ -13,6 +15,9 @@ def run_bot():
     print("🧪 Entered bot thread...")
 
     try:
+        # 🔥 Fix import path issue on Render
+        sys.path.append(os.getcwd())
+
         import bot
         print("✅ bot.py imported successfully")
 
@@ -26,7 +31,7 @@ def run_bot():
 if __name__ == "__main__":
     print("🟢 App starting...")
 
-    # 🌍 Print IP
+    # 🌍 Print Render Public IP
     try:
         ip = requests.get("https://api.ipify.org").text
         print(f"🌍 Render Public IP: {ip}")
@@ -35,10 +40,12 @@ if __name__ == "__main__":
 
     print("🧵 Starting bot thread...")
 
+    # 🚀 Start bot in background
     bot_thread = threading.Thread(target=run_bot)
     bot_thread.daemon = True
     bot_thread.start()
 
     print("🚀 Starting Flask server...")
 
+    # 🌐 Keep service alive for Render
     app.run(host="0.0.0.0", port=3000)
