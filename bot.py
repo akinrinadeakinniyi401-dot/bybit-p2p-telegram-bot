@@ -4,7 +4,7 @@ from telegram.ext import (
     MessageHandler, ContextTypes, filters
 )
 from config import TELEGRAM_TOKEN, ADMIN_ID
-from bybit import get_payment_methods, post_buy_ad, format_payment_methods
+from bybit import get_payment_methods, post_buy_ad
 
 # 🧠 Store user settings + state
 user_settings = {}
@@ -65,7 +65,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_settings["coin"] = coin
         await query.edit_message_text(f"✅ Coin set to {coin}")
 
-    # 🌍 Currency
+    # 🌍 Set Currency
     elif data == "currency":
         keyboard = [
             [InlineKeyboardButton("NGN", callback_data="cur_NGN")],
@@ -79,12 +79,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_settings["currency"] = currency
         await query.edit_message_text(f"✅ Currency set to {currency}")
 
-    # 📊 Margin
+    # 📊 Set Margin
     elif data == "margin":
         user_state["action"] = "margin"
         await query.edit_message_text("Enter margin (e.g 1.5):")
 
-    # 💵 Limits
+    # 💵 Set Limits
     elif data == "limits":
         user_state["action"] = "min"
         await query.edit_message_text("Enter MIN amount:")
@@ -111,21 +111,28 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
 
-        except:
-            await query.edit_message_text("❌ Failed to load payment methods")
+        except Exception as e:
+            await query.edit_message_text(f"❌ Failed to load payments\n{e}")
 
     elif data.startswith("pay_"):
         pid = data.split("_")[1]
         user_settings["payment"] = pid
-        await query.edit_message_text(f"✅ Payment method selected (ID: {pid})")
+        await query.edit_message_text(f"✅ Payment selected (ID: {pid})")
 
     # 🚀 POST AD
     elif data == "post":
         await query.edit_message_text("⏳ Posting ad...")
 
-        result = post_buy_ad(user_settings)
+        # ❗ Check if payment is selected
+        if not user_settings.get("payment"):
+            await query.edit_message_text("❌ Please select a payment method first")
+            return
 
-        await query.edit_message_text(f"📡 Response:\n{result}")
+        try:
+            result = post_buy_ad(user_settings)
+            await query.edit_message_text(f"📡 Response:\n{result}")
+        except Exception as e:
+            await query.edit_message_text(f"❌ Error posting ad:\n{e}")
 
 
 # 📝 HANDLE TEXT INPUTS
@@ -135,26 +142,28 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = update.message.text
 
-    # 📊 Margin input
+    # 📊 Margin
     if user_state.get("action") == "margin":
         user_settings["margin"] = text
         user_state["action"] = None
         await update.message.reply_text(f"✅ Margin set to {text}")
 
-    # 💵 Min input
+    # 💵 Min
     elif user_state.get("action") == "min":
         user_settings["min"] = text
         user_state["action"] = "max"
         await update.message.reply_text("Enter MAX amount:")
 
-    # 💵 Max input
+    # 💵 Max
     elif user_state.get("action") == "max":
         user_settings["max"] = text
         user_state["action"] = None
-        await update.message.reply_text(f"✅ Limits set: {user_settings['min']} - {text}")
+        await update.message.reply_text(
+            f"✅ Limits set:\nMin: {user_settings['min']}\nMax: {text}"
+        )
 
 
-# 🚀 START BOT
+# 🚀 START BOT (UPDATED FOR RENDER)
 def start_bot():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
@@ -163,4 +172,6 @@ def start_bot():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
     print("🤖 Bot is running...")
-    app.run_polling()
+
+    # 🔥 IMPORTANT FIX FOR RENDER
+    app.run_polling(stop_signals=None)
