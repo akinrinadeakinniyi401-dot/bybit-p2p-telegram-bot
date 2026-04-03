@@ -12,7 +12,7 @@ BASE_URL = "https://api.bybit.com"
 
 
 # ─────────────────────────────────────────
-# 🔐 Generate Signature (HMAC SHA256)
+# 🔐 Generate Signature
 # Bybit spec: timestamp + api_key + recv_window + payload
 # ─────────────────────────────────────────
 def generate_signature(timestamp: str, payload: str, recv_window="5000"):
@@ -47,59 +47,45 @@ def get_headers(payload=""):
 def get_payment_methods():
     endpoint = "/v5/p2p/user/payment/list"
     url = BASE_URL + endpoint
-
     headers = get_headers("")
-
     try:
         response = requests.get(url, headers=headers, timeout=10)
-
-        # 🔍 Log everything for diagnosis
-        logger.info(f"[Bybit] GET {url}")
-        logger.info(f"[Bybit] Status code: {response.status_code}")
-        logger.info(f"[Bybit] Response headers: {dict(response.headers)}")
-        logger.info(f"[Bybit] Raw response body: '{response.text}'")
-
+        logger.info(f"[Bybit] Payment methods status: {response.status_code}")
+        logger.info(f"[Bybit] Raw body: '{response.text}'")
         if not response.text.strip():
             return {
                 "retCode": -1,
-                "retMsg": (
-                    "Bybit returned an empty response. "
-                    "This almost always means your Render IP is not whitelisted on Bybit. "
-                    f"Go to Bybit API Management → edit your key → add the Render IP shown in your startup logs."
-                )
+                "retMsg": "Empty response — add Render IP to Bybit API whitelist"
             }
-
         return response.json()
-
-    except requests.exceptions.Timeout:
-        logger.error("[Bybit] Request timed out")
-        return {"retCode": -1, "retMsg": "Request timed out — Bybit did not respond in 10s"}
     except Exception as e:
         logger.error(f"[Bybit] get_payment_methods error: {e}")
         return {"error": str(e)}
 
 
 # ─────────────────────────────────────────
-# 🚀 Post BUY Ad
+# 🔄 Update / Relist Ad
+# POST /v5/p2p/item/update
+# actionType:
+#   "ACTIVE"  → relist / refresh ad (keeps it at top)
+#   "MODIFY"  → modify ad details
 # ─────────────────────────────────────────
-def post_buy_ad(settings):
-    endpoint = "/v5/p2p/item/create"
+def update_ad(settings):
+    endpoint = "/v5/p2p/item/update"
     url = BASE_URL + endpoint
 
     body = {
-        "tokenId": settings["coin"],
-        "currencyId": settings["currency"],
-        "side": "0",                                   # 0 = BUY
-        "priceType": "1",                              # 1 = floating/variable rate
-        "premium": settings["margin"],
-        "price": "0",
-        "minAmount": settings["min"],
-        "maxAmount": settings["max"],
-        "remark": "Auto bot ad",
-        "paymentIds": [settings["payment"]],
-        "quantity": settings.get("quantity", "10000"),
+        "id":          settings["ad_id"],
+        "priceType":   settings.get("price_type", "1"),   # 1 = floating
+        "premium":     settings.get("margin", "0"),
+        "price":       settings.get("price", "0"),
+        "minAmount":   settings.get("min", "1000"),
+        "maxAmount":   settings.get("max", "100000"),
+        "remark":      settings.get("remark", ""),
+        "paymentIds":  [settings.get("payment", "-1")],   # -1 = keep existing
+        "quantity":    settings.get("quantity", "10000"),
         "paymentPeriod": "15",
-        "itemType": "ORIGIN",
+        "actionType":  "ACTIVE",                          # relist/refresh
         "tradingPreferenceSet": {
             "hasUnPostAd": "0",
             "isKyc": "1",
@@ -120,26 +106,16 @@ def post_buy_ad(settings):
 
     try:
         response = requests.post(url, headers=headers, data=payload, timeout=10)
-
-        # 🔍 Log everything for diagnosis
-        logger.info(f"[Bybit] POST {url}")
-        logger.info(f"[Bybit] Status code: {response.status_code}")
-        logger.info(f"[Bybit] Raw response body: '{response.text}'")
+        logger.info(f"[Bybit] Update ad status: {response.status_code}")
+        logger.info(f"[Bybit] Raw body: '{response.text}'")
 
         if not response.text.strip():
             return {
                 "retCode": -1,
-                "retMsg": (
-                    "Bybit returned an empty response. "
-                    "Your Render IP is likely not whitelisted on Bybit."
-                )
+                "retMsg": "Empty response — add Render IP to Bybit API whitelist"
             }
 
         return response.json()
-
-    except requests.exceptions.Timeout:
-        logger.error("[Bybit] Post ad request timed out")
-        return {"retCode": -1, "retMsg": "Request timed out"}
     except Exception as e:
-        logger.error(f"[Bybit] post_buy_ad error: {e}")
+        logger.error(f"[Bybit] update_ad error: {e}")
         return {"error": str(e)}
