@@ -152,10 +152,14 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-# 🔧 BUILD BOT — just registers handlers and returns the app
-# Webhook registration is handled in app.py
+# 🔧 BUILD BOT — no Updater, webhook mode only
 def start_bot():
-    application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    application = (
+        ApplicationBuilder()
+        .token(TELEGRAM_TOKEN)
+        .updater(None)          # ← disables Updater entirely, webhook doesn't need it
+        .build()
+    )
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CallbackQueryHandler(button_handler))
