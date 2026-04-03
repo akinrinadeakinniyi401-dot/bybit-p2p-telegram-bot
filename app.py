@@ -12,7 +12,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-bot_app = None  # Will be set during startup
+bot_app = None  # Set during startup
 
 
 # 🌐 Health check
@@ -42,14 +42,13 @@ def webhook():
 
 
 async def setup_bot():
-    """Initialise bot and register webhook with Telegram."""
     from bot import start_bot
     render_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
     if not render_url:
         raise ValueError("RENDER_EXTERNAL_URL environment variable is not set")
     webhook_url = f"{render_url}/webhook"
     logger.info(f"Setting webhook: {webhook_url}")
-    bot = start_bot()                          # build handlers, return app
+    bot = start_bot()
     await bot.initialize()
     await bot.bot.set_webhook(url=webhook_url)
     logger.info("✅ Webhook registered successfully")
@@ -59,7 +58,6 @@ async def setup_bot():
 if __name__ == "__main__":
     logger.info("🟢 App starting...")
 
-    # Run async setup synchronously before Flask starts
     try:
         bot_app = asyncio.run(setup_bot())
         logger.info("🤖 Bot ready")
@@ -67,6 +65,7 @@ if __name__ == "__main__":
         logger.exception(f"❌ Failed to start bot: {e}")
         raise SystemExit(1)
 
-    port = int(os.environ.get("PORT", 3000))
+    # 🔑 Render requires PORT env var — defaults to 10000
+    port = int(os.environ.get("PORT", 10000))
     logger.info(f"🚀 Starting Flask on port {port}")
     app.run(host="0.0.0.0", port=port)
