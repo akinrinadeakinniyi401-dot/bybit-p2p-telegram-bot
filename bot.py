@@ -1,3 +1,5 @@
+import asyncio
+import logging
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
@@ -5,6 +7,8 @@ from telegram.ext import (
 )
 from config import TELEGRAM_TOKEN, ADMIN_ID
 from bybit import get_payment_methods, post_buy_ad
+
+logger = logging.getLogger(__name__)
 
 # 🧠 Store user settings + state
 user_settings = {}
@@ -17,7 +21,7 @@ def is_admin(user_id):
 
 
 # ─────────────────────────────────────────
-# 🏠 MAIN MENU keyboard builder
+# 🏠 MAIN MENU
 # ─────────────────────────────────────────
 def main_menu_keyboard():
     return InlineKeyboardMarkup([
@@ -27,17 +31,17 @@ def main_menu_keyboard():
         [InlineKeyboardButton("💵 Set Min/Max", callback_data="limits")],
         [InlineKeyboardButton("🏦 Select Payment Method", callback_data="payments")],
         [InlineKeyboardButton("🚀 Post Ad", callback_data="post")],
-        [InlineKeyboardButton("📋 View Current Settings", callback_data="view_settings")],
+        [InlineKeyboardButton("📋 View Settings", callback_data="menu")],
     ])
 
 
 def main_menu_text():
-    coin = user_settings.get("coin", "USDT")
+    coin     = user_settings.get("coin", "USDT")
     currency = user_settings.get("currency", "NGN")
-    margin = user_settings.get("margin", "0")
-    min_amt = user_settings.get("min", "1000")
-    max_amt = user_settings.get("max", "100000")
-    payment = user_settings.get("payment_name", user_settings.get("payment", "Not selected"))
+    margin   = user_settings.get("margin", "0")
+    min_amt  = user_settings.get("min", "1000")
+    max_amt  = user_settings.get("max", "100000")
+    payment  = user_settings.get("payment_name", "❗ Not selected")
     return (
         "⚙️ *P2P Bot Control Panel*\n\n"
         f"🪙 Coin: `{coin}`\n"
@@ -48,27 +52,25 @@ def main_menu_text():
     )
 
 
-# Back button shortcut
 def back_button():
     return [[InlineKeyboardButton("⬅️ Back to Menu", callback_data="menu")]]
 
 
 # ─────────────────────────────────────────
-# 🚀 /start COMMAND
+# /start and /menu
 # ─────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ Unauthorized")
         return
 
-    # Set defaults only if not already set
     user_settings.setdefault("coin", "USDT")
     user_settings.setdefault("currency", "NGN")
     user_settings.setdefault("margin", "0")
     user_settings.setdefault("min", "1000")
     user_settings.setdefault("max", "100000")
     user_settings.setdefault("payment", "")
-    user_settings.setdefault("payment_name", "Not selected")
+    user_settings.setdefault("payment_name", "❗ Not selected")
 
     await update.message.reply_text(
         main_menu_text(),
@@ -77,9 +79,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-# ─────────────────────────────────────────
-# 📋 /menu COMMAND — same as start
-# ─────────────────────────────────────────
 async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start(update, context)
 
@@ -89,10 +88,10 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    await query.answer()          # answer immediately to stop the loading spinner
     data = query.data
 
-    # ─── 🏠 Back to main menu ───
+    # ── 🏠 Main menu ──
     if data == "menu":
         await query.edit_message_text(
             main_menu_text(),
@@ -100,20 +99,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
 
-    # ─── 📋 View current settings ───
-    elif data == "view_settings":
-        await query.edit_message_text(
-            main_menu_text(),
-            reply_markup=main_menu_keyboard(),
-            parse_mode="Markdown"
-        )
-
-    # ─── 💰 Set Coin ───
+    # ── 💰 Coin ──
     elif data == "coin":
         keyboard = [
             [InlineKeyboardButton("USDT", callback_data="coin_USDT"),
-             InlineKeyboardButton("BTC", callback_data="coin_BTC"),
-             InlineKeyboardButton("ETH", callback_data="coin_ETH")],
+             InlineKeyboardButton("BTC",  callback_data="coin_BTC"),
+             InlineKeyboardButton("ETH",  callback_data="coin_ETH")],
         ] + back_button()
         await query.edit_message_text(
             "💰 Select Coin:",
@@ -129,7 +120,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
 
-    # ─── 🌍 Set Currency ───
+    # ── 🌍 Currency ──
     elif data == "currency":
         keyboard = [
             [InlineKeyboardButton("NGN", callback_data="cur_NGN"),
@@ -153,71 +144,114 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
 
-    # ─── 📊 Set Margin ───
+    # ── 📊 Margin ──
     elif data == "margin":
         user_state["action"] = "margin"
         await query.edit_message_text(
-            "📊 Enter margin percentage (e.g. `1.5` for 1.5%):\n\n"
-            "ℹ️ This is the premium above market price.",
+            "📊 Type your margin percentage and send it here.\n\n"
+            "Example: `1.5` means 1.5% above market price",
             reply_markup=InlineKeyboardMarkup(back_button()),
             parse_mode="Markdown"
         )
 
-    # ─── 💵 Set Min/Max ───
+    # ── 💵 Min/Max ──
     elif data == "limits":
         user_state["action"] = "min"
         await query.edit_message_text(
-            "💵 Enter *minimum* order amount:",
+            "💵 Type the *minimum* order amount and send it here.\n\nExample: `1000`",
             reply_markup=InlineKeyboardMarkup(back_button()),
             parse_mode="Markdown"
         )
 
-    # ─── 🏦 Load Payment Methods from Bybit ───
+    # ── 🏦 Payment Methods (fetched live from Bybit) ──
     elif data == "payments":
-        await query.edit_message_text("⏳ Loading your Bybit payment methods...")
-        result = get_payment_methods()
-        try:
-            items = result["result"]["items"]
-            if not items:
-                await query.edit_message_text(
-                    "❌ No payment methods found on your Bybit account.\n"
-                    "Please add a payment method on Bybit P2P first.",
-                    reply_markup=InlineKeyboardMarkup(back_button())
-                )
-                return
+        await query.edit_message_text("⏳ Fetching your Bybit payment methods...")
 
-            keyboard = []
-            for m in items:
-                name = m.get("realName") or m.get("name", "Unknown")
-                pid = m["id"]
-                pay_type = m.get("paymentConfigVo", {}).get("paymentName", "")
-                label = f"{pay_type} — {name}" if pay_type else name
-                keyboard.append([
-                    InlineKeyboardButton(label, callback_data=f"pay_{pid}_{name[:20]}")
-                ])
-            keyboard += back_button()
+        # Run blocking Bybit API call in a thread so bot stays responsive
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, get_payment_methods)
 
+        logger.info(f"Bybit payment response: {result}")
+
+        # Handle API error
+        if "error" in result:
             await query.edit_message_text(
-                "🏦 Select your payment method:\n"
-                "_(These are loaded directly from your Bybit account)_",
-                reply_markup=InlineKeyboardMarkup(keyboard),
-                parse_mode="Markdown"
-            )
-
-        except Exception as e:
-            await query.edit_message_text(
-                f"❌ Failed to load payments\n\n`{e}`\n\n"
-                "Make sure your Bybit API key has P2P permissions.",
+                f"❌ API error: `{result['error']}`\n\n"
+                "Check that your Bybit API key is correct and has P2P permissions.",
                 reply_markup=InlineKeyboardMarkup(back_button()),
                 parse_mode="Markdown"
             )
+            return
+
+        ret_code = result.get("retCode", -1)
+        ret_msg  = result.get("retMsg", "Unknown error")
+
+        if ret_code != 0:
+            await query.edit_message_text(
+                f"❌ Bybit returned error:\n\n"
+                f"Code: `{ret_code}`\n"
+                f"Message: `{ret_msg}`\n\n"
+                "Common causes:\n"
+                "• API key not whitelisted (add Render IP)\n"
+                "• API key missing P2P permissions\n"
+                "• Invalid API key or secret",
+                reply_markup=InlineKeyboardMarkup(back_button()),
+                parse_mode="Markdown"
+            )
+            return
+
+        # Parse payment methods
+        try:
+            items = result["result"]["paymentConfigList"]
+        except (KeyError, TypeError):
+            # fallback: try items key
+            try:
+                items = result["result"]["items"]
+            except (KeyError, TypeError):
+                await query.edit_message_text(
+                    f"❌ Unexpected response format from Bybit:\n`{result}`",
+                    reply_markup=InlineKeyboardMarkup(back_button()),
+                    parse_mode="Markdown"
+                )
+                return
+
+        if not items:
+            await query.edit_message_text(
+                "❌ No payment methods found on your Bybit account.\n\n"
+                "Go to Bybit → P2P → Profile → Payment Methods and add one first.",
+                reply_markup=InlineKeyboardMarkup(back_button())
+            )
+            return
+
+        keyboard = []
+        for m in items:
+            # Bybit returns different field names depending on endpoint version
+            pid   = str(m.get("id", m.get("paymentId", "")))
+            pname = (m.get("realName") or
+                     m.get("accountNo") or
+                     m.get("name") or
+                     pid)
+            ptype = (m.get("paymentType") or
+                     m.get("paymentConfigVo", {}).get("paymentName", "") or
+                     "")
+            label = f"{ptype} — {pname}" if ptype else pname
+            # Truncate label to fit Telegram button (max 64 chars on callback_data)
+            safe_name = pname[:15].replace("_", "-")
+            keyboard.append([
+                InlineKeyboardButton(label[:60], callback_data=f"pay_{pid}_{safe_name}")
+            ])
+
+        keyboard += back_button()
+        await query.edit_message_text(
+            "🏦 Select your payment method:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
 
     elif data.startswith("pay_"):
-        # Format: pay_{id}_{name}
         parts = data.split("_", 2)
-        pid = parts[1]
+        pid   = parts[1]
         pname = parts[2] if len(parts) > 2 else pid
-        user_settings["payment"] = pid
+        user_settings["payment"]      = pid
         user_settings["payment_name"] = pname
         await query.edit_message_text(
             f"✅ Payment method selected: *{pname}*\n\n" + main_menu_text(),
@@ -225,12 +259,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
 
-    # ─── 🚀 POST AD ───
+    # ── 🚀 Post Ad ──
     elif data == "post":
-        # Validate all settings before posting
         missing = []
         if not user_settings.get("payment"):
-            missing.append("🏦 Payment method")
+            missing.append("🏦 Payment method (tap Select Payment Method)")
         if not user_settings.get("coin"):
             missing.append("💰 Coin")
         if not user_settings.get("currency"):
@@ -238,44 +271,44 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if missing:
             await query.edit_message_text(
-                "❌ Please set the following before posting:\n" +
-                "\n".join(missing),
+                "❌ Please complete these settings first:\n\n" + "\n".join(missing),
                 reply_markup=InlineKeyboardMarkup(back_button())
             )
             return
 
         await query.edit_message_text("⏳ Posting ad on Bybit P2P...")
-        try:
-            result = post_buy_ad(user_settings)
-            ret_code = result.get("retCode", -1)
-            ret_msg = result.get("retMsg", "Unknown response")
 
-            if ret_code == 0:
-                await query.edit_message_text(
-                    f"✅ *Ad posted successfully!*\n\n"
-                    f"Coin: `{user_settings['coin']}`\n"
-                    f"Currency: `{user_settings['currency']}`\n"
-                    f"Min: `{user_settings['min']}` | Max: `{user_settings['max']}`\n"
-                    f"Payment: `{user_settings.get('payment_name', user_settings['payment'])}`",
-                    reply_markup=InlineKeyboardMarkup(back_button()),
-                    parse_mode="Markdown"
-                )
-            else:
-                await query.edit_message_text(
-                    f"❌ *Bybit rejected the ad:*\n\n`{ret_msg}`",
-                    reply_markup=InlineKeyboardMarkup(back_button()),
-                    parse_mode="Markdown"
-                )
-        except Exception as e:
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(None, post_buy_ad, user_settings)
+
+        logger.info(f"Post ad result: {result}")
+
+        ret_code = result.get("retCode", -1)
+        ret_msg  = result.get("retMsg", "Unknown response")
+
+        if ret_code == 0:
             await query.edit_message_text(
-                f"❌ Error posting ad:\n\n`{e}`",
+                "✅ *Ad posted successfully on Bybit P2P!*\n\n"
+                f"🪙 Coin: `{user_settings['coin']}`\n"
+                f"🌍 Currency: `{user_settings['currency']}`\n"
+                f"📊 Margin: `{user_settings['margin']}%`\n"
+                f"💵 Min: `{user_settings['min']}` | Max: `{user_settings['max']}`\n"
+                f"🏦 Payment: `{user_settings.get('payment_name', user_settings['payment'])}`",
+                reply_markup=InlineKeyboardMarkup(back_button()),
+                parse_mode="Markdown"
+            )
+        else:
+            await query.edit_message_text(
+                f"❌ *Bybit rejected the ad:*\n\n"
+                f"Code: `{ret_code}`\n"
+                f"Message: `{ret_msg}`",
                 reply_markup=InlineKeyboardMarkup(back_button()),
                 parse_mode="Markdown"
             )
 
 
 # ─────────────────────────────────────────
-# 📝 HANDLE TEXT INPUTS
+# 📝 TEXT INPUT HANDLER
 # ─────────────────────────────────────────
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
@@ -283,52 +316,48 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = update.message.text.strip()
 
-    # 📊 Margin input
     if user_state.get("action") == "margin":
         try:
-            float(text)  # validate it's a number
+            float(text)
             user_settings["margin"] = text
             user_state["action"] = None
             await update.message.reply_text(
-                f"✅ Margin set to *{text}%*\n\nType /menu to return to the control panel.",
+                f"✅ Margin set to *{text}%*\n\nTap /menu to return.",
                 parse_mode="Markdown"
             )
         except ValueError:
             await update.message.reply_text(
-                "❌ Invalid margin. Please enter a number e.g. `1.5`",
+                "❌ Invalid value. Send a number like `1.5`",
                 parse_mode="Markdown"
             )
 
-    # 💵 Min amount input
     elif user_state.get("action") == "min":
         try:
             float(text)
             user_settings["min"] = text
             user_state["action"] = "max"
             await update.message.reply_text(
-                f"✅ Min set to *{text}*\n\nNow enter the *maximum* order amount:",
+                f"✅ Min set to *{text}*\n\nNow send the *maximum* amount:",
                 parse_mode="Markdown"
             )
         except ValueError:
             await update.message.reply_text(
-                "❌ Invalid amount. Please enter a number e.g. `1000`",
+                "❌ Invalid value. Send a number like `1000`",
                 parse_mode="Markdown"
             )
 
-    # 💵 Max amount input
     elif user_state.get("action") == "max":
         try:
             float(text)
             user_settings["max"] = text
             user_state["action"] = None
             await update.message.reply_text(
-                f"✅ Limits set:\nMin: *{user_settings['min']}* | Max: *{text}*\n\n"
-                "Type /menu to return to the control panel.",
+                f"✅ Limits saved:\nMin: *{user_settings['min']}* | Max: *{text}*\n\nTap /menu to return.",
                 parse_mode="Markdown"
             )
         except ValueError:
             await update.message.reply_text(
-                "❌ Invalid amount. Please enter a number e.g. `100000`",
+                "❌ Invalid value. Send a number like `100000`",
                 parse_mode="Markdown"
             )
 
@@ -340,7 +369,7 @@ def start_bot():
     application = (
         ApplicationBuilder()
         .token(TELEGRAM_TOKEN)
-        .updater(None)   # webhook mode — no polling updater needed
+        .updater(None)      # webhook mode — no polling needed
         .build()
     )
 
@@ -349,5 +378,5 @@ def start_bot():
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
-    print("🤖 Bot handlers registered")
+    logger.info("🤖 Bot handlers registered")
     return application
