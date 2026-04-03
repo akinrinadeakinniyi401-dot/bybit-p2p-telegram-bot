@@ -5,11 +5,11 @@ from telegram.ext import (
 )
 from config import TELEGRAM_TOKEN, ADMIN_ID
 from bybit import get_payment_methods, post_buy_ad
-import asyncio
 
 # 🧠 Store user settings + state
 user_settings = {}
 user_state = {}
+
 
 # 🔐 Restrict access
 def is_admin(user_id):
@@ -50,7 +50,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     data = query.data
 
     # 💰 Set Coin
@@ -93,12 +92,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 🏦 Load Payment Methods
     elif data == "payments":
         await query.edit_message_text("⏳ Loading payment methods...")
-
         result = get_payment_methods()
-
         try:
             items = result["result"]["items"]
-
             keyboard = []
             for m in items:
                 name = m["name"]
@@ -106,12 +102,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 keyboard.append([
                     InlineKeyboardButton(f"{name}", callback_data=f"pay_{pid}")
                 ])
-
             await query.edit_message_text(
                 "Select Payment Method:",
                 reply_markup=InlineKeyboardMarkup(keyboard)
             )
-
         except Exception as e:
             await query.edit_message_text(f"❌ Failed to load payments\n{e}")
 
@@ -123,12 +117,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 🚀 POST AD
     elif data == "post":
         await query.edit_message_text("⏳ Posting ad...")
-
-        # ❗ Check if payment is selected
         if not user_settings.get("payment"):
             await query.edit_message_text("❌ Please select a payment method first")
             return
-
         try:
             result = post_buy_ad(user_settings)
             await query.edit_message_text(f"📡 Response:\n{result}")
@@ -143,19 +134,16 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = update.message.text
 
-    # 📊 Margin
     if user_state.get("action") == "margin":
         user_settings["margin"] = text
         user_state["action"] = None
         await update.message.reply_text(f"✅ Margin set to {text}")
 
-    # 💵 Min
     elif user_state.get("action") == "min":
         user_settings["min"] = text
         user_state["action"] = "max"
         await update.message.reply_text("Enter MAX amount:")
 
-    # 💵 Max
     elif user_state.get("action") == "max":
         user_settings["max"] = text
         user_state["action"] = None
@@ -164,24 +152,14 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-# 🚀 BUILD BOT — returns the app so Flask can use it for webhook
-def start_bot(webhook_url=None):
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+# 🔧 BUILD BOT — just registers handlers and returns the app
+# Webhook registration is handled in app.py
+def start_bot():
+    application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CallbackQueryHandler(button_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
-    # Register the webhook URL with Telegram
-    if webhook_url:
-        async def set_webhook():
-            await app.initialize()
-            await app.bot.set_webhook(url=webhook_url)
-            print(f"✅ Webhook set: {webhook_url}")
-
-        asyncio.run(set_webhook())
-        print("🤖 Bot configured for webhook mode")
-    else:
-        print("⚠️ No webhook URL provided — bot not registered")
-
-    return app
+    print("🤖 Bot handlers registered")
+    return application
