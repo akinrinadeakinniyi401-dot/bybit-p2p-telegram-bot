@@ -1,10 +1,11 @@
 import os
 import asyncio
 import logging
+import requests as http_requests
 from flask import Flask, request, jsonify
-from telegram import Update
+from telegram import Update, BotCommand
 
-# 🪵 Log everything so Render shows errors
+# 🪵 Logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
@@ -12,7 +13,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
-bot_app = None  # Set during startup
+bot_app = None
 
 
 # 🌐 Health check
@@ -43,20 +44,37 @@ def webhook():
 
 async def setup_bot():
     from bot import start_bot
+
     render_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
     if not render_url:
         raise ValueError("RENDER_EXTERNAL_URL environment variable is not set")
+
     webhook_url = f"{render_url}/webhook"
     logger.info(f"Setting webhook: {webhook_url}")
+
     bot = start_bot()
     await bot.initialize()
     await bot.bot.set_webhook(url=webhook_url)
+
+    # 🤖 Register /menu as a bot command so it appears in Telegram menu button
+    await bot.bot.set_my_commands([
+        BotCommand("start", "Start the bot"),
+        BotCommand("menu", "Open control panel"),
+    ])
+
     logger.info("✅ Webhook registered successfully")
     return bot
 
 
 if __name__ == "__main__":
     logger.info("🟢 App starting...")
+
+    # 🌍 Log Render public IP for Bybit API whitelist
+    try:
+        ip = http_requests.get("https://api.ipify.org", timeout=5).text
+        logger.info(f"🌍 Render Public IP (add to Bybit whitelist): {ip}")
+    except Exception as e:
+        logger.warning(f"Could not fetch public IP: {e}")
 
     try:
         bot_app = asyncio.run(setup_bot())
@@ -65,7 +83,6 @@ if __name__ == "__main__":
         logger.exception(f"❌ Failed to start bot: {e}")
         raise SystemExit(1)
 
-    # 🔑 Render requires PORT env var — defaults to 10000
     port = int(os.environ.get("PORT", 10000))
     logger.info(f"🚀 Starting Flask on port {port}")
     app.run(host="0.0.0.0", port=port)
