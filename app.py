@@ -1,19 +1,20 @@
 import os
 import asyncio
 import logging
+import threading
 import requests as http_requests
 from flask import Flask, request, jsonify
 from telegram import Update, BotCommand
 
-# 🪵 Logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
 )
 logger = logging.getLogger(__name__)
 
-app = Flask(__name__)
-bot_app = None
+app      = Flask(__name__)
+bot_app  = None
+bot_loop = None   # persistent event loop reused by all webhook calls
 
 
 # 🌐 Health check
@@ -22,32 +23,29 @@ def home():
     return "✅ Bot is running"
 
 
-# 📨 Telegram webhook route
+# 📨 Webhook — uses the bot's persistent loop, never creates a new one
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    global bot_app
-    if bot_app is None:
-        logger.error("bot_app is not initialised")
+    global bot_app, bot_loop
+    if bot_app is None or bot_loop is None:
         return jsonify({"status": "error", "detail": "bot not ready"}), 500
     try:
-        data = request.get_json(force=True)
+        data   = request.get_json(force=True)
         update = Update.de_json(data, bot_app.bot)
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(bot_app.process_update(update))
-        loop.close()
+        future = asyncio.run_coroutine_threadsafe(
+            bot_app.process_update(update), bot_loop
+        )
+        future.result(timeout=30)
         return jsonify({"status": "ok"}), 200
     except Exception as e:
         logger.exception(f"Webhook error: {e}")
         return jsonify({"status": "error", "detail": str(e)}), 500
 
 
-async def setup_bot():
+# ─── Bot setup (runs inside the persistent loop) ───
+async def run_bot_setup(render_url):
+    global bot_app
     from bot import start_bot
-
-    render_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
-    if not render_url:
-        raise ValueError("RENDER_EXTERNAL_URL environment variable is not set")
 
     webhook_url = f"{render_url}/webhook"
     logger.info(f"Setting webhook: {webhook_url}")
@@ -55,51 +53,55 @@ async def setup_bot():
     bot = start_bot()
     await bot.initialize()
     await bot.bot.set_webhook(url=webhook_url)
-
-    # Register /menu as visible command in Telegram
     await bot.bot.set_my_commands([
         BotCommand("start", "Start the bot"),
-        BotCommand("menu", "Open control panel"),
+        BotCommand("menu",  "Open control panel"),
     ])
+    bot_app = bot
+    logger.info("✅ Bot ready")
 
-    logger.info("✅ Webhook registered successfully")
-    return bot
+
+# ─── Keep the background loop alive ───
+def start_background_loop(loop):
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
 
 
 if __name__ == "__main__":
     logger.info("🟢 App starting...")
 
-    # ═══════════════════════════════════════════
-    # 🌍 Fetch and log Render public IP
-    # Add this IP to your Bybit API whitelist
-    # ═══════════════════════════════════════════
-    public_ip = None
-    for service in ["https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"]:
+    # 🌍 Log Render public IP — add this to Bybit API whitelist
+    for svc in ["https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"]:
         try:
-            public_ip = http_requests.get(service, timeout=5).text.strip()
-            if public_ip:
+            ip = http_requests.get(svc, timeout=5).text.strip()
+            if ip:
+                logger.info("=" * 55)
+                logger.info(f"  🌍 RENDER PUBLIC IP: {ip}")
+                logger.info(f"  👉 Add to Bybit API whitelist")
+                logger.info("=" * 55)
                 break
         except Exception:
             continue
 
-    if public_ip:
-        logger.info("=" * 55)
-        logger.info(f"  🌍 RENDER PUBLIC IP: {public_ip}")
-        logger.info(f"  👉 Add this IP to your Bybit API whitelist")
-        logger.info("=" * 55)
-    else:
-        logger.warning("⚠️ Could not fetch public IP — add it manually from Render dashboard")
+    render_url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+    if not render_url:
+        logger.error("❌ RENDER_EXTERNAL_URL not set")
+        raise SystemExit(1)
 
-    # ═══════════════════════════════════════════
-    # 🤖 Start bot
-    # ═══════════════════════════════════════════
+    # Create one persistent event loop for the entire process lifetime
+    bot_loop = asyncio.new_event_loop()
+    t = threading.Thread(target=start_background_loop, args=(bot_loop,), daemon=False)
+    t.start()
+    logger.info("✅ Persistent event loop started")
+
+    # Run bot setup on that loop
+    future = asyncio.run_coroutine_threadsafe(run_bot_setup(render_url), bot_loop)
     try:
-        bot_app = asyncio.run(setup_bot())
-        logger.info("🤖 Bot ready")
+        future.result(timeout=30)
     except Exception as e:
         logger.exception(f"❌ Failed to start bot: {e}")
         raise SystemExit(1)
 
     port = int(os.environ.get("PORT", 10000))
     logger.info(f"🚀 Starting Flask on port {port}")
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=port, threaded=True)
