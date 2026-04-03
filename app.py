@@ -56,7 +56,7 @@ async def setup_bot():
     await bot.initialize()
     await bot.bot.set_webhook(url=webhook_url)
 
-    # 🤖 Register /menu as a bot command so it appears in Telegram menu button
+    # Register /menu as visible command in Telegram
     await bot.bot.set_my_commands([
         BotCommand("start", "Start the bot"),
         BotCommand("menu", "Open control panel"),
@@ -69,13 +69,30 @@ async def setup_bot():
 if __name__ == "__main__":
     logger.info("🟢 App starting...")
 
-    # 🌍 Log Render public IP for Bybit API whitelist
-    try:
-        ip = http_requests.get("https://api.ipify.org", timeout=5).text
-        logger.info(f"🌍 Render Public IP (add to Bybit whitelist): {ip}")
-    except Exception as e:
-        logger.warning(f"Could not fetch public IP: {e}")
+    # ═══════════════════════════════════════════
+    # 🌍 Fetch and log Render public IP
+    # Add this IP to your Bybit API whitelist
+    # ═══════════════════════════════════════════
+    public_ip = None
+    for service in ["https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"]:
+        try:
+            public_ip = http_requests.get(service, timeout=5).text.strip()
+            if public_ip:
+                break
+        except Exception:
+            continue
 
+    if public_ip:
+        logger.info("=" * 55)
+        logger.info(f"  🌍 RENDER PUBLIC IP: {public_ip}")
+        logger.info(f"  👉 Add this IP to your Bybit API whitelist")
+        logger.info("=" * 55)
+    else:
+        logger.warning("⚠️ Could not fetch public IP — add it manually from Render dashboard")
+
+    # ═══════════════════════════════════════════
+    # 🤖 Start bot
+    # ═══════════════════════════════════════════
     try:
         bot_app = asyncio.run(setup_bot())
         logger.info("🤖 Bot ready")
