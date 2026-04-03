@@ -5,6 +5,7 @@ from telegram.ext import (
 )
 from config import TELEGRAM_TOKEN, ADMIN_ID
 from bybit import get_payment_methods, post_buy_ad
+import asyncio
 
 # 🧠 Store user settings + state
 user_settings = {}
@@ -163,15 +164,24 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
 
-# 🚀 START BOT (UPDATED FOR RENDER)
-def start_bot():
+# 🚀 BUILD BOT — returns the app so Flask can use it for webhook
+def start_bot(webhook_url=None):
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(button_handler))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
-    print("🤖 Bot is running...")
+    # Register the webhook URL with Telegram
+    if webhook_url:
+        async def set_webhook():
+            await app.initialize()
+            await app.bot.set_webhook(url=webhook_url)
+            print(f"✅ Webhook set: {webhook_url}")
 
-    # 🔥 IMPORTANT FIX FOR RENDER
-    app.run_polling(stop_signals=None)
+        asyncio.run(set_webhook())
+        print("🤖 Bot configured for webhook mode")
+    else:
+        print("⚠️ No webhook URL provided — bot not registered")
+
+    return app
