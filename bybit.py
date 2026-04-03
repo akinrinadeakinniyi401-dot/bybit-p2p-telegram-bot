@@ -13,9 +13,7 @@ BASE_URL = "https://api.bybit.com"
 
 # ─────────────────────────────────────────
 # 🔐 Generate Signature (HMAC SHA256)
-# Bybit rule:
-#   GET  → timestamp + api_key + recv_window + queryString
-#   POST → timestamp + api_key + recv_window + jsonBodyString
+# Bybit spec: timestamp + api_key + recv_window + payload
 # ─────────────────────────────────────────
 def generate_signature(timestamp: str, payload: str, recv_window="5000"):
     param_str = f"{timestamp}{BYBIT_API_KEY}{recv_window}{payload}"
@@ -45,43 +43,60 @@ def get_headers(payload=""):
 
 # ─────────────────────────────────────────
 # 🔍 Fetch User Payment Methods
-# GET /v5/p2p/user/payment/list
-# For GET: payload = query string (empty if no params)
 # ─────────────────────────────────────────
 def get_payment_methods():
     endpoint = "/v5/p2p/user/payment/list"
     url = BASE_URL + endpoint
-    # GET with no query params → payload is empty string
+
     headers = get_headers("")
+
     try:
         response = requests.get(url, headers=headers, timeout=10)
-        logger.info(f"Payment methods status: {response.status_code}")
-        result = response.json()
-        logger.info(f"Payment methods response: {result}")
-        return result
+
+        # 🔍 Log everything for diagnosis
+        logger.info(f"[Bybit] GET {url}")
+        logger.info(f"[Bybit] Status code: {response.status_code}")
+        logger.info(f"[Bybit] Response headers: {dict(response.headers)}")
+        logger.info(f"[Bybit] Raw response body: '{response.text}'")
+
+        if not response.text.strip():
+            return {
+                "retCode": -1,
+                "retMsg": (
+                    "Bybit returned an empty response. "
+                    "This almost always means your Render IP is not whitelisted on Bybit. "
+                    f"Go to Bybit API Management → edit your key → add the Render IP shown in your startup logs."
+                )
+            }
+
+        return response.json()
+
+    except requests.exceptions.Timeout:
+        logger.error("[Bybit] Request timed out")
+        return {"retCode": -1, "retMsg": "Request timed out — Bybit did not respond in 10s"}
     except Exception as e:
-        logger.error(f"get_payment_methods error: {e}")
+        logger.error(f"[Bybit] get_payment_methods error: {e}")
         return {"error": str(e)}
 
 
 # ─────────────────────────────────────────
 # 🚀 Post BUY Ad
-# POST /v5/p2p/item/create
 # ─────────────────────────────────────────
 def post_buy_ad(settings):
     endpoint = "/v5/p2p/item/create"
     url = BASE_URL + endpoint
+
     body = {
         "tokenId": settings["coin"],
         "currencyId": settings["currency"],
-        "side": "0",                                  # 0 = BUY
-        "priceType": "1",                             # 1 = floating/variable rate
-        "premium": settings["margin"],                # % premium above market
-        "price": "0",                                 # auto when priceType=1
+        "side": "0",                                   # 0 = BUY
+        "priceType": "1",                              # 1 = floating/variable rate
+        "premium": settings["margin"],
+        "price": "0",
         "minAmount": settings["min"],
         "maxAmount": settings["max"],
         "remark": "Auto bot ad",
-        "paymentIds": [settings["payment"]],          # ID from get_payment_methods
+        "paymentIds": [settings["payment"]],
         "quantity": settings.get("quantity", "10000"),
         "paymentPeriod": "15",
         "itemType": "ORIGIN",
@@ -99,14 +114,32 @@ def post_buy_ad(settings):
             "hasCompleteRateDay30": "0"
         }
     }
-    payload = json.dumps(body, separators=(',', ':'))  # compact JSON, no spaces
+
+    payload = json.dumps(body, separators=(',', ':'))
     headers = get_headers(payload)
+
     try:
         response = requests.post(url, headers=headers, data=payload, timeout=10)
-        logger.info(f"Post ad status: {response.status_code}")
-        result = response.json()
-        logger.info(f"Post ad response: {result}")
-        return result
+
+        # 🔍 Log everything for diagnosis
+        logger.info(f"[Bybit] POST {url}")
+        logger.info(f"[Bybit] Status code: {response.status_code}")
+        logger.info(f"[Bybit] Raw response body: '{response.text}'")
+
+        if not response.text.strip():
+            return {
+                "retCode": -1,
+                "retMsg": (
+                    "Bybit returned an empty response. "
+                    "Your Render IP is likely not whitelisted on Bybit."
+                )
+            }
+
+        return response.json()
+
+    except requests.exceptions.Timeout:
+        logger.error("[Bybit] Post ad request timed out")
+        return {"retCode": -1, "retMsg": "Request timed out"}
     except Exception as e:
-        logger.error(f"post_buy_ad error: {e}")
+        logger.error(f"[Bybit] post_buy_ad error: {e}")
         return {"error": str(e)}
