@@ -1,51 +1,33 @@
-from flask import Flask
-import requests
+from flask import Flask, request
 import threading
-import sys
 import os
+from bot import start_bot
+from telegram import Update
+from telegram.ext import ApplicationBuilder
+from config import TELEGRAM_TOKEN
 
 app = Flask(__name__)
+
+# Store the bot app globally so Flask can pass updates to it
+bot_app = None
 
 @app.route("/")
 def home():
     return "Bot is running"
 
-
-def run_bot():
-    print("🧪 Entered bot thread...")
-
-    try:
-        # 🔥 Fix import path issue on Render
-        sys.path.append(os.getcwd())
-
-        import bot
-        print("✅ bot.py imported successfully")
-
-        print("🚀 Starting Telegram bot...")
-        bot.start_bot()
-
-    except Exception as e:
-        print("❌ BOT ERROR:", e)
-
+@app.route(f"/webhook", methods=["POST"])
+async def webhook():
+    global bot_app
+    data = request.get_json()
+    update = Update.de_json(data, bot_app.bot)
+    await bot_app.process_update(update)
+    return "ok"
 
 if __name__ == "__main__":
-    print("🟢 App starting...")
+    RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL")  # Set this in Render env vars
+    WEBHOOK_URL = f"{RENDER_URL}/webhook"
 
-    # 🌍 Print Render Public IP
-    try:
-        ip = requests.get("https://api.ipify.org").text
-        print(f"🌍 Render Public IP: {ip}")
-    except Exception as e:
-        print("IP fetch failed:", e)
+    bot_app = start_bot(webhook_url=WEBHOOK_URL)  # see bot.py change below
 
-    print("🧵 Starting bot thread...")
-
-    # 🚀 Start bot in background
-    bot_thread = threading.Thread(target=run_bot)
-    bot_thread.daemon = True
-    bot_thread.start()
-
-    print("🚀 Starting Flask server...")
-
-    # 🌐 Keep service alive for Render
-    app.run(host="0.0.0.0", port=3000)
+    port = int(os.environ.get("PORT", 3000))
+    app.run(host="0.0.0.0", port=port)
