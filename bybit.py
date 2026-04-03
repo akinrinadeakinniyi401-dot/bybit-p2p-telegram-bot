@@ -33,11 +33,11 @@ def get_headers(payload=""):
     recv_window = "5000"
     sign = generate_signature(timestamp, payload, recv_window)
     return {
-        "X-BAPI-API-KEY": BYBIT_API_KEY,
-        "X-BAPI-TIMESTAMP": timestamp,
-        "X-BAPI-SIGN": sign,
+        "X-BAPI-API-KEY":     BYBIT_API_KEY,
+        "X-BAPI-TIMESTAMP":   timestamp,
+        "X-BAPI-SIGN":        sign,
         "X-BAPI-RECV-WINDOW": recv_window,
-        "Content-Type": "application/json"
+        "Content-Type":       "application/json"
     }
 
 
@@ -64,50 +64,56 @@ def get_payment_methods():
 
 
 # ─────────────────────────────────────────
-# 🔄 Update / Relist Ad
+# 🔄 Modify Ad with new fixed price
 # POST /v5/p2p/item/update
-# actionType:
-#   "ACTIVE"  → relist / refresh ad (keeps it at top)
-#   "MODIFY"  → modify ad details
+# actionType: "MODIFY" — updates price and relists
 # ─────────────────────────────────────────
-def update_ad(settings):
+def modify_ad(ad_id, new_price, settings):
     endpoint = "/v5/p2p/item/update"
     url = BASE_URL + endpoint
 
     body = {
-        "id":          settings["ad_id"],
-        "priceType":   settings.get("price_type", "1"),   # 1 = floating
-        "premium":     settings.get("margin", "0"),
-        "price":       settings.get("price", "0"),
-        "minAmount":   settings.get("min", "1000"),
-        "maxAmount":   settings.get("max", "100000"),
-        "remark":      settings.get("remark", ""),
-        "paymentIds":  [settings.get("payment", "-1")],   # -1 = keep existing
-        "quantity":    settings.get("quantity", "10000"),
+        "id":            ad_id,
+        "actionType":    "MODIFY",
+        "priceType":     "0",                              # 0 = fixed price
+        "price":         str(round(float(new_price), 8)), # fixed price value
+        "premium":       "",                               # not used for fixed
+        "minAmount":     settings.get("min", "1000"),
+        "maxAmount":     settings.get("max", "100000"),
+        "quantity":      settings.get("quantity", "10000"),
+        "paymentIds":    [settings.get("payment", "")],
         "paymentPeriod": "15",
-        "actionType":  "ACTIVE",                          # relist/refresh
+        "remark":        settings.get("remark", ""),
         "tradingPreferenceSet": {
-            "hasUnPostAd": "0",
-            "isKyc": "1",
-            "isEmail": "0",
-            "isMobile": "0",
-            "hasRegisterTime": "0",
-            "registerTimeThreshold": "0",
-            "orderFinishNumberDay30": "0",
-            "completeRateDay30": "0",
-            "nationalLimit": "",
-            "hasOrderFinishNumberDay30": "0",
-            "hasCompleteRateDay30": "0"
+            "hasUnPostAd":              "0",
+            "isKyc":                    "1",
+            "isEmail":                  "0",
+            "isMobile":                 "0",
+            "hasRegisterTime":          "0",
+            "registerTimeThreshold":    "0",
+            "orderFinishNumberDay30":   "0",
+            "completeRateDay30":        "0",
+            "nationalLimit":            "",
+            "hasOrderFinishNumberDay30":"0",
+            "hasCompleteRateDay30":     "0",
+            "hasNationalLimit":         "0"
         }
     }
 
     payload = json.dumps(body, separators=(',', ':'))
     headers = get_headers(payload)
 
+    logger.info(f"[Bybit] Sending MODIFY request:")
+    logger.info(f"[Bybit]   Ad ID:     {ad_id}")
+    logger.info(f"[Bybit]   New price: {new_price}")
+    logger.info(f"[Bybit]   Min/Max:   {settings.get('min')} / {settings.get('max')}")
+    logger.info(f"[Bybit]   Payment:   {settings.get('payment')}")
+    logger.info(f"[Bybit]   Quantity:  {settings.get('quantity')}")
+
     try:
         response = requests.post(url, headers=headers, data=payload, timeout=10)
-        logger.info(f"[Bybit] Update ad status: {response.status_code}")
-        logger.info(f"[Bybit] Raw body: '{response.text}'")
+        logger.info(f"[Bybit] Response status: {response.status_code}")
+        logger.info(f"[Bybit] Response body:   {response.text}")
 
         if not response.text.strip():
             return {
@@ -116,6 +122,10 @@ def update_ad(settings):
             }
 
         return response.json()
+
+    except requests.exceptions.Timeout:
+        logger.error("[Bybit] Request timed out")
+        return {"retCode": -1, "retMsg": "Request timed out"}
     except Exception as e:
-        logger.error(f"[Bybit] update_ad error: {e}")
+        logger.error(f"[Bybit] modify_ad error: {e}")
         return {"error": str(e)}
