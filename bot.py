@@ -79,7 +79,7 @@ def main_menu_text():
         f"📦 Quantity: `{quantity}`\n\n"
         f"📈 Current price this session: `{cur}`\n"
         f"📡 Status: {status}\n\n"
-        f"💡 Type /pingbybit to test API connection"
+        f"💡 /pingbybit — test API | /getpaymentid — get payment ID"
     )
 
 
@@ -131,8 +131,8 @@ async def auto_update_loop(bot, chat_id):
 
     while refresh_running:
         cycle += 1
-        now       = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        new_price = current_price + increment
+        now           = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        new_price     = current_price + increment
         new_price_str = str(new_price.quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP))
 
         logger.info(f"[Cycle {cycle}] {now}")
@@ -216,73 +216,53 @@ async def ping_bybit_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     loop   = asyncio.get_event_loop()
     result = await loop.run_in_executor(None, ping_api)
 
-    logger.info(f"[pingbybit] Full result: {result}")
-
     ret_code = result.get("retCode", -1)
     ret_msg  = result.get("retMsg", "")
 
     if ret_code == 0:
-        info = result.get("result", {})
+        info  = result.get("result", {})
+        perms = info.get("permissions", {})
+        ips   = info.get("ips", [])
 
-        # Parse permissions
-        raw_perms = info.get("permissions", {})
+        # ── Parse each permission group ──
         perm_lines = []
-
-        # Known permission keys and what they mean for P2P
-        perm_map = {
-            "ContractTrade":  "Futures/Contract trading",
-            "Spot":           "Spot trading",
-            "Wallet":         "Wallet read",
-            "Options":        "Options trading",
-            "Derivatives":    "Derivatives",
-            "CopyTrading":    "Copy trading",
-            "BlockTrade":     "Block trade",
-            "Exchange":       "Exchange",
-            "NFT":            "NFT",
-            "Affiliate":      "Affiliate",
-            "OTC":            "OTC trading",
-        }
-
-        for key, vals in raw_perms.items():
-            label = perm_map.get(key, key)
+        for key, vals in perms.items():
             if vals:
-                perm_lines.append(f"  ✅ {label}")
+                perm_lines.append(f"  ✅ {key}: {', '.join(vals)}")
             else:
-                perm_lines.append(f"  ❌ {label}")
+                perm_lines.append(f"  ➖ {key}: none")
 
-        # Check P2P specifically — Bybit P2P permission may appear as "Trade" or not listed
-        has_p2p = any(
-            "p2p" in str(v).lower() or "trade" in str(k).lower()
-            for k, v in raw_perms.items()
-            if v
-        )
+        # ── Check what matters for this bot ──
+        fiat_p2p    = perms.get("FiatP2P", [])
+        has_orders  = "FiatP2POrder" in fiat_p2p
+        has_ads     = "Advertising"  in fiat_p2p
+        read_only   = info.get("readOnly", 1)
 
-        ips        = info.get("ips", [])
-        api_key    = info.get("apiKey", "")
-        read_only  = info.get("readOnly", None)
-        expire     = info.get("expiredAt", "Never")
-
-        p2p_status = "✅ Likely enabled" if has_p2p else "⚠️ Not detected — enable P2P Trading on Bybit API key"
+        if has_ads and not read_only:
+            ad_status = "✅ Can CREATE and EDIT ads"
+        elif has_ads and read_only:
+            ad_status = "⚠️ Has Advertising permission but key is READ ONLY"
+        elif has_orders:
+            ad_status = "⚠️ Can manage orders but NOT edit ads — enable Advertising"
+        else:
+            ad_status = "❌ No P2P permission — enable FiatP2P on Bybit API key"
 
         await update.message.reply_text(
-            f"✅ *Bybit API connected successfully!*\n\n"
-            f"🔑 API Key: `...{api_key[-6:] if api_key else 'hidden'}`\n"
-            f"🔒 Read only: `{read_only}`\n"
-            f"📅 Expires: `{expire}`\n"
-            f"🌍 Whitelisted IPs: `{', '.join(ips) if ips else 'None set'}`\n\n"
-            f"🔓 *Permissions:*\n" + "\n".join(perm_lines) + "\n\n"
-            f"🛒 P2P Trading: {p2p_status}\n\n"
-            f"{'✅ Ready to update ads!' if has_p2p else '❌ Enable P2P permission on your Bybit API key to update ads'}",
+            f"✅ *Bybit API connected!*\n\n"
+            f"🔑 Key: `...{info.get('apiKey','')[-6:]}`\n"
+            f"🔒 Read only: `{'Yes' if read_only else 'No'}`\n"
+            f"🌍 Whitelisted IPs: `{', '.join(ips) if ips else 'None'}`\n\n"
+            f"🔓 *All Permissions:*\n" + "\n".join(perm_lines) + "\n\n"
+            f"🛒 *P2P Ad editing: {ad_status}*",
             parse_mode="Markdown"
         )
     else:
         await update.message.reply_text(
-            f"❌ *Bybit API connection failed*\n\n"
-            f"Error: `{ret_msg}`\n\n"
-            f"*Checklist:*\n"
-            f"• ✅/❌ IP `74.220.52.2` added to Bybit API whitelist?\n"
-            f"• ✅/❌ API key has P2P Trading permission?\n"
-            f"• ✅/❌ API key and secret correct in Render env vars?",
+            f"❌ *Bybit API failed*\n\nError: `{ret_msg}`\n\n"
+            f"Checklist:\n"
+            f"• IP `74.220.52.2` whitelisted on Bybit API key?\n"
+            f"• FiatP2P + Advertising permission enabled?\n"
+            f"• API key/secret correct in Render env vars?",
             parse_mode="Markdown"
         )
 
@@ -302,7 +282,7 @@ async def get_payment_id_command(update: Update, context: ContextTypes.DEFAULT_T
         raw = raw[:3500] + "...(truncated)"
     await update.message.reply_text(
         f"📋 Raw Bybit response:\n\n`{raw}`\n\n"
-        "Copy the `id` value and use *Set Ad Details* → Payment ID in /menu.",
+        "Copy the `id` value and use *Set Ad Details* in /menu.",
         parse_mode="Markdown"
     )
 
@@ -327,7 +307,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "🆔 Send your Bybit Ad ID.\n\n"
             "*How to find it:*\n"
-            "Bybit App → P2P → My Ads → tap your ad → copy the long ID number.\n\n"
+            "Bybit App → P2P → My Ads → tap your ad → copy the long number.\n\n"
             "Example: `1898988222063644672`",
             reply_markup=InlineKeyboardMarkup(back_button()), parse_mode="Markdown"
         )
@@ -363,7 +343,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "📋 *Ad Details Setup — Step 1 of 4*\n\n"
             "These must exactly match what is on your Bybit ad.\n\n"
             "Send your *Payment Method ID*.\n\n"
-            "Use /getpaymentid to fetch it from Bybit, or find it in:\n"
+            "Use /getpaymentid to fetch it, or find it in:\n"
             "Bybit → P2P → My Ads → tap ad → payment section.\n\n"
             "Example: `7110`",
             reply_markup=InlineKeyboardMarkup(back_button()), parse_mode="Markdown"
@@ -489,7 +469,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             await update.message.reply_text("❌ Invalid. Send a whole number like `2`", parse_mode="Markdown")
 
-    # Ad details — 4 step flow
     elif action == "payment":
         user_settings["payment"] = text
         user_state["action"] = "min"
@@ -535,8 +514,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_state["action"] = None
             await update.message.reply_text(
                 f"✅ Quantity: `{text}`\n\n"
-                "✅ *All ad details saved!*\n\n"
-                "Tap /menu to continue.",
+                "✅ *All ad details saved!*\n\nTap /menu to continue.",
                 parse_mode="Markdown"
             )
         except Exception:
@@ -553,10 +531,10 @@ def start_bot():
         .updater(None)
         .build()
     )
-    application.add_handler(CommandHandler("start",         start))
-    application.add_handler(CommandHandler("menu",          menu_command))
-    application.add_handler(CommandHandler("pingbybit",     ping_bybit_command))
-    application.add_handler(CommandHandler("getpaymentid",  get_payment_id_command))
+    application.add_handler(CommandHandler("start",        start))
+    application.add_handler(CommandHandler("menu",         menu_command))
+    application.add_handler(CommandHandler("pingbybit",    ping_bybit_command))
+    application.add_handler(CommandHandler("getpaymentid", get_payment_id_command))
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     logger.info("🤖 Bot handlers registered")
