@@ -13,17 +13,25 @@ from bybit import modify_ad
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────
-# 🧠 State
+# 🧠 State — must match your Bybit ad exactly
 # ─────────────────────────────────────────
 user_settings = {
-    "ad_id":      "",      # Bybit ad ID
-    "base_price": "",      # starting price e.g. "1350"
-    "increment":  "0.05",  # amount added each cycle
-    "interval":   2,       # minutes between updates
+    # Auto-update settings
+    "ad_id":      "",       # your Bybit ad ID
+    "base_price": "",       # current price on your ad right now
+    "increment":  "0.05",   # how much to add each cycle
+    "interval":   2,        # minutes between updates
+
+    # Must match what's set on your Bybit ad
+    "payment":        "",   # your payment method ID from Bybit
+    "min":            "",   # min order amount on your ad
+    "max":            "",   # max order amount on your ad
+    "quantity":       "",   # token quantity on your ad
+    "payment_period": "15", # payment window in minutes
+    "remark":         "",   # ad description
 }
 
-user_state = {}
-
+user_state      = {}
 refresh_task    = None
 refresh_running = False
 current_price   = Decimal("0")
@@ -40,20 +48,25 @@ def main_menu_keyboard():
     status = "🟢 Auto-Update ON  — tap to STOP" if refresh_running \
              else "🔴 Auto-Update OFF — tap to START"
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🆔 Set Ad ID",        callback_data="set_ad_id")],
-        [InlineKeyboardButton("💲 Set Base Price",   callback_data="set_base_price")],
-        [InlineKeyboardButton("➕ Set Increment",    callback_data="set_increment")],
-        [InlineKeyboardButton("⏱ Set Interval",     callback_data="set_interval")],
-        [InlineKeyboardButton("🔄 Update Once Now",  callback_data="update_now")],
-        [InlineKeyboardButton(status,                callback_data="toggle_refresh")],
+        [InlineKeyboardButton("🆔 Set Ad ID",          callback_data="set_ad_id")],
+        [InlineKeyboardButton("💲 Set Base Price",     callback_data="set_base_price")],
+        [InlineKeyboardButton("➕ Set Increment",      callback_data="set_increment")],
+        [InlineKeyboardButton("⏱ Set Interval",       callback_data="set_interval")],
+        [InlineKeyboardButton("📋 Set Ad Details",     callback_data="set_ad_details")],
+        [InlineKeyboardButton("🔄 Update Once Now",    callback_data="update_now")],
+        [InlineKeyboardButton(status,                  callback_data="toggle_refresh")],
     ])
 
 
 def main_menu_text():
-    ad_id      = user_settings.get("ad_id")     or "❗ Not set"
-    base_price = user_settings.get("base_price") or "❗ Not set"
-    increment  = user_settings.get("increment",  "0.05")
-    interval   = user_settings.get("interval",   2)
+    ad_id      = user_settings.get("ad_id")       or "❗ Not set"
+    base_price = user_settings.get("base_price")   or "❗ Not set"
+    increment  = user_settings.get("increment",    "0.05")
+    interval   = user_settings.get("interval",     2)
+    payment    = user_settings.get("payment")      or "❗ Not set"
+    min_amt    = user_settings.get("min")          or "❗ Not set"
+    max_amt    = user_settings.get("max")          or "❗ Not set"
+    quantity   = user_settings.get("quantity")     or "❗ Not set"
     cur        = str(current_price) if current_price else (base_price or "—")
     status     = "🟢 Running" if refresh_running else "🔴 Stopped"
 
@@ -62,7 +75,11 @@ def main_menu_text():
         f"🆔 Ad ID: `{ad_id}`\n"
         f"💲 Base price: `{base_price}`\n"
         f"➕ Increment: `+{increment}` per cycle\n"
-        f"⏱ Interval: every `{interval}` min\n"
+        f"⏱ Interval: every `{interval}` min\n\n"
+        f"📋 *Ad Details (must match Bybit):*\n"
+        f"🏦 Payment ID: `{payment}`\n"
+        f"💵 Min: `{min_amt}` | Max: `{max_amt}`\n"
+        f"📦 Quantity: `{quantity}`\n\n"
         f"📈 Current price this session: `{cur}`\n"
         f"📡 Status: {status}"
     )
@@ -78,6 +95,14 @@ def _check_required():
         missing.append("🆔 Ad ID")
     if not user_settings.get("base_price"):
         missing.append("💲 Base Price")
+    if not user_settings.get("payment"):
+        missing.append("🏦 Payment ID (in Ad Details)")
+    if not user_settings.get("min"):
+        missing.append("💵 Min amount (in Ad Details)")
+    if not user_settings.get("max"):
+        missing.append("💵 Max amount (in Ad Details)")
+    if not user_settings.get("quantity"):
+        missing.append("📦 Quantity (in Ad Details)")
     return missing
 
 
@@ -88,10 +113,10 @@ async def auto_update_loop(bot, chat_id):
     global refresh_running, current_price
 
     refresh_running = True
-    increment  = Decimal(str(user_settings.get("increment", "0.05")))
-    base_price = Decimal(str(user_settings.get("base_price")))
+    increment   = Decimal(str(user_settings.get("increment", "0.05")))
+    base_price  = Decimal(str(user_settings.get("base_price")))
     current_price = base_price
-    interval   = user_settings.get("interval", 2)
+    interval    = user_settings.get("interval", 2)
 
     logger.info("=" * 60)
     logger.info("🚀 AUTO-UPDATE LOOP STARTED")
@@ -99,6 +124,9 @@ async def auto_update_loop(bot, chat_id):
     logger.info(f"   Base price: {base_price}")
     logger.info(f"   Increment:  +{increment} per cycle")
     logger.info(f"   Interval:   every {interval} minute(s)")
+    logger.info(f"   Payment ID: {user_settings.get('payment')}")
+    logger.info(f"   Min/Max:    {user_settings.get('min')} / {user_settings.get('max')}")
+    logger.info(f"   Quantity:   {user_settings.get('quantity')}")
     logger.info("=" * 60)
 
     cycle = 0
@@ -197,7 +225,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "🆔 Send your Bybit Ad ID.\n\n"
             "*How to find it:*\n"
-            "Bybit → P2P → My Ads → tap your ad → copy the ID.\n\n"
+            "Bybit App → P2P → My Ads → tap your ad → copy the ID from the page.\n\n"
             "Example: `1898988222063644672`",
             reply_markup=InlineKeyboardMarkup(back_button()), parse_mode="Markdown"
         )
@@ -205,8 +233,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "set_base_price":
         user_state["action"] = "base_price"
         await query.edit_message_text(
-            "💲 Send the *current price* your ad is set to on Bybit.\n\n"
-            "The bot will start from this price and add the increment each cycle.\n\n"
+            "💲 Send the *current price* your ad shows on Bybit right now.\n\n"
+            "The bot starts from this and adds the increment each cycle.\n\n"
             "Example: `1350`",
             reply_markup=InlineKeyboardMarkup(back_button()), parse_mode="Markdown"
         )
@@ -215,15 +243,27 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_state["action"] = "increment"
         await query.edit_message_text(
             "➕ Send the amount to add to the price each cycle.\n\n"
-            "Examples:\n`0.05` → adds 0.05 every cycle\n`1` → adds 1.00 every cycle",
+            "Examples:\n`0.05` → adds 0.05 every cycle\n`1` → adds 1 every cycle",
             reply_markup=InlineKeyboardMarkup(back_button()), parse_mode="Markdown"
         )
 
     elif data == "set_interval":
         user_state["action"] = "interval"
         await query.edit_message_text(
-            "⏱ Send the interval in *minutes* between each update.\n\n"
+            "⏱ Send interval in *minutes* between each update.\n\n"
             "Examples: `2` = every 2 min | `5` = every 5 min\nMinimum: `1`",
+            reply_markup=InlineKeyboardMarkup(back_button()), parse_mode="Markdown"
+        )
+
+    elif data == "set_ad_details":
+        user_state["action"] = "payment"
+        await query.edit_message_text(
+            "📋 *Ad Details Setup*\n\n"
+            "These must exactly match what is set on your Bybit ad.\n\n"
+            "Step 1 of 4 — Send your *Payment Method ID*.\n\n"
+            "To find it: Bybit → P2P → My Ads → tap your ad → check payment details.\n"
+            "Or type /getpaymentid to fetch it from Bybit.\n\n"
+            "Example: `7110`",
             reply_markup=InlineKeyboardMarkup(back_button()), parse_mode="Markdown"
         )
 
@@ -247,7 +287,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
         ret_code = result.get("retCode", result.get("ret_code", -1))
-        ret_msg  = result.get("retMsg",  result.get("ret_msg", "Unknown"))
+        ret_msg  = result.get("retMsg",  result.get("ret_msg",  "Unknown"))
 
         if ret_code == 0:
             await query.edit_message_text(
@@ -286,8 +326,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.edit_message_text(
                 f"🟢 *Auto-update started!*\n"
                 f"Starting at `{user_settings['base_price']}`, "
-                f"adding `+{user_settings['increment']}` every `{user_settings['interval']}` min.\n\n"
-                + main_menu_text(),
+                f"adding `+{user_settings['increment']}` every "
+                f"`{user_settings['interval']}` min.\n\n" + main_menu_text(),
                 reply_markup=main_menu_keyboard(), parse_mode="Markdown"
             )
 
@@ -346,6 +386,75 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             await update.message.reply_text("❌ Invalid. Send a whole number like `2`", parse_mode="Markdown")
 
+    # Ad details — 4 step flow: payment → min → max → quantity
+    elif action == "payment":
+        user_settings["payment"] = text
+        user_state["action"] = "min"
+        await update.message.reply_text(
+            f"✅ Payment ID: `{text}`\n\n"
+            "Step 2 of 4 — Send the *minimum* order amount on your ad.\n\nExample: `1000`",
+            parse_mode="Markdown"
+        )
+
+    elif action == "min":
+        try:
+            float(text)
+            user_settings["min"] = text
+            user_state["action"] = "max"
+            await update.message.reply_text(
+                f"✅ Min: `{text}`\n\n"
+                "Step 3 of 4 — Send the *maximum* order amount on your ad.\n\nExample: `500000`",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            await update.message.reply_text("❌ Invalid. Send a number like `1000`", parse_mode="Markdown")
+
+    elif action == "max":
+        try:
+            float(text)
+            user_settings["max"] = text
+            user_state["action"] = "quantity"
+            await update.message.reply_text(
+                f"✅ Max: `{text}`\n\n"
+                "Step 4 of 4 — Send the *token quantity* on your ad.\n\nExample: `5000`",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            await update.message.reply_text("❌ Invalid. Send a number like `500000`", parse_mode="Markdown")
+
+    elif action == "quantity":
+        try:
+            float(text)
+            user_settings["quantity"] = text
+            user_state["action"] = None
+            await update.message.reply_text(
+                f"✅ Quantity: `{text}`\n\n"
+                "✅ *All ad details saved!*\n\nTap /menu to continue.",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            await update.message.reply_text("❌ Invalid. Send a number like `5000`", parse_mode="Markdown")
+
+
+# ─────────────────────────────────────────
+# /getpaymentid
+# ─────────────────────────────────────────
+async def get_payment_id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    from bybit import get_payment_methods
+    await update.message.reply_text("⏳ Fetching from Bybit...")
+    loop   = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, get_payment_methods)
+    raw    = str(result)
+    if len(raw) > 3500:
+        raw = raw[:3500] + "...(truncated)"
+    await update.message.reply_text(
+        f"📋 Raw Bybit response:\n\n`{raw}`\n\n"
+        "Copy the `id` value and use *Set Ad Details* in /menu.",
+        parse_mode="Markdown"
+    )
+
 
 # ─────────────────────────────────────────
 # 🔧 BUILD BOT
@@ -357,8 +466,9 @@ def start_bot():
         .updater(None)
         .build()
     )
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("menu",  menu_command))
+    application.add_handler(CommandHandler("start",        start))
+    application.add_handler(CommandHandler("menu",         menu_command))
+    application.add_handler(CommandHandler("getpaymentid", get_payment_id_command))
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     logger.info("🤖 Bot handlers registered")
