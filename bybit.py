@@ -13,20 +13,16 @@ BASE_URL = "https://api.bybit.com"
 
 # ─────────────────────────────────────────
 # 🔐 Signature
-# Bybit spec:
-#   GET  → timestamp + api_key + recv_window + queryString
-#   POST → timestamp + api_key + recv_window + jsonBodyString
-# Result must be lowercase hex (HMAC_SHA256)
+# GET  → timestamp + api_key + recv_window + queryString
+# POST → timestamp + api_key + recv_window + jsonBodyString
 # ─────────────────────────────────────────
 def generate_signature(timestamp: str, payload: str, recv_window: str = "5000") -> str:
     raw = f"{timestamp}{BYBIT_API_KEY}{recv_window}{payload}"
-    logger.info(f"[Bybit] Signing string: {raw[:80]}...")
-    sig = hmac.new(
+    return hmac.new(
         BYBIT_API_SECRET.encode("utf-8"),
         raw.encode("utf-8"),
         hashlib.sha256
-    ).hexdigest()          # lowercase hex — correct per spec
-    return sig
+    ).hexdigest()
 
 
 def get_headers(payload: str = "") -> dict:
@@ -42,21 +38,18 @@ def get_headers(payload: str = "") -> dict:
     }
 
 
-# ─────────────────────────────────────────
-# 🛠 Shared response parser with full logging
-# ─────────────────────────────────────────
 def parse_response(response, label=""):
     logger.info(f"[Bybit]{label} HTTP status : {response.status_code}")
     logger.info(f"[Bybit]{label} Raw body    : {response.text[:500]}")
 
     if not response.text.strip():
-        return {"retCode": -1, "retMsg": "Empty response — check IP whitelist on Bybit API key"}
+        return {"retCode": -1, "retMsg": "Empty response — check IP whitelist and API key P2P permissions on Bybit"}
 
     if response.status_code == 404:
-        return {"retCode": -1, "retMsg": f"404 Not Found — endpoint may be wrong: {response.url}"}
+        return {"retCode": -1, "retMsg": f"404 — endpoint not found or API key missing P2P permission"}
 
     if response.text.strip().startswith("<"):
-        return {"retCode": -1, "retMsg": f"HTML response (geo-block or CDN error) HTTP {response.status_code}"}
+        return {"retCode": -1, "retMsg": f"HTML/CDN block — HTTP {response.status_code}. Check Render region or IP whitelist"}
 
     try:
         return response.json()
@@ -65,43 +58,64 @@ def parse_response(response, label=""):
 
 
 # ─────────────────────────────────────────
+# 🏓 Ping / API connectivity test
+# Uses GET /v5/account/wallet-balance which
+# is a simple authenticated endpoint that
+# works if key + signature + IP are all OK
+# ─────────────────────────────────────────
+def ping_api():
+    # Use Bybit server time endpoint (no auth needed) to check connectivity first
+    try:
+        r = requests.get(f"{BASE_URL}/v3/public/time", timeout=5)
+        server_time = r.json().get("result", {}).get("timeSecond", "unknown")
+        logger.info(f"[Bybit] Server time: {server_time}")
+    except Exception as e:
+        return {"retCode": -1, "retMsg": f"Cannot reach Bybit servers at all: {e}"}
+
+    # Now test authenticated endpoint — GET /v5/user/query-api
+    # This returns info about the API key itself (permissions, IP whitelist etc)
+    endpoint    = "/v5/user/query-api"
+    url         = BASE_URL + endpoint
+    query       = ""          # no query params
+    headers     = get_headers(query)
+
+    logger.info(f"[Bybit] Ping → GET {url}")
+
+    try:
+        response = requests.get(url, headers=headers, timeout=10)
+        result   = parse_response(response, " [ping]")
+        logger.info(f"[Bybit] Ping result: {result}")
+        return result
+    except Exception as e:
+        logger.error(f"[Bybit] ping error: {e}")
+        return {"error": str(e)}
+
+
+# ─────────────────────────────────────────
 # 🔍 Get User Payment Methods
-# Correct endpoint from Bybit P2P docs
 # ─────────────────────────────────────────
 def get_payment_methods():
-    # Try both known endpoint variants and log which works
     endpoints_to_try = [
         "/v5/p2p/user/payment/list",
         "/v5/p2p/payment/list",
     ]
-
     for endpoint in endpoints_to_try:
         url     = BASE_URL + endpoint
-        headers = get_headers("")   # GET with no query string → payload = ""
-
+        headers = get_headers("")
         logger.info(f"[Bybit] GET {url}")
-        logger.info(f"[Bybit] Headers: {headers}")
-
         try:
             response = requests.get(url, headers=headers, timeout=10)
             result   = parse_response(response, f" [{endpoint}]")
-
-            # If not 404 this is the right endpoint
-            if result.get("retCode") != -1 or "404" not in result.get("retMsg", ""):
-                logger.info(f"[Bybit] Working endpoint: {endpoint}")
+            if "404" not in result.get("retMsg", ""):
                 return result
-            else:
-                logger.warning(f"[Bybit] Endpoint {endpoint} returned 404, trying next...")
-
+            logger.warning(f"[Bybit] {endpoint} → 404, trying next...")
         except Exception as e:
-            logger.error(f"[Bybit] Request error on {endpoint}: {e}")
-
-    return {"retCode": -1, "retMsg": "All payment endpoints returned 404 — check Bybit API docs for correct URL"}
+            logger.error(f"[Bybit] {endpoint} error: {e}")
+    return {"retCode": -1, "retMsg": "All payment endpoints failed — enable P2P permission on your Bybit API key"}
 
 
 # ─────────────────────────────────────────
 # 🔄 Modify Ad — update fixed price
-# POST /v5/p2p/item/update
 # ─────────────────────────────────────────
 def modify_ad(ad_id: str, new_price: str, settings: dict) -> dict:
     endpoint = "/v5/p2p/item/update"
@@ -110,7 +124,7 @@ def modify_ad(ad_id: str, new_price: str, settings: dict) -> dict:
     body = {
         "id":            ad_id,
         "actionType":    "MODIFY",
-        "priceType":     "0",                            # fixed price
+        "priceType":     "0",
         "price":         str(new_price),
         "premium":       "",
         "minAmount":     settings.get("min",            ""),
@@ -135,7 +149,6 @@ def modify_ad(ad_id: str, new_price: str, settings: dict) -> dict:
         }
     }
 
-    # POST payload must be compact JSON (no spaces) for correct signature
     payload = json.dumps(body, separators=(',', ':'))
     headers = get_headers(payload)
 
@@ -151,12 +164,10 @@ def modify_ad(ad_id: str, new_price: str, settings: dict) -> dict:
     try:
         response = requests.post(url, headers=headers, data=payload, timeout=10)
         result   = parse_response(response, " [modify_ad]")
-        logger.info(f"[Bybit] Result   : {result}")
+        logger.info(f"[Bybit] Result: {result}")
         logger.info("=" * 55)
         return result
-
     except requests.exceptions.Timeout:
-        logger.error("[Bybit] modify_ad timed out")
         return {"retCode": -1, "retMsg": "Request timed out"}
     except Exception as e:
         logger.error(f"[Bybit] modify_ad exception: {e}")
