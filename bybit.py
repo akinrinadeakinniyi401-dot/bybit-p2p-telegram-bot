@@ -40,16 +40,16 @@ def get_headers(payload: str = "") -> dict:
 
 def parse_response(response, label=""):
     logger.info(f"[Bybit]{label} HTTP status : {response.status_code}")
-    logger.info(f"[Bybit]{label} Raw body    : {response.text[:500]}")
+    logger.info(f"[Bybit]{label} Raw body    : {response.text[:800]}")
 
     if not response.text.strip():
-        return {"retCode": -1, "retMsg": "Empty response — check IP whitelist and API key P2P permissions on Bybit"}
+        return {"retCode": -1, "retMsg": "Empty response — check IP whitelist on Bybit API key"}
 
     if response.status_code == 404:
-        return {"retCode": -1, "retMsg": f"404 — endpoint not found or API key missing P2P permission"}
+        return {"retCode": -1, "retMsg": "404 — endpoint not found or API key missing P2P permission"}
 
     if response.text.strip().startswith("<"):
-        return {"retCode": -1, "retMsg": f"HTML/CDN block — HTTP {response.status_code}. Check Render region or IP whitelist"}
+        return {"retCode": -1, "retMsg": f"HTML/CDN block — HTTP {response.status_code}"}
 
     try:
         return response.json()
@@ -58,117 +58,118 @@ def parse_response(response, label=""):
 
 
 # ─────────────────────────────────────────
-# 🏓 Ping / API connectivity test
-# Uses GET /v5/account/wallet-balance which
-# is a simple authenticated endpoint that
-# works if key + signature + IP are all OK
+# 🏓 Ping — test API key + show permissions
 # ─────────────────────────────────────────
 def ping_api():
-    # Use Bybit server time endpoint (no auth needed) to check connectivity first
+    # First check Bybit server reachability
     try:
-        r = requests.get(f"{BASE_URL}/v3/public/time", timeout=5)
+        r           = requests.get(f"{BASE_URL}/v3/public/time", timeout=5)
         server_time = r.json().get("result", {}).get("timeSecond", "unknown")
         logger.info(f"[Bybit] Server time: {server_time}")
     except Exception as e:
-        return {"retCode": -1, "retMsg": f"Cannot reach Bybit servers at all: {e}"}
+        return {"retCode": -1, "retMsg": f"Cannot reach Bybit: {e}"}
 
-    # Now test authenticated endpoint — GET /v5/user/query-api
-    # This returns info about the API key itself (permissions, IP whitelist etc)
-    endpoint    = "/v5/user/query-api"
-    url         = BASE_URL + endpoint
-    query       = ""          # no query params
-    headers     = get_headers(query)
-
+    # Test authenticated endpoint
+    url     = BASE_URL + "/v5/user/query-api"
+    headers = get_headers("")
     logger.info(f"[Bybit] Ping → GET {url}")
-
     try:
         response = requests.get(url, headers=headers, timeout=10)
         result   = parse_response(response, " [ping]")
         logger.info(f"[Bybit] Ping result: {result}")
         return result
     except Exception as e:
-        logger.error(f"[Bybit] ping error: {e}")
         return {"error": str(e)}
 
 
 # ─────────────────────────────────────────
-# 🔍 Get User Payment Methods
+# 📋 Get Ad Details
+# POST /v5/p2p/item/info
+# Returns all real values of your ad
 # ─────────────────────────────────────────
-def get_payment_methods():
-    endpoints_to_try = [
-        "/v5/p2p/user/payment/list",
-        "/v5/p2p/payment/list",
-    ]
-    for endpoint in endpoints_to_try:
-        url     = BASE_URL + endpoint
-        headers = get_headers("")
-        logger.info(f"[Bybit] GET {url}")
-        try:
-            response = requests.get(url, headers=headers, timeout=10)
-            result   = parse_response(response, f" [{endpoint}]")
-            if "404" not in result.get("retMsg", ""):
-                return result
-            logger.warning(f"[Bybit] {endpoint} → 404, trying next...")
-        except Exception as e:
-            logger.error(f"[Bybit] {endpoint} error: {e}")
-    return {"retCode": -1, "retMsg": "All payment endpoints failed — enable P2P permission on your Bybit API key"}
+def get_ad_details(ad_id: str) -> dict:
+    endpoint = "/v5/p2p/item/info"
+    url      = BASE_URL + endpoint
+
+    body    = {"itemId": ad_id}
+    payload = json.dumps(body, separators=(',', ':'))
+    headers = get_headers(payload)
+
+    logger.info(f"[Bybit] Fetching ad details for ID: {ad_id}")
+
+    try:
+        response = requests.post(url, headers=headers, data=payload, timeout=10)
+        result   = parse_response(response, " [get_ad_details]")
+        return result
+    except requests.exceptions.Timeout:
+        return {"retCode": -1, "retMsg": "Request timed out"}
+    except Exception as e:
+        logger.error(f"[Bybit] get_ad_details error: {e}")
+        return {"error": str(e)}
 
 
 # ─────────────────────────────────────────
-# 🔄 Modify Ad — update fixed price
+# 🔄 Modify Ad — update fixed price only
+# Uses real values fetched from get_ad_details
+# POST /v5/p2p/item/update
 # ─────────────────────────────────────────
-def modify_ad(ad_id: str, new_price: str, settings: dict) -> dict:
+def modify_ad(ad_id: str, new_price: str, ad_data: dict) -> dict:
     endpoint = "/v5/p2p/item/update"
     url      = BASE_URL + endpoint
+
+    # Build tradingPreferenceSet from real ad values
+    # Convert int values to strings as Bybit update endpoint expects strings
+    tps = ad_data.get("tradingPreferenceSet", {})
+    trading_pref = {
+        "hasUnPostAd":               str(tps.get("hasUnPostAd",               "0")),
+        "isKyc":                     str(tps.get("isKyc",                     "0")),
+        "isEmail":                   str(tps.get("isEmail",                   "0")),
+        "isMobile":                  str(tps.get("isMobile",                  "0")),
+        "hasRegisterTime":           str(tps.get("hasRegisterTime",           "0")),
+        "registerTimeThreshold":     str(tps.get("registerTimeThreshold",     "0")),
+        "orderFinishNumberDay30":    str(tps.get("orderFinishNumberDay30",    "0")),
+        "completeRateDay30":         str(tps.get("completeRateDay30",         "0")),
+        "nationalLimit":             str(tps.get("nationalLimit",             "")),
+        "hasOrderFinishNumberDay30": str(tps.get("hasOrderFinishNumberDay30", "0")),
+        "hasCompleteRateDay30":      str(tps.get("hasCompleteRateDay30",      "0")),
+        "hasNationalLimit":          str(tps.get("hasNationalLimit",          "0")),
+    }
 
     body = {
         "id":            ad_id,
         "actionType":    "MODIFY",
-        "priceType":     "0",
+        "priceType":     str(ad_data.get("priceType", "0")),
         "price":         str(new_price),
-        "premium":       "",
-        "minAmount":     settings.get("min",            ""),
-        "maxAmount":     settings.get("max",            ""),
-        "quantity":      settings.get("quantity",       ""),
-        "paymentIds":    [settings.get("payment",       "")],
-        "paymentPeriod": settings.get("payment_period", "15"),
-        "remark":        settings.get("remark",         ""),
-        "tradingPreferenceSet": {
-            "hasUnPostAd":               "0",
-            "isKyc":                     "1",
-            "isEmail":                   "0",
-            "isMobile":                  "0",
-            "hasRegisterTime":           "0",
-            "registerTimeThreshold":     "0",
-            "orderFinishNumberDay30":    "0",
-            "completeRateDay30":         "0",
-            "nationalLimit":             "",
-            "hasOrderFinishNumberDay30": "0",
-            "hasCompleteRateDay30":      "0",
-            "hasNationalLimit":          "0"
-        }
+        "premium":       str(ad_data.get("premium", "")),
+        "minAmount":     str(ad_data.get("minAmount", "")),
+        "maxAmount":     str(ad_data.get("maxAmount", "")),
+        "quantity":      str(ad_data.get("lastQuantity", ad_data.get("quantity", ""))),
+        "paymentIds":    [str(p) for p in ad_data.get("payments", [])],
+        "paymentPeriod": str(ad_data.get("paymentPeriod", "15")),
+        "remark":        str(ad_data.get("remark", "")),
+        "tradingPreferenceSet": trading_pref,
     }
 
     payload = json.dumps(body, separators=(',', ':'))
     headers = get_headers(payload)
 
     logger.info("=" * 55)
-    logger.info(f"[Bybit] POST {url}")
-    logger.info(f"[Bybit] Ad ID    : {ad_id}")
-    logger.info(f"[Bybit] New price: {new_price}")
-    logger.info(f"[Bybit] Min/Max  : {settings.get('min')} / {settings.get('max')}")
-    logger.info(f"[Bybit] Quantity : {settings.get('quantity')}")
-    logger.info(f"[Bybit] Payment  : {settings.get('payment')}")
-    logger.info(f"[Bybit] Body     : {payload}")
+    logger.info(f"[Bybit] MODIFY ad: {ad_id}")
+    logger.info(f"[Bybit] New price:  {new_price}")
+    logger.info(f"[Bybit] Min/Max:    {body['minAmount']} / {body['maxAmount']}")
+    logger.info(f"[Bybit] Quantity:   {body['quantity']}")
+    logger.info(f"[Bybit] PaymentIds: {body['paymentIds']}")
+    logger.info(f"[Bybit] Full body:  {payload}")
 
     try:
         response = requests.post(url, headers=headers, data=payload, timeout=10)
         result   = parse_response(response, " [modify_ad]")
-        logger.info(f"[Bybit] Result: {result}")
+        logger.info(f"[Bybit] Modify result: {result}")
         logger.info("=" * 55)
         return result
     except requests.exceptions.Timeout:
+        logger.error("[Bybit] modify_ad timed out")
         return {"retCode": -1, "retMsg": "Request timed out"}
     except Exception as e:
-        logger.error(f"[Bybit] modify_ad exception: {e}")
+        logger.error(f"[Bybit] modify_ad error: {e}")
         return {"error": str(e)}
