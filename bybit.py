@@ -52,16 +52,21 @@ def parse_response(response, label=""):
         return {"retCode": -1, "retMsg": f"HTML/CDN block — HTTP {response.status_code}"}
 
     try:
-        return response.json()
+        data = response.json()
+        # Bybit P2P uses ret_code/ret_msg, other endpoints use retCode/retMsg
+        # Normalise to retCode/retMsg so the rest of the code is consistent
+        if "ret_code" in data and "retCode" not in data:
+            data["retCode"] = data["ret_code"]
+            data["retMsg"]  = data.get("ret_msg", "")
+        return data
     except Exception as e:
         return {"retCode": -1, "retMsg": f"JSON parse error: {e} | body: {response.text[:200]}"}
 
 
 # ─────────────────────────────────────────
-# 🏓 Ping — test API key + show permissions
+# 🏓 Ping — test API key + permissions
 # ─────────────────────────────────────────
 def ping_api():
-    # First check Bybit server reachability
     try:
         r           = requests.get(f"{BASE_URL}/v3/public/time", timeout=5)
         server_time = r.json().get("result", {}).get("timeSecond", "unknown")
@@ -69,7 +74,6 @@ def ping_api():
     except Exception as e:
         return {"retCode": -1, "retMsg": f"Cannot reach Bybit: {e}"}
 
-    # Test authenticated endpoint
     url     = BASE_URL + "/v5/user/query-api"
     headers = get_headers("")
     logger.info(f"[Bybit] Ping → GET {url}")
@@ -85,22 +89,18 @@ def ping_api():
 # ─────────────────────────────────────────
 # 📋 Get Ad Details
 # POST /v5/p2p/item/info
-# Returns all real values of your ad
 # ─────────────────────────────────────────
 def get_ad_details(ad_id: str) -> dict:
     endpoint = "/v5/p2p/item/info"
     url      = BASE_URL + endpoint
-
-    body    = {"itemId": ad_id}
-    payload = json.dumps(body, separators=(',', ':'))
-    headers = get_headers(payload)
+    body     = {"itemId": ad_id}
+    payload  = json.dumps(body, separators=(',', ':'))
+    headers  = get_headers(payload)
 
     logger.info(f"[Bybit] Fetching ad details for ID: {ad_id}")
-
     try:
         response = requests.post(url, headers=headers, data=payload, timeout=10)
-        result   = parse_response(response, " [get_ad_details]")
-        return result
+        return parse_response(response, " [get_ad_details]")
     except requests.exceptions.Timeout:
         return {"retCode": -1, "retMsg": "Request timed out"}
     except Exception as e:
@@ -110,15 +110,23 @@ def get_ad_details(ad_id: str) -> dict:
 
 # ─────────────────────────────────────────
 # 🔄 Modify Ad — update fixed price only
-# Uses real values fetched from get_ad_details
 # POST /v5/p2p/item/update
+#
+# KEY FIX: paymentIds must use the IDs from
+# paymentTerms (e.g. "22381011") NOT the
+# payment type numbers from payments (e.g. "522")
 # ─────────────────────────────────────────
 def modify_ad(ad_id: str, new_price: str, ad_data: dict) -> dict:
     endpoint = "/v5/p2p/item/update"
     url      = BASE_URL + endpoint
 
+    # ✅ Extract payment METHOD IDs from paymentTerms
+    payment_terms = ad_data.get("paymentTerms", [])
+    payment_ids   = [str(pt["id"]) for pt in payment_terms if pt.get("id")]
+
+    logger.info(f"[Bybit] Payment method IDs from paymentTerms: {payment_ids}")
+
     # Build tradingPreferenceSet from real ad values
-    # Convert int values to strings as Bybit update endpoint expects strings
     tps = ad_data.get("tradingPreferenceSet", {})
     trading_pref = {
         "hasUnPostAd":               str(tps.get("hasUnPostAd",               "0")),
@@ -144,7 +152,7 @@ def modify_ad(ad_id: str, new_price: str, ad_data: dict) -> dict:
         "minAmount":     str(ad_data.get("minAmount", "")),
         "maxAmount":     str(ad_data.get("maxAmount", "")),
         "quantity":      str(ad_data.get("lastQuantity", ad_data.get("quantity", ""))),
-        "paymentIds":    [str(p) for p in ad_data.get("payments", [])],
+        "paymentIds":    payment_ids,   # ✅ real payment method IDs
         "paymentPeriod": str(ad_data.get("paymentPeriod", "15")),
         "remark":        str(ad_data.get("remark", "")),
         "tradingPreferenceSet": trading_pref,
