@@ -13,22 +13,19 @@ from bybit import modify_ad
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────
-# 🧠 State — must match your Bybit ad exactly
+# 🧠 State
 # ─────────────────────────────────────────
 user_settings = {
-    # Auto-update settings
-    "ad_id":      "",       # your Bybit ad ID
-    "base_price": "",       # current price on your ad right now
-    "increment":  "0.05",   # how much to add each cycle
-    "interval":   2,        # minutes between updates
-
-    # Must match what's set on your Bybit ad
-    "payment":        "",   # your payment method ID from Bybit
-    "min":            "",   # min order amount on your ad
-    "max":            "",   # max order amount on your ad
-    "quantity":       "",   # token quantity on your ad
-    "payment_period": "15", # payment window in minutes
-    "remark":         "",   # ad description
+    "ad_id":          "",
+    "base_price":     "",
+    "increment":      "0.05",
+    "interval":       2,
+    "payment":        "",
+    "min":            "",
+    "max":            "",
+    "quantity":       "",
+    "payment_period": "15",
+    "remark":         "",
 }
 
 user_state      = {}
@@ -76,12 +73,13 @@ def main_menu_text():
         f"💲 Base price: `{base_price}`\n"
         f"➕ Increment: `+{increment}` per cycle\n"
         f"⏱ Interval: every `{interval}` min\n\n"
-        f"📋 *Ad Details (must match Bybit):*\n"
+        f"📋 *Ad Details (must match Bybit ad):*\n"
         f"🏦 Payment ID: `{payment}`\n"
         f"💵 Min: `{min_amt}` | Max: `{max_amt}`\n"
         f"📦 Quantity: `{quantity}`\n\n"
         f"📈 Current price this session: `{cur}`\n"
-        f"📡 Status: {status}"
+        f"📡 Status: {status}\n\n"
+        f"💡 Type /pingbybit to test API connection"
     )
 
 
@@ -96,13 +94,13 @@ def _check_required():
     if not user_settings.get("base_price"):
         missing.append("💲 Base Price")
     if not user_settings.get("payment"):
-        missing.append("🏦 Payment ID (in Ad Details)")
+        missing.append("🏦 Payment ID (in Set Ad Details)")
     if not user_settings.get("min"):
-        missing.append("💵 Min amount (in Ad Details)")
+        missing.append("💵 Min amount (in Set Ad Details)")
     if not user_settings.get("max"):
-        missing.append("💵 Max amount (in Ad Details)")
+        missing.append("💵 Max amount (in Set Ad Details)")
     if not user_settings.get("quantity"):
-        missing.append("📦 Quantity (in Ad Details)")
+        missing.append("📦 Quantity (in Set Ad Details)")
     return missing
 
 
@@ -113,10 +111,10 @@ async def auto_update_loop(bot, chat_id):
     global refresh_running, current_price
 
     refresh_running = True
-    increment   = Decimal(str(user_settings.get("increment", "0.05")))
-    base_price  = Decimal(str(user_settings.get("base_price")))
+    increment     = Decimal(str(user_settings.get("increment", "0.05")))
+    base_price    = Decimal(str(user_settings.get("base_price")))
     current_price = base_price
-    interval    = user_settings.get("interval", 2)
+    interval      = user_settings.get("interval", 2)
 
     logger.info("=" * 60)
     logger.info("🚀 AUTO-UPDATE LOOP STARTED")
@@ -149,7 +147,7 @@ async def auto_update_loop(bot, chat_id):
         )
 
         ret_code = result.get("retCode", result.get("ret_code", -1))
-        ret_msg  = result.get("retMsg",  result.get("ret_msg", "Unknown"))
+        ret_msg  = result.get("retMsg",  result.get("ret_msg",  "Unknown"))
 
         if ret_code == 0:
             current_price = new_price
@@ -206,6 +204,110 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────
+# 🏓 /pingbybit — test API + show permissions
+# ─────────────────────────────────────────
+async def ping_bybit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+
+    await update.message.reply_text("⏳ Testing Bybit API connection...")
+
+    from bybit import ping_api
+    loop   = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, ping_api)
+
+    logger.info(f"[pingbybit] Full result: {result}")
+
+    ret_code = result.get("retCode", -1)
+    ret_msg  = result.get("retMsg", "")
+
+    if ret_code == 0:
+        info = result.get("result", {})
+
+        # Parse permissions
+        raw_perms = info.get("permissions", {})
+        perm_lines = []
+
+        # Known permission keys and what they mean for P2P
+        perm_map = {
+            "ContractTrade":  "Futures/Contract trading",
+            "Spot":           "Spot trading",
+            "Wallet":         "Wallet read",
+            "Options":        "Options trading",
+            "Derivatives":    "Derivatives",
+            "CopyTrading":    "Copy trading",
+            "BlockTrade":     "Block trade",
+            "Exchange":       "Exchange",
+            "NFT":            "NFT",
+            "Affiliate":      "Affiliate",
+            "OTC":            "OTC trading",
+        }
+
+        for key, vals in raw_perms.items():
+            label = perm_map.get(key, key)
+            if vals:
+                perm_lines.append(f"  ✅ {label}")
+            else:
+                perm_lines.append(f"  ❌ {label}")
+
+        # Check P2P specifically — Bybit P2P permission may appear as "Trade" or not listed
+        has_p2p = any(
+            "p2p" in str(v).lower() or "trade" in str(k).lower()
+            for k, v in raw_perms.items()
+            if v
+        )
+
+        ips        = info.get("ips", [])
+        api_key    = info.get("apiKey", "")
+        read_only  = info.get("readOnly", None)
+        expire     = info.get("expiredAt", "Never")
+
+        p2p_status = "✅ Likely enabled" if has_p2p else "⚠️ Not detected — enable P2P Trading on Bybit API key"
+
+        await update.message.reply_text(
+            f"✅ *Bybit API connected successfully!*\n\n"
+            f"🔑 API Key: `...{api_key[-6:] if api_key else 'hidden'}`\n"
+            f"🔒 Read only: `{read_only}`\n"
+            f"📅 Expires: `{expire}`\n"
+            f"🌍 Whitelisted IPs: `{', '.join(ips) if ips else 'None set'}`\n\n"
+            f"🔓 *Permissions:*\n" + "\n".join(perm_lines) + "\n\n"
+            f"🛒 P2P Trading: {p2p_status}\n\n"
+            f"{'✅ Ready to update ads!' if has_p2p else '❌ Enable P2P permission on your Bybit API key to update ads'}",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text(
+            f"❌ *Bybit API connection failed*\n\n"
+            f"Error: `{ret_msg}`\n\n"
+            f"*Checklist:*\n"
+            f"• ✅/❌ IP `74.220.52.2` added to Bybit API whitelist?\n"
+            f"• ✅/❌ API key has P2P Trading permission?\n"
+            f"• ✅/❌ API key and secret correct in Render env vars?",
+            parse_mode="Markdown"
+        )
+
+
+# ─────────────────────────────────────────
+# 📋 /getpaymentid
+# ─────────────────────────────────────────
+async def get_payment_id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    await update.message.reply_text("⏳ Fetching payment methods from Bybit...")
+    from bybit import get_payment_methods
+    loop   = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, get_payment_methods)
+    raw    = str(result)
+    if len(raw) > 3500:
+        raw = raw[:3500] + "...(truncated)"
+    await update.message.reply_text(
+        f"📋 Raw Bybit response:\n\n`{raw}`\n\n"
+        "Copy the `id` value and use *Set Ad Details* → Payment ID in /menu.",
+        parse_mode="Markdown"
+    )
+
+
+# ─────────────────────────────────────────
 # 🎛️ BUTTON HANDLER
 # ─────────────────────────────────────────
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -225,7 +327,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "🆔 Send your Bybit Ad ID.\n\n"
             "*How to find it:*\n"
-            "Bybit App → P2P → My Ads → tap your ad → copy the ID from the page.\n\n"
+            "Bybit App → P2P → My Ads → tap your ad → copy the long ID number.\n\n"
             "Example: `1898988222063644672`",
             reply_markup=InlineKeyboardMarkup(back_button()), parse_mode="Markdown"
         )
@@ -250,7 +352,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "set_interval":
         user_state["action"] = "interval"
         await query.edit_message_text(
-            "⏱ Send interval in *minutes* between each update.\n\n"
+            "⏱ Send the interval in *minutes* between each update.\n\n"
             "Examples: `2` = every 2 min | `5` = every 5 min\nMinimum: `1`",
             reply_markup=InlineKeyboardMarkup(back_button()), parse_mode="Markdown"
         )
@@ -258,11 +360,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "set_ad_details":
         user_state["action"] = "payment"
         await query.edit_message_text(
-            "📋 *Ad Details Setup*\n\n"
-            "These must exactly match what is set on your Bybit ad.\n\n"
-            "Step 1 of 4 — Send your *Payment Method ID*.\n\n"
-            "To find it: Bybit → P2P → My Ads → tap your ad → check payment details.\n"
-            "Or type /getpaymentid to fetch it from Bybit.\n\n"
+            "📋 *Ad Details Setup — Step 1 of 4*\n\n"
+            "These must exactly match what is on your Bybit ad.\n\n"
+            "Send your *Payment Method ID*.\n\n"
+            "Use /getpaymentid to fetch it from Bybit, or find it in:\n"
+            "Bybit → P2P → My Ads → tap ad → payment section.\n\n"
             "Example: `7110`",
             reply_markup=InlineKeyboardMarkup(back_button()), parse_mode="Markdown"
         )
@@ -278,7 +380,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         price_to_use = str(current_price) if current_price else user_settings["base_price"]
         await query.edit_message_text(
-            f"⏳ Sending update (price: `{price_to_use}`)...", parse_mode="Markdown"
+            f"⏳ Sending update to Bybit (price: `{price_to_use}`)...",
+            parse_mode="Markdown"
         )
 
         result = await asyncio.get_event_loop().run_in_executor(
@@ -291,7 +394,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if ret_code == 0:
             await query.edit_message_text(
-                f"✅ *Updated!* Price: `{price_to_use}`\n\n" + main_menu_text(),
+                f"✅ *Ad updated!* Price: `{price_to_use}`\n\n" + main_menu_text(),
                 reply_markup=main_menu_keyboard(), parse_mode="Markdown"
             )
         else:
@@ -386,13 +489,14 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             await update.message.reply_text("❌ Invalid. Send a whole number like `2`", parse_mode="Markdown")
 
-    # Ad details — 4 step flow: payment → min → max → quantity
+    # Ad details — 4 step flow
     elif action == "payment":
         user_settings["payment"] = text
         user_state["action"] = "min"
         await update.message.reply_text(
             f"✅ Payment ID: `{text}`\n\n"
-            "Step 2 of 4 — Send the *minimum* order amount on your ad.\n\nExample: `1000`",
+            "*Step 2 of 4* — Send the *minimum* order amount on your ad.\n\n"
+            "Example: `1000`",
             parse_mode="Markdown"
         )
 
@@ -403,7 +507,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_state["action"] = "max"
             await update.message.reply_text(
                 f"✅ Min: `{text}`\n\n"
-                "Step 3 of 4 — Send the *maximum* order amount on your ad.\n\nExample: `500000`",
+                "*Step 3 of 4* — Send the *maximum* order amount on your ad.\n\n"
+                "Example: `500000`",
                 parse_mode="Markdown"
             )
         except Exception:
@@ -416,7 +521,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_state["action"] = "quantity"
             await update.message.reply_text(
                 f"✅ Max: `{text}`\n\n"
-                "Step 4 of 4 — Send the *token quantity* on your ad.\n\nExample: `5000`",
+                "*Step 4 of 4* — Send the *token quantity* on your ad.\n\n"
+                "Example: `5000`",
                 parse_mode="Markdown"
             )
         except Exception:
@@ -429,31 +535,12 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_state["action"] = None
             await update.message.reply_text(
                 f"✅ Quantity: `{text}`\n\n"
-                "✅ *All ad details saved!*\n\nTap /menu to continue.",
+                "✅ *All ad details saved!*\n\n"
+                "Tap /menu to continue.",
                 parse_mode="Markdown"
             )
         except Exception:
             await update.message.reply_text("❌ Invalid. Send a number like `5000`", parse_mode="Markdown")
-
-
-# ─────────────────────────────────────────
-# /getpaymentid
-# ─────────────────────────────────────────
-async def get_payment_id_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
-    from bybit import get_payment_methods
-    await update.message.reply_text("⏳ Fetching from Bybit...")
-    loop   = asyncio.get_event_loop()
-    result = await loop.run_in_executor(None, get_payment_methods)
-    raw    = str(result)
-    if len(raw) > 3500:
-        raw = raw[:3500] + "...(truncated)"
-    await update.message.reply_text(
-        f"📋 Raw Bybit response:\n\n`{raw}`\n\n"
-        "Copy the `id` value and use *Set Ad Details* in /menu.",
-        parse_mode="Markdown"
-    )
 
 
 # ─────────────────────────────────────────
@@ -466,9 +553,10 @@ def start_bot():
         .updater(None)
         .build()
     )
-    application.add_handler(CommandHandler("start",        start))
-    application.add_handler(CommandHandler("menu",         menu_command))
-    application.add_handler(CommandHandler("getpaymentid", get_payment_id_command))
+    application.add_handler(CommandHandler("start",         start))
+    application.add_handler(CommandHandler("menu",          menu_command))
+    application.add_handler(CommandHandler("pingbybit",     ping_bybit_command))
+    application.add_handler(CommandHandler("getpaymentid",  get_payment_id_command))
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     logger.info("🤖 Bot handlers registered")
