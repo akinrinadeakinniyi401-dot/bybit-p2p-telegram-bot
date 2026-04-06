@@ -10,11 +10,22 @@ logger = logging.getLogger(__name__)
 
 BASE_URL = "https://api.bybit.com"
 
+# ─────────────────────────────────────────
+# Max floating % per currency and coin
+# ─────────────────────────────────────────
+MAX_FLOAT_PCT = {
+    "NGN": {"BTC": 110, "ETH": 110, "USDT": 110, "USDC": 110},
+    "USD": {"BTC": 130, "ETH": 130, "USDT": 120, "USDC": 120},
+}
+
+def get_max_float_pct(currency_id: str, token_id: str) -> int:
+    currency = currency_id.upper()
+    token    = token_id.upper()
+    return MAX_FLOAT_PCT.get(currency, {}).get(token, 110)
+
 
 # ─────────────────────────────────────────
 # 🔐 Signature
-# GET  → timestamp + api_key + recv_window + queryString
-# POST → timestamp + api_key + recv_window + jsonBodyString
 # ─────────────────────────────────────────
 def generate_signature(timestamp: str, payload: str, recv_window: str = "5000") -> str:
     raw = f"{timestamp}{BYBIT_API_KEY}{recv_window}{payload}"
@@ -44,27 +55,23 @@ def parse_response(response, label=""):
 
     if not response.text.strip():
         return {"retCode": -1, "retMsg": "Empty response — check IP whitelist on Bybit API key"}
-
     if response.status_code == 404:
-        return {"retCode": -1, "retMsg": "404 — endpoint not found or API key missing P2P permission"}
-
+        return {"retCode": -1, "retMsg": "404 — endpoint not found or missing P2P permission"}
     if response.text.strip().startswith("<"):
         return {"retCode": -1, "retMsg": f"HTML/CDN block — HTTP {response.status_code}"}
-
     try:
         data = response.json()
-        # Bybit P2P uses ret_code/ret_msg, other endpoints use retCode/retMsg
-        # Normalise to retCode/retMsg so the rest of the code is consistent
+        # Normalise P2P ret_code/ret_msg → retCode/retMsg
         if "ret_code" in data and "retCode" not in data:
             data["retCode"] = data["ret_code"]
             data["retMsg"]  = data.get("ret_msg", "")
         return data
     except Exception as e:
-        return {"retCode": -1, "retMsg": f"JSON parse error: {e} | body: {response.text[:200]}"}
+        return {"retCode": -1, "retMsg": f"JSON parse error: {e}"}
 
 
 # ─────────────────────────────────────────
-# 🏓 Ping — test API key + permissions
+# 🏓 Ping
 # ─────────────────────────────────────────
 def ping_api():
     try:
@@ -76,7 +83,6 @@ def ping_api():
 
     url     = BASE_URL + "/v5/user/query-api"
     headers = get_headers("")
-    logger.info(f"[Bybit] Ping → GET {url}")
     try:
         response = requests.get(url, headers=headers, timeout=10)
         result   = parse_response(response, " [ping]")
@@ -84,6 +90,31 @@ def ping_api():
         return result
     except Exception as e:
         return {"error": str(e)}
+
+
+# ─────────────────────────────────────────
+# 💲 Get BTC/USDT spot price from Bybit
+# GET /v5/market/tickers?category=spot&symbol=BTCUSDT
+# Returns last traded price as float
+# ─────────────────────────────────────────
+def get_btc_usdt_price() -> float:
+    url    = f"{BASE_URL}/v5/market/tickers"
+    params = {"category": "spot", "symbol": "BTCUSDT"}
+    logger.info(f"[Bybit] Fetching BTC/USDT price...")
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        logger.info(f"[Bybit] Tickers status: {response.status_code}")
+        logger.info(f"[Bybit] Tickers body:   {response.text[:300]}")
+        data  = response.json()
+        items = data.get("result", {}).get("list", [])
+        if items:
+            price = float(items[0].get("lastPrice", 0))
+            logger.info(f"[Bybit] BTC/USDT price: {price}")
+            return price
+        return 0.0
+    except Exception as e:
+        logger.error(f"[Bybit] get_btc_usdt_price error: {e}")
+        return 0.0
 
 
 # ─────────────────────────────────────────
@@ -96,7 +127,6 @@ def get_ad_details(ad_id: str) -> dict:
     body     = {"itemId": ad_id}
     payload  = json.dumps(body, separators=(',', ':'))
     headers  = get_headers(payload)
-
     logger.info(f"[Bybit] Fetching ad details for ID: {ad_id}")
     try:
         response = requests.post(url, headers=headers, data=payload, timeout=10)
@@ -109,24 +139,39 @@ def get_ad_details(ad_id: str) -> dict:
 
 
 # ─────────────────────────────────────────
-# 🔄 Modify Ad — update fixed price only
+# 📃 Get My Ads List
+# POST /v5/p2p/item/personal/list
+# ─────────────────────────────────────────
+def get_my_ads() -> dict:
+    endpoint = "/v5/p2p/item/personal/list"
+    url      = BASE_URL + endpoint
+    body     = {"page": "1", "size": "50"}
+    payload  = json.dumps(body, separators=(',', ':'))
+    headers  = get_headers(payload)
+    logger.info(f"[Bybit] Fetching my ads list...")
+    try:
+        response = requests.post(url, headers=headers, data=payload, timeout=10)
+        return parse_response(response, " [get_my_ads]")
+    except requests.exceptions.Timeout:
+        return {"retCode": -1, "retMsg": "Request timed out"}
+    except Exception as e:
+        logger.error(f"[Bybit] get_my_ads error: {e}")
+        return {"error": str(e)}
+
+
+# ─────────────────────────────────────────
+# 🔄 Modify Ad
 # POST /v5/p2p/item/update
-#
-# KEY FIX: paymentIds must use the IDs from
-# paymentTerms (e.g. "22381011") NOT the
-# payment type numbers from payments (e.g. "522")
 # ─────────────────────────────────────────
 def modify_ad(ad_id: str, new_price: str, ad_data: dict) -> dict:
     endpoint = "/v5/p2p/item/update"
     url      = BASE_URL + endpoint
 
-    # ✅ Extract payment METHOD IDs from paymentTerms
+    # ✅ Use payment METHOD IDs from paymentTerms
     payment_terms = ad_data.get("paymentTerms", [])
     payment_ids   = [str(pt["id"]) for pt in payment_terms if pt.get("id")]
+    logger.info(f"[Bybit] Payment method IDs: {payment_ids}")
 
-    logger.info(f"[Bybit] Payment method IDs from paymentTerms: {payment_ids}")
-
-    # Build tradingPreferenceSet from real ad values
     tps = ad_data.get("tradingPreferenceSet", {})
     trading_pref = {
         "hasUnPostAd":               str(tps.get("hasUnPostAd",               "0")),
@@ -152,7 +197,7 @@ def modify_ad(ad_id: str, new_price: str, ad_data: dict) -> dict:
         "minAmount":     str(ad_data.get("minAmount", "")),
         "maxAmount":     str(ad_data.get("maxAmount", "")),
         "quantity":      str(ad_data.get("lastQuantity", ad_data.get("quantity", ""))),
-        "paymentIds":    payment_ids,   # ✅ real payment method IDs
+        "paymentIds":    payment_ids,
         "paymentPeriod": str(ad_data.get("paymentPeriod", "15")),
         "remark":        str(ad_data.get("remark", "")),
         "tradingPreferenceSet": trading_pref,
