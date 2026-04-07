@@ -19,9 +19,7 @@ MAX_FLOAT_PCT = {
 }
 
 def get_max_float_pct(currency_id: str, token_id: str) -> int:
-    currency = currency_id.upper()
-    token    = token_id.upper()
-    return MAX_FLOAT_PCT.get(currency, {}).get(token, 110)
+    return MAX_FLOAT_PCT.get(currency_id.upper(), {}).get(token_id.upper(), 110)
 
 
 # ─────────────────────────────────────────
@@ -93,14 +91,12 @@ def ping_api():
 
 
 # ─────────────────────────────────────────
-# 💲 Get BTC/USDT spot price from Bybit
-# GET /v5/market/tickers?category=spot&symbol=BTCUSDT
-# Returns last traded price as float
+# 💲 Get BTC/USDT spot price
 # ─────────────────────────────────────────
 def get_btc_usdt_price() -> float:
     url    = f"{BASE_URL}/v5/market/tickers"
     params = {"category": "spot", "symbol": "BTCUSDT"}
-    logger.info(f"[Bybit] Fetching BTC/USDT price...")
+    logger.info("[Bybit] Fetching BTC/USDT price...")
     try:
         response = requests.get(url, params=params, timeout=10)
         logger.info(f"[Bybit] Tickers status: {response.status_code}")
@@ -141,14 +137,14 @@ def get_ad_details(ad_id: str) -> dict:
 # ─────────────────────────────────────────
 # 📃 Get My Ads List
 # POST /v5/p2p/item/personal/list
+# Body must be {} — all params are optional
 # ─────────────────────────────────────────
 def get_my_ads() -> dict:
     endpoint = "/v5/p2p/item/personal/list"
     url      = BASE_URL + endpoint
-    body     = {"page": "1", "size": "50"}
-    payload  = json.dumps(body, separators=(',', ':'))
+    payload  = "{}"                          # empty JSON object — do NOT add page/size
     headers  = get_headers(payload)
-    logger.info(f"[Bybit] Fetching my ads list...")
+    logger.info("[Bybit] Fetching my ads list...")
     try:
         response = requests.post(url, headers=headers, data=payload, timeout=10)
         return parse_response(response, " [get_my_ads]")
@@ -167,7 +163,7 @@ def modify_ad(ad_id: str, new_price: str, ad_data: dict) -> dict:
     endpoint = "/v5/p2p/item/update"
     url      = BASE_URL + endpoint
 
-    # ✅ Use payment METHOD IDs from paymentTerms
+    # Use payment METHOD IDs from paymentTerms
     payment_terms = ad_data.get("paymentTerms", [])
     payment_ids   = [str(pt["id"]) for pt in payment_terms if pt.get("id")]
     logger.info(f"[Bybit] Payment method IDs: {payment_ids}")
