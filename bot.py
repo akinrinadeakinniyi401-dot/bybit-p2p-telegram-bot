@@ -576,6 +576,7 @@ async def ping_bybit_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global refresh_task, refresh_running, current_price, ad_data
     global order_monitor_task, order_monitor_running, auto_pay_enabled
+    global seen_order_ids, paid_order_ids
 
     query   = update.callback_query
     await query.answer()
@@ -638,7 +639,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "reset_do":
-        global seen_order_ids, paid_order_ids
         # Stop everything
         refresh_running       = False
         order_monitor_running = False
