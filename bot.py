@@ -63,7 +63,7 @@ def setup_progress() -> tuple:
     ]
     done  = sum(steps)
     total = len(steps)
-    bar   = "".join(["✅" if s else "⬜"] for s in steps)
+    bar   = "".join("✅" if s else "⬜" for s in steps)
     return done, total, bar
 
 
