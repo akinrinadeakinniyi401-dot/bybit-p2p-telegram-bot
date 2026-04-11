@@ -199,6 +199,22 @@ def mark_order_paid(order_id: str, payment_type: str, payment_id: str) -> dict:
 
 
 # ─────────────────────────────────────────
+# 🪙 Release Assets (SELL orders)
+# POST /v5/p2p/order/finish
+# ─────────────────────────────────────────
+def release_assets(order_id: str) -> dict:
+    logger.info(f"[Bybit] Releasing assets for order: {order_id}")
+    return _post("/v5/p2p/order/finish", {"orderId": order_id})
+
+
+# ─────────────────────────────────────────
+# 📦 Get Sell Orders (status 20 = awaiting seller release)
+# ─────────────────────────────────────────
+def get_sell_orders() -> dict:
+    return _post("/v5/p2p/order/pending/simplifyList", {"status": 20, "page": 1, "size": 30})
+
+
+# ─────────────────────────────────────────
 # 💬 Send Chat Message
 # ─────────────────────────────────────────
 def send_chat_message(order_id: str, message: str) -> dict:
