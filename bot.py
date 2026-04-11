@@ -408,16 +408,22 @@ async def order_monitor_loop(bot, chat_id):
     global sell_msg_enabled, sell_custom_msg, sell_msg_count
 
     order_monitor_running = True
-    logger.info("🔔 ORDER MONITOR STARTED — watching BUY + SELL orders")
+    logger.info("🔔 ORDER MONITOR STARTED — BUY (status 10 side 0) + SELL (status 10 side 1 → status 20)")
 
     while order_monitor_running:
         try:
-            # ── BUY orders (status 10 = awaiting buyer payment) ──
-            buy_result = await asyncio.get_event_loop().run_in_executor(None, get_pending_orders)
-            if buy_result.get("retCode", buy_result.get("ret_code", -1)) == 0:
-                buy_items = buy_result.get("result", {}).get("items", [])
-                logger.info(f"[Orders] BUY: {len(buy_items)} pending")
+            # ── ONE call fetches ALL status=10 orders (both BUY and SELL) ──
+            # side=0 → I am the BUYER (I need to pay the seller)
+            # side=1 → I am the SELLER (buyer needs to pay me)
+            all_result = await asyncio.get_event_loop().run_in_executor(None, get_pending_orders)
+            if all_result.get("retCode", all_result.get("ret_code", -1)) == 0:
+                all_items = all_result.get("result", {}).get("items", [])
 
+                buy_items  = [i for i in all_items if str(i.get("side", "")) == "0"]
+                sell_items = [i for i in all_items if str(i.get("side", "")) == "1"]
+                logger.info(f"[Orders] status=10 → BUY:{len(buy_items)} SELL:{len(sell_items)}")
+
+                # ── BUY orders: I need to pay seller ──
                 for item in buy_items:
                     order_id = item.get("id")
                     if not order_id or order_id in seen_order_ids:
@@ -440,13 +446,15 @@ async def order_monitor_loop(bot, chat_id):
 
                     msg = format_order_message(order_detail, seller_info)
                     await bot.send_message(
-                        chat_id=chat_id, text=f"🛒 *BUY Order*\n{msg}",
-                        reply_markup=order_buttons(order_id), parse_mode="Markdown"
+                        chat_id=chat_id,
+                        text=f"🛒 *BUY Order — Pay Seller*\n{msg}",
+                        reply_markup=order_buttons(order_id),
+                        parse_mode="Markdown"
                     )
                     seen_order_ids.add(order_id)
                     logger.info(f"[BUY] Notified: {order_id}")
 
-                    # Auto-pay logic
+                    # Auto-pay
                     if auto_pay_enabled and order_id not in paid_order_ids:
                         avg_release = seller_info.get("averageReleaseTime", "0")
                         try:
@@ -490,18 +498,14 @@ async def order_monitor_loop(bot, chat_id):
                                     parse_mode="Markdown"
                                 )
 
-            # ── SELL orders (status 20 = awaiting seller release) ──
-            sell_result = await asyncio.get_event_loop().run_in_executor(None, get_sell_orders)
-            if sell_result.get("retCode", sell_result.get("ret_code", -1)) == 0:
-                sell_items = sell_result.get("result", {}).get("items", [])
-                logger.info(f"[Orders] SELL: {len(sell_items)} pending")
-
+                # ── SELL orders awaiting buyer payment (status=10, side=1) ──
+                # Buyer has NOT yet paid — show details + send custom message
                 for item in sell_items:
                     order_id = item.get("id")
                     if not order_id or order_id in seen_sell_order_ids:
                         continue
 
-                    logger.info(f"[SELL] New order: {order_id}")
+                    logger.info(f"[SELL] New order awaiting buyer payment: {order_id}")
                     det = await asyncio.get_event_loop().run_in_executor(None, get_order_detail, order_id)
                     if det.get("retCode", -1) != 0:
                         continue
@@ -518,21 +522,61 @@ async def order_monitor_loop(bot, chat_id):
 
                     msg = format_sell_order_message(order_detail, buyer_info)
                     await bot.send_message(
-                        chat_id=chat_id, text=f"💰 *SELL Order*\n{msg}",
-                        reply_markup=sell_order_buttons(order_id), parse_mode="Markdown"
+                        chat_id=chat_id,
+                        text=f"💰 *SELL Order — Awaiting Buyer Payment*\n{msg}",
+                        parse_mode="Markdown"
+                        # No buttons yet — buyer hasn't paid, no action needed from us
                     )
                     seen_sell_order_ids.add(order_id)
-                    logger.info(f"[SELL] Notified: {order_id}")
+                    logger.info(f"[SELL] Notified (awaiting payment): {order_id}")
 
-                    # Send custom message to buyer chat N times
+                    # Send custom message to buyer immediately
                     if sell_msg_enabled and sell_custom_msg:
                         for i in range(sell_msg_count):
                             await asyncio.get_event_loop().run_in_executor(
                                 None, send_chat_message, order_id, sell_custom_msg
                             )
-                            logger.info(f"[SELL] Custom msg {i+1}/{sell_msg_count} sent to {order_id}")
+                            logger.info(f"[SELL] Custom msg {i+1}/{sell_msg_count} → {order_id}")
                             if i < sell_msg_count - 1:
-                                await asyncio.sleep(1)  # small gap between messages
+                                await asyncio.sleep(1)
+
+            # ── SELL orders where BUYER HAS PAID (status=20) → show release button ──
+            paid_sell_result = await asyncio.get_event_loop().run_in_executor(None, get_sell_orders)
+            if paid_sell_result.get("retCode", paid_sell_result.get("ret_code", -1)) == 0:
+                paid_sell_items = paid_sell_result.get("result", {}).get("items", [])
+                logger.info(f"[Orders] status=20 (buyer paid, awaiting release): {len(paid_sell_items)}")
+
+                for item in paid_sell_items:
+                    order_id = item.get("id")
+                    # Use a separate key so we re-notify when order moves from status=10 to status=20
+                    release_key = f"paid_{order_id}"
+                    if not order_id or release_key in seen_sell_order_ids:
+                        continue
+
+                    logger.info(f"[SELL] Buyer paid, release needed: {order_id}")
+                    det = await asyncio.get_event_loop().run_in_executor(None, get_order_detail, order_id)
+                    if det.get("retCode", -1) != 0:
+                        continue
+                    order_detail = det.get("result", {})
+                    buyer_uid    = order_detail.get("targetUserId", "")
+
+                    buyer_info = {}
+                    if buyer_uid:
+                        bi = await asyncio.get_event_loop().run_in_executor(
+                            None, get_counterparty_info, str(buyer_uid), order_id
+                        )
+                        if bi.get("retCode", -1) == 0:
+                            buyer_info = bi.get("result", {})
+
+                    msg = format_sell_order_message(order_detail, buyer_info)
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=f"✅ *SELL Order — Buyer Has Paid! Release Coin Now*\n{msg}",
+                        reply_markup=sell_order_buttons(order_id),
+                        parse_mode="Markdown"
+                    )
+                    seen_sell_order_ids.add(release_key)
+                    logger.info(f"[SELL] Release notification sent: {order_id}")
 
         except Exception as e:
             logger.error(f"[Orders] Loop error: {e}")
@@ -916,18 +960,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("release_"):
         order_id = data[8:]
         await query.edit_message_text(
-            f"⚠️ *Confirm Release*\n\nYou are about to release coins for order:\n`{order_id}`\n\n"
-            "This cannot be undone. Proceed?",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Yes, Release Coin", callback_data=f"release_confirm_{order_id}")],
-                [InlineKeyboardButton("❌ Cancel",            callback_data="main_menu")],
-            ]),
-            parse_mode="Markdown"
+            f"⏳ Releasing coins for order `{order_id}`...", parse_mode="Markdown"
         )
-
-    elif data.startswith("release_confirm_"):
-        order_id = data[16:]
-        await query.edit_message_text(f"⏳ Releasing coins for order `{order_id}`...", parse_mode="Markdown")
         result   = await asyncio.get_event_loop().run_in_executor(None, release_assets, order_id)
         ret_code = result.get("retCode", result.get("ret_code", -1))
         ret_msg  = result.get("retMsg",  result.get("ret_msg",  ""))
@@ -935,8 +969,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             released_order_ids.add(order_id)
             logger.info(f"[SELL] ✅ Released: {order_id}")
             await query.edit_message_text(
-                f"🪙 *Coins released successfully!*\n\nOrder: `{order_id}`\n\n"
-                "The buyer has received their coins.",
+                f"🪙 *Coins released successfully!*\n\nOrder: `{order_id}`\n\nThe buyer has received their coins.",
                 parse_mode="Markdown"
             )
         else:
