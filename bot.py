@@ -307,33 +307,52 @@ def autopay_section_text():
     )
 
 
+def _get_pay_name(pay_term: dict) -> str:
+    """Get human-readable payment name from a payment term object.
+    Priority: paymentConfig.paymentName > bankName > get_payment_name(type) > type number"""
+    # Best source: paymentConfig contains the actual payment method name
+    cfg = pay_term.get("paymentConfig", {}) or {}
+    cfg_name = cfg.get("paymentName", "").strip()
+    if cfg_name:
+        return cfg_name
+    # Second: bankName often contains the bank/wallet name
+    bank = pay_term.get("bankName", "").strip()
+    if bank:
+        return bank
+    # Fallback: map payment type number to known name
+    ptype = pay_term.get("paymentType", "")
+    if ptype:
+        return get_payment_name(ptype)
+    return "—"
+
+
 # ─────────────────────────────────────────
-# 📦 FORMAT ORDER MESSAGE
+# 📦 FORMAT BUY ORDER MESSAGE
+# (I am the buyer — I need to pay the seller)
 # ─────────────────────────────────────────
 def format_order_message(order_detail: dict, seller_info: dict) -> str:
-    side       = "BUY" if order_detail.get("side") == 0 else "SELL"
     order_type = order_detail.get("orderType", "ORIGIN")
     quantity   = order_detail.get("quantity",  "—")
     amount     = order_detail.get("amount",    "—")
     currency   = order_detail.get("currencyId","—")
     price      = order_detail.get("price",     "—")
     order_id   = order_detail.get("id",        "—")
+    token      = order_detail.get("tokenId",   "—")
 
-    # Payment info — check confirmedPayTerm first, fallback to paymentTermList[0]
+    # Seller's payment details — where I need to send money
     pay_term   = order_detail.get("confirmedPayTerm", {}) or {}
     if not pay_term:
         terms    = order_detail.get("paymentTermList", [])
         pay_term = terms[0] if terms else {}
 
-    bank_name    = pay_term.get("bankName",  "").strip() or "—"
-    real_name    = pay_term.get("realName",  "").strip() or "—"
-    account_no   = pay_term.get("accountNo", "").strip() or "—"
-    payment_type = pay_term.get("paymentType", "")
-    pay_name     = get_payment_name(payment_type) if payment_type else "—"
+    pay_name   = _get_pay_name(pay_term)
+    bank_name  = pay_term.get("bankName",  "").strip() or "—"
+    real_name  = pay_term.get("realName",  "").strip() or order_detail.get("sellerRealName", "—")
+    account_no = pay_term.get("accountNo", "").strip() or "—"
 
     # Seller stats
-    good_rate    = seller_info.get("goodAppraiseRate", "—")
-    avg_release  = seller_info.get("averageReleaseTime", "0")
+    good_rate   = seller_info.get("goodAppraiseRate", "—")
+    avg_release = seller_info.get("averageReleaseTime", "0")
 
     try:
         release_mins = float(avg_release)
@@ -345,16 +364,15 @@ def format_order_message(order_detail: dict, seller_info: dict) -> str:
         slow_warn    = ""
 
     return (
-        f"📦 *New P2P Order*\n"
         f"{'─' * 28}\n"
         f"🆔 `{order_id}`\n"
-        f"🔄 `{order_type}` | Side: `{side}`\n"
-        f"🪙 Qty: `{quantity}` | 💵 `{amount} {currency}`\n"
+        f"🔄 `{order_type}` | 🪙 `{token}`\n"
+        f"📦 Qty: `{quantity}` | 💵 `{amount} {currency}`\n"
         f"💲 Price: `{price}`\n"
         f"{'─' * 28}\n"
         f"💳 Payment: *{pay_name}*\n"
         f"🏦 Bank: `{bank_name}`\n"
-        f"👤 Name: `{real_name}`\n"
+        f"👤 Seller Name: `{real_name}`\n"
         f"🔢 Account: `{account_no}`\n"
         f"{'─' * 28}\n"
         f"📊 Seller Rating: `{good_rate}%`\n"
@@ -371,20 +389,19 @@ def format_sell_order_message(order_detail: dict, buyer_info: dict) -> str:
     order_id  = order_detail.get("id",        "—")
     token     = order_detail.get("tokenId",   "—")
 
-    # Buyer payment info
+    # Buyer's payment details — where they sent money from
     pay_term  = order_detail.get("confirmedPayTerm", {}) or {}
     if not pay_term:
         terms    = order_detail.get("paymentTermList", [])
         pay_term = terms[0] if terms else {}
 
-    bank_name   = pay_term.get("bankName",  "").strip() or "—"
-    real_name   = pay_term.get("realName",  "").strip() or order_detail.get("buyerRealName","—")
-    account_no  = pay_term.get("accountNo", "").strip() or "—"
-    payment_type = pay_term.get("paymentType", "")
-    pay_name    = get_payment_name(payment_type) if payment_type else "—"
+    pay_name   = _get_pay_name(pay_term)
+    bank_name  = pay_term.get("bankName",  "").strip() or "—"
+    real_name  = pay_term.get("realName",  "").strip() or order_detail.get("buyerRealName", "—")
+    account_no = pay_term.get("accountNo", "").strip() or "—"
 
     # Buyer stats
-    good_rate   = buyer_info.get("goodAppraiseRate", "—")
+    good_rate    = buyer_info.get("goodAppraiseRate",    "—")
     avg_transfer = buyer_info.get("averageTransferTime", "—")
 
     return (
@@ -439,7 +456,7 @@ async def order_monitor_loop(bot, chat_id):
 
                 buy_items  = [i for i in all_items if str(i.get("side", "")) == "0"]
                 sell_items = [i for i in all_items if str(i.get("side", "")) == "1"]
-                logger.info(f"[Orders] status=10 → BUY:{len(buy_items)} SELL:{len(sell_items)}")
+                logger.info(f"[Orders] status=10 → I am BUYER (side=0): {len(buy_items)} | I am SELLER awaiting payment (side=1): {len(sell_items)}")
 
                 # ── BUY orders: I need to pay seller ──
                 for item in buy_items:
@@ -558,11 +575,15 @@ async def order_monitor_loop(bot, chat_id):
                             if i < sell_msg_count - 1:
                                 await asyncio.sleep(1)
 
-            # ── SELL orders where BUYER HAS PAID (status=20) → show release button ──
+            # ── SELL orders where BUYER HAS PAID (status=20, side=1) → show release button ──
+            # side=1 means I am the SELLER. side=0 at status=20 means I am the BUYER
+            # waiting for the seller to release to me — not actionable for me here.
             paid_sell_result = await asyncio.get_event_loop().run_in_executor(None, get_sell_orders)
             if paid_sell_result.get("retCode", paid_sell_result.get("ret_code", -1)) == 0:
-                paid_sell_items = paid_sell_result.get("result", {}).get("items", [])
-                logger.info(f"[Orders] status=20 (buyer paid, awaiting release): {len(paid_sell_items)}")
+                all_status20 = paid_sell_result.get("result", {}).get("items", [])
+                # Only process where I am the seller (side=1)
+                paid_sell_items = [i for i in all_status20 if str(i.get("side", "")) == "1"]
+                logger.info(f"[Orders] status=20 side=1 (buyer paid, I must release): {len(paid_sell_items)}")
 
                 for item in paid_sell_items:
                     order_id = item.get("id")
