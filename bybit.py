@@ -5,11 +5,35 @@ import requests
 import json
 import logging
 import uuid
-from config import BYBIT_API_KEY, BYBIT_API_SECRET
+from config import BYBIT_ACCOUNTS
 
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://api.bybit.com"
+
+# ─────────────────────────────────────────
+# 🔑 Active account — switched by bot.py
+# ─────────────────────────────────────────
+_active_index    = 0
+BYBIT_API_KEY    = BYBIT_ACCOUNTS[0]["key"]
+BYBIT_API_SECRET = BYBIT_ACCOUNTS[0]["secret"]
+
+
+def set_active_account(index: int):
+    global _active_index, BYBIT_API_KEY, BYBIT_API_SECRET
+    if 0 <= index < len(BYBIT_ACCOUNTS):
+        _active_index    = index
+        BYBIT_API_KEY    = BYBIT_ACCOUNTS[index]["key"]
+        BYBIT_API_SECRET = BYBIT_ACCOUNTS[index]["secret"]
+        logger.info(f"[Bybit] Active account → {BYBIT_ACCOUNTS[index]['label']}")
+
+
+def get_active_account() -> dict:
+    return BYBIT_ACCOUNTS[_active_index]
+
+
+def get_all_accounts() -> list:
+    return BYBIT_ACCOUNTS
 
 # ─────────────────────────────────────────
 # Max floating % per currency and coin
