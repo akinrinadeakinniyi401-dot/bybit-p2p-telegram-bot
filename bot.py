@@ -8,12 +8,14 @@ from telegram.ext import (
     MessageHandler, ContextTypes, filters
 )
 from config import TELEGRAM_TOKEN, ADMIN_IDS
+import bybit
 from bybit import (
     get_ad_details, get_my_ads, modify_ad,
     get_btc_usdt_price, get_max_float_pct,
     get_pending_orders, get_sell_orders, get_order_detail,
     get_counterparty_info, mark_order_paid,
-    send_chat_message, get_payment_name, release_assets
+    send_chat_message, get_payment_name, release_assets,
+    set_active_account, get_active_account, get_all_accounts
 )
 
 logger = logging.getLogger(__name__)
@@ -98,14 +100,28 @@ def main_menu_keyboard():
     o_icon = "🔔" if order_monitor_running else "🔕"
     p_icon = "💳✅" if auto_pay_enabled else "💳"
     r_icon = "🟢" if refresh_running else "📊"
+    acct   = get_active_account()
+    all_ac = get_all_accounts()
 
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"{r_icon} AD PRICE BOT", callback_data="section_ads")],
+    kb = []
+    # Account selector row — only show if more than 1 account
+    if len(all_ac) > 1:
+        kb.append([
+            InlineKeyboardButton(
+                f"{'✅ ' if i == bybit._active_index else ''}{ac['label']}",
+                callback_data=f"switch_account_{i}"
+            )
+            for i, ac in enumerate(all_ac)
+        ])
+
+    kb += [
+        [InlineKeyboardButton(f"{r_icon} AD PRICE BOT",  callback_data="section_ads")],
         [InlineKeyboardButton(f"{o_icon} ORDER MONITOR", callback_data="section_orders")],
-        [InlineKeyboardButton(f"{p_icon} AUTO-PAY",     callback_data="section_autopay")],
-        [InlineKeyboardButton("📡 Bot Status",          callback_data="bot_status")],
-        [InlineKeyboardButton("🔁 Reset Session",       callback_data="reset_confirm")],
-    ])
+        [InlineKeyboardButton(f"{p_icon} AUTO-PAY",      callback_data="section_autopay")],
+        [InlineKeyboardButton("📡 Bot Status",           callback_data="bot_status")],
+        [InlineKeyboardButton("🔁 Reset Session",        callback_data="reset_confirm")],
+    ]
+    return InlineKeyboardMarkup(kb)
 
 
 def main_menu_text():
@@ -113,9 +129,11 @@ def main_menu_text():
     o_status = "🔔 Active" if order_monitor_running else "🔕 Off"
     p_status = "💳 ON"    if auto_pay_enabled       else "💳 OFF"
     r_status = "🟢 Running" if refresh_running       else "🔴 Off"
+    acct     = get_active_account()
 
     return (
         "🤖 *P2P Auto Bot*\n\n"
+        f"🔑 Active: *{acct['label']}*\n"
         f"Setup: {bar} `{done}/{total}`\n\n"
         f"📊 Price Bot: {r_status}\n"
         f"📦 Orders: {o_status}\n"
@@ -736,6 +754,42 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             main_menu_text(), reply_markup=main_menu_keyboard(), parse_mode="Markdown"
         )
 
+    # ── 🔑 Switch Account ──
+    elif data.startswith("switch_account_"):
+        idx = int(data.split("_")[-1])
+        accounts = get_all_accounts()
+        if idx >= len(accounts):
+            await query.answer("Invalid account", show_alert=True)
+            return
+
+        # Stop all running tasks before switching
+        if refresh_running or order_monitor_running:
+            await query.answer(
+                "⚠️ Stop all running tasks before switching accounts.",
+                show_alert=True
+            )
+            return
+
+        set_active_account(idx)
+        # Clear all per-account state
+        ad_data.clear()
+        seen_order_ids.clear()
+        paid_order_ids.clear()
+        seen_sell_order_ids.clear()
+        released_order_ids.clear()
+        for k, v in [("ad_id",""),("bybit_uid",""),("mode","fixed"),
+                     ("increment","0.05"),("float_pct",""),("ngn_usdt_ref",""),("interval",2)]:
+            user_settings[k] = v
+
+        acct = accounts[idx]
+        await query.edit_message_text(
+            f"✅ *Switched to {acct['label']}*\n\n"
+            f"All session data cleared. Set your Ad ID and fetch ad details for this account.\n\n"
+            + main_menu_text(),
+            reply_markup=main_menu_keyboard(),
+            parse_mode="Markdown"
+        )
+
     # ── 📊 AD PRICE BOT section ──
     elif data == "section_ads":
         await query.edit_message_text(
@@ -763,6 +817,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ap_status = "💳 ON" if auto_pay_enabled else "💳 OFF"
         await query.edit_message_text(
             f"📡 *Bot Status*\n\n"
+            f"🔑 Active: *{get_active_account()['label']}*\n"
             f"Setup: {bar} `{done}/{total}`\n\n"
             f"📊 Price Bot: {r_status}\n"
             f"📦 Order Monitor: {o_status}\n"
@@ -806,6 +861,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         released_order_ids  = set()
         sell_msg_enabled    = False
         sell_msg_count      = 1
+        set_active_account(0)  # reset to Account 1
         for k, v in [("ad_id",""),("bybit_uid",""),("mode","fixed"),
                      ("increment","0.05"),("float_pct",""),("ngn_usdt_ref",""),("interval",2)]:
             user_settings[k] = v
