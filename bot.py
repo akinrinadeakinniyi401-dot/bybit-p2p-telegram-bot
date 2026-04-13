@@ -663,6 +663,8 @@ async def auto_update_loop(bot, chat_id):
 
         if mode == "fixed":
             new_p = current_price + increment
+            # Subtract 10 to stay safely within Bybit's upper price limit
+            new_p = new_p - Decimal("10")
             new_p_str = str(new_p.quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP))
         else:
             float_pct    = float(user_settings.get("float_pct",0))
@@ -675,8 +677,12 @@ async def auto_update_loop(bot, chat_id):
                     if not refresh_running: break
                     await asyncio.sleep(1)
                 continue
+            # Subtract 10 to stay safely within Bybit's upper price limit
+            new_p_str = str(
+                (Decimal(new_p_str) - Decimal("10")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            )
 
-        logger.info(f"[Cycle {cycle}] {now} | {mode.upper()} | price={new_p_str}")
+        logger.info(f"[Cycle {cycle}] {now} | {mode.upper()} | price={new_p_str} (after -10 buffer)")
         result   = await asyncio.get_event_loop().run_in_executor(
             None, modify_ad, user_settings["ad_id"], new_p_str, ad_data
         )
@@ -1257,7 +1263,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mode = user_settings.get("mode","fixed")
         await query.edit_message_text(f"⏳ Updating ({mode} mode)...")
         if mode == "fixed":
-            price = str(current_price) if current_price else ad_data.get("price","0")
+            raw_price = Decimal(str(current_price)) if current_price else Decimal(str(ad_data.get("price","0")))
+            price = str((raw_price - Decimal("10")).quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP))
         else:
             float_pct    = float(user_settings.get("float_pct",0))
             ngn_usdt_ref = float(user_settings.get("ngn_usdt_ref") or 0)
@@ -1268,6 +1275,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text(f"❌ `{err}`",
                     reply_markup=InlineKeyboardMarkup(back_section("section_ads")), parse_mode="Markdown")
                 return
+            # Subtract 10 buffer
+            price = str((Decimal(price) - Decimal("10")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
         result   = await asyncio.get_event_loop().run_in_executor(
             None, modify_ad, user_settings["ad_id"], price, ad_data
         )
