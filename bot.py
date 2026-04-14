@@ -628,6 +628,19 @@ async def order_monitor_loop(bot, chat_id):
 # ─────────────────────────────────────────
 # 💲 Float price calc
 # ─────────────────────────────────────────
+def _extract_bybit_max(error_msg: str) -> str | None:
+    """
+    Parse Bybit error 912120022 message to extract the maximum allowed price.
+    Example msg: 'The fixed price set is lower than 88416341.28 or higher than 108064417.12.'
+    Returns '108064417.12' or None if parse fails.
+    """
+    import re
+    match = re.search(r'higher than ([\d.]+)', error_msg)
+    if match:
+        return match.group(1)
+    return None
+
+
 def calc_floating_price(ad_data, float_pct, ngn_usdt_ref):
     btc = get_btc_usdt_price()
     if btc <= 0:
@@ -663,8 +676,6 @@ async def auto_update_loop(bot, chat_id):
 
         if mode == "fixed":
             new_p = current_price + increment
-            # Subtract 10 to stay safely within Bybit's upper price limit
-            new_p = new_p - Decimal("10")
             new_p_str = str(new_p.quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP))
         else:
             float_pct    = float(user_settings.get("float_pct",0))
@@ -677,19 +688,47 @@ async def auto_update_loop(bot, chat_id):
                     if not refresh_running: break
                     await asyncio.sleep(1)
                 continue
-            # Subtract 10 to stay safely within Bybit's upper price limit
-            new_p_str = str(
-                (Decimal(new_p_str) - Decimal("10")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-            )
 
-        logger.info(f"[Cycle {cycle}] {now} | {mode.upper()} | price={new_p_str} (after -10 buffer)")
+        logger.info(f"[Cycle {cycle}] {now} | {mode.upper()} | price={new_p_str}")
         result   = await asyncio.get_event_loop().run_in_executor(
             None, modify_ad, user_settings["ad_id"], new_p_str, ad_data
         )
         ret_code = result.get("retCode", result.get("ret_code",-1))
         ret_msg  = result.get("retMsg",  result.get("ret_msg","Unknown"))
 
-        if ret_code == 0:
+        # ── If price out of range, extract Bybit's max and retry once ──
+        if ret_code == 912120022:
+            bybit_max = _extract_bybit_max(ret_msg)
+            if bybit_max:
+                logger.info(f"[Cycle {cycle}] Price out of range. Bybit max={bybit_max}. Retrying...")
+                retry_result = await asyncio.get_event_loop().run_in_executor(
+                    None, modify_ad, user_settings["ad_id"], bybit_max, ad_data
+                )
+                retry_code = retry_result.get("retCode", retry_result.get("ret_code",-1))
+                retry_msg  = retry_result.get("retMsg",  retry_result.get("ret_msg","Unknown"))
+                if retry_code == 0:
+                    if mode == "fixed":
+                        current_price = Decimal(bybit_max)
+                    logger.info(f"[Cycle {cycle}] ✅ Retry success → {bybit_max}")
+                    await bot.send_message(chat_id=chat_id,
+                        text=(
+                            f"✅ *Cycle {cycle}* `{now}`\n"
+                            f"⚠️ Original price `{new_p_str}` was out of range\n"
+                            f"💲 Posted Bybit max: `{bybit_max}` ({mode.upper()})"
+                        ),
+                        parse_mode="Markdown")
+                else:
+                    logger.error(f"[Cycle {cycle}] ❌ Retry also failed: {retry_code} | {retry_msg}")
+                    await bot.send_message(chat_id=chat_id,
+                        text=f"❌ *Cycle {cycle} retry failed*\n`{retry_code}` — `{retry_msg}`",
+                        parse_mode="Markdown")
+            else:
+                logger.error(f"[Cycle {cycle}] ❌ Could not parse max price from: {ret_msg}")
+                await bot.send_message(chat_id=chat_id,
+                    text=f"❌ *Cycle {cycle} failed*\n`{ret_code}` — `{ret_msg}`",
+                    parse_mode="Markdown")
+
+        elif ret_code == 0:
             if mode == "fixed":
                 current_price = new_p
             logger.info(f"[Cycle {cycle}] ✅ → {new_p_str}")
@@ -1263,8 +1302,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mode = user_settings.get("mode","fixed")
         await query.edit_message_text(f"⏳ Updating ({mode} mode)...")
         if mode == "fixed":
-            raw_price = Decimal(str(current_price)) if current_price else Decimal(str(ad_data.get("price","0")))
-            price = str((raw_price - Decimal("10")).quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP))
+            price = str(current_price) if current_price else ad_data.get("price","0")
         else:
             float_pct    = float(user_settings.get("float_pct",0))
             ngn_usdt_ref = float(user_settings.get("ngn_usdt_ref") or 0)
@@ -1275,13 +1313,21 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.edit_message_text(f"❌ `{err}`",
                     reply_markup=InlineKeyboardMarkup(back_section("section_ads")), parse_mode="Markdown")
                 return
-            # Subtract 10 buffer
-            price = str((Decimal(price) - Decimal("10")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
-        result   = await asyncio.get_event_loop().run_in_executor(
+        result = await asyncio.get_event_loop().run_in_executor(
             None, modify_ad, user_settings["ad_id"], price, ad_data
         )
         rc = result.get("retCode", result.get("ret_code",-1))
         rm = result.get("retMsg",  result.get("ret_msg",""))
+        # Smart retry if price out of range
+        if rc == 912120022:
+            bybit_max = _extract_bybit_max(rm)
+            if bybit_max:
+                result = await asyncio.get_event_loop().run_in_executor(
+                    None, modify_ad, user_settings["ad_id"], bybit_max, ad_data
+                )
+                rc = result.get("retCode", result.get("ret_code",-1))
+                rm = result.get("retMsg",  result.get("ret_msg",""))
+                price = bybit_max  # show the retried price
         if rc == 0:
             await query.edit_message_text(
                 f"✅ *Updated!* Price: `{price}` ({mode.upper()})\n\n_{next_setup_hint()}_",
