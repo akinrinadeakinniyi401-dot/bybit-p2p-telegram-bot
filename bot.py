@@ -119,6 +119,7 @@ def main_menu_keyboard():
         [InlineKeyboardButton(f"{o_icon} ORDER MONITOR", callback_data="section_orders")],
         [InlineKeyboardButton(f"{p_icon} AUTO-PAY",      callback_data="section_autopay")],
         [InlineKeyboardButton("📡 Bot Status",           callback_data="bot_status")],
+        [InlineKeyboardButton("🌍 Get My IP",            callback_data="get_my_ip")],
         [InlineKeyboardButton("🔁 Reset Session",        callback_data="reset_confirm")],
     ]
     return InlineKeyboardMarkup(kb)
@@ -819,6 +820,31 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             main_menu_text(), reply_markup=main_menu_keyboard(), parse_mode="Markdown"
         )
+
+    # ── 🌍 Get My IP ──
+    elif data == "get_my_ip":
+        await query.edit_message_text("⏳ Fetching Render public IP...")
+        import requests as _req
+        ip = None
+        for svc in ["https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"]:
+            try:
+                ip = _req.get(svc, timeout=5).text.strip()
+                if ip:
+                    break
+            except Exception:
+                continue
+        if ip:
+            await query.edit_message_text(
+                f"🌍 *Render Public IP*\n\n`{ip}`\n\n"
+                "👉 Add this to your Bybit API whitelist if it changed.",
+                reply_markup=InlineKeyboardMarkup(back_main()),
+                parse_mode="Markdown"
+            )
+        else:
+            await query.edit_message_text(
+                "❌ Could not fetch IP. Try again.",
+                reply_markup=InlineKeyboardMarkup(back_main())
+            )
 
     # ── 🔑 Switch Account ──
     elif data.startswith("switch_account_"):
