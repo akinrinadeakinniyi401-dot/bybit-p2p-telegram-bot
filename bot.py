@@ -390,16 +390,23 @@ def format_sell_order_message(order_detail: dict, buyer_info: dict) -> str:
     order_id  = order_detail.get("id",        "—")
     token     = order_detail.get("tokenId",   "—")
 
-    # Buyer's payment details — where they sent money from
-    pay_term  = order_detail.get("confirmedPayTerm", {}) or {}
-    if not pay_term:
-        terms    = order_detail.get("paymentTermList", [])
-        pay_term = terms[0] if terms else {}
+    # Buyer's full name from order detail (most reliable source)
+    buyer_name = (
+        order_detail.get("buyerRealName", "").strip()
+        or buyer_info.get("realName", "").strip()
+        or "—"
+    )
 
-    pay_name   = _get_pay_name(pay_term)
-    bank_name  = pay_term.get("bankName",  "").strip() or "—"
-    real_name  = pay_term.get("realName",  "").strip() or order_detail.get("buyerRealName", "—")
-    account_no = pay_term.get("accountNo", "").strip() or "—"
+    # My payment details (from paymentTermList — these are MY payment methods on the ad)
+    my_pay_term = {}
+    pay_term_list = order_detail.get("paymentTermList", [])
+    if pay_term_list:
+        my_pay_term = pay_term_list[0]
+
+    my_pay_name  = _get_pay_name(my_pay_term)
+    my_bank      = my_pay_term.get("bankName",  "").strip() or "—"
+    my_name      = my_pay_term.get("realName",  "").strip() or order_detail.get("sellerRealName", "—")
+    my_account   = my_pay_term.get("accountNo", "").strip() or "—"
 
     # Buyer stats
     good_rate    = buyer_info.get("goodAppraiseRate",    "—")
@@ -411,13 +418,16 @@ def format_sell_order_message(order_detail: dict, buyer_info: dict) -> str:
         f"🪙 Token: `{token}` | Qty: `{quantity}`\n"
         f"💵 Amount: `{amount} {currency}` | 💲 `{price}`\n"
         f"{'─' * 28}\n"
-        f"💳 Payment: *{pay_name}*\n"
-        f"🏦 Bank: `{bank_name}`\n"
-        f"👤 Buyer Name: `{real_name}`\n"
-        f"🔢 Account: `{account_no}`\n"
-        f"{'─' * 28}\n"
+        f"👤 *Buyer Name:* `{buyer_name}`\n"
         f"📊 Buyer Rating: `{good_rate}%`\n"
-        f"⏱ Avg Transfer Time: `{avg_transfer} min`"
+        f"⏱ Avg Transfer Time: `{avg_transfer} min`\n"
+        f"{'─' * 28}\n"
+        f"🏦 *My Payment Details:*\n"
+        f"💳 Method: *{my_pay_name}*\n"
+        f"🏦 Bank: `{my_bank}`\n"
+        f"👤 My Name: `{my_name}`\n"
+        f"🔢 Account: `{my_account}`\n"
+        f"{'─' * 28}"
     )
 
 
@@ -835,7 +845,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 continue
         if ip:
             await query.edit_message_text(
-                f"🌍 *Render Public IP*\n\n`{ip}`\n\n"
+                f"🌍 *Public IP Address*\n\n`{ip}`\n\n"
                 "👉 Add this to your Bybit API whitelist if it changed.",
                 reply_markup=InlineKeyboardMarkup(back_main()),
                 parse_mode="Markdown"
