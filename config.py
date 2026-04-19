@@ -65,3 +65,4 @@ if not ADMIN_IDS:
 FLW_CLIENT_ID     = os.getenv("FLW_CLIENT_ID", "")
 FLW_CLIENT_SECRET = os.getenv("FLW_CLIENT_SECRET", "")
 FLW_SECRET_HASH   = os.getenv("FLW_SECRET_HASH", "")
+FLW_SECRET_KEY    = os.getenv("FLW_SECRET_KEY", "")  # Standard v3 API secret key
