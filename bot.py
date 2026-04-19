@@ -41,6 +41,7 @@ current_price         = Decimal("0")
 order_monitor_task    = None
 order_monitor_running = False
 auto_pay_enabled      = False
+flw_pay_enabled       = False   # Flutterwave auto-pay toggle
 seen_order_ids        = set()   # BUY orders notified
 paid_order_ids        = set()   # BUY orders marked paid
 seen_sell_order_ids   = set()   # SELL orders notified
@@ -57,6 +58,15 @@ SELLER_WARN_MSG = (
 )
 
 def is_admin(uid): return uid in ADMIN_IDS
+
+
+# Stores the chat_id of the last admin who started the bot
+# Used by app.py to send FLW webhook notifications
+_admin_chat_ids: set = set()
+
+
+def _get_admin_chat_ids() -> set:
+    return _admin_chat_ids
 
 
 # ─────────────────────────────────────────
@@ -98,7 +108,7 @@ def next_setup_hint() -> str:
 # ─────────────────────────────────────────
 def main_menu_keyboard():
     o_icon = "🔔" if order_monitor_running else "🔕"
-    p_icon = "💳✅" if auto_pay_enabled else "💳"
+    p_icon = "💳✅" if (auto_pay_enabled or flw_pay_enabled) else "💳"
     r_icon = "🟢" if refresh_running else "📊"
     acct   = get_active_account()
     all_ac = get_all_accounts()
@@ -287,24 +297,30 @@ def orders_section_text():
 # 💳 AUTO-PAY SECTION
 # ─────────────────────────────────────────
 def autopay_section_keyboard():
-    pay = "💳 Disable Auto-Pay" if auto_pay_enabled else "💳 Enable Auto-Pay"
+    pay     = "💳 Disable Auto-Pay (Bybit)" if auto_pay_enabled  else "💳 Enable Auto-Pay (Bybit)"
+    flw     = "🟢 Disable Flutterwave Pay"  if flw_pay_enabled   else "🔴 Enable Flutterwave Pay"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(pay, callback_data="toggle_auto_pay")],
-        [InlineKeyboardButton("ℹ️ How Auto-Pay Works", callback_data="autopay_info")],
+        [InlineKeyboardButton(flw, callback_data="toggle_flw_pay")],
+        [InlineKeyboardButton("ℹ️ How Auto-Pay Works",       callback_data="autopay_info")],
+        [InlineKeyboardButton("ℹ️ How Flutterwave Pay Works", callback_data="flw_info")],
         *back_main()
     ])
 
 
 def autopay_section_text():
-    status = "✅ ENABLED" if auto_pay_enabled else "❌ DISABLED"
+    bybit_status = "✅ ENABLED" if auto_pay_enabled else "❌ DISABLED"
+    flw_status   = "✅ ENABLED" if flw_pay_enabled  else "❌ DISABLED"
+    from config import FLW_CLIENT_ID
+    flw_configured = "✅ Configured" if FLW_CLIENT_ID else "❌ Not configured — add FLW_CLIENT_ID & FLW_CLIENT_SECRET to Render"
     return (
-        f"💳 *AUTO-PAY — {status}*\n\n"
-        "When enabled, the bot will:\n"
-        "1️⃣ Detect new orders automatically\n"
-        "2️⃣ Wait 5 seconds to read order details\n"
-        "3️⃣ Mark the order as paid\n"
-        "4️⃣ If seller avg release time ≥ 30 min → also send a warning message to the seller\n\n"
-        "⚠️ Make sure Order Monitor is running before enabling Auto-Pay."
+        f"💳 *AUTO-PAY*\n\n"
+        f"Bybit Mark-Paid: *{bybit_status}*\n"
+        f"Flutterwave Pay: *{flw_status}*\n\n"
+        f"Flutterwave credentials: {flw_configured}\n\n"
+        "⚠️ Enable only ONE mode at a time.\n"
+        "Bybit marks the order paid without sending money.\n"
+        "Flutterwave actually sends the money then marks paid."
     )
 
 
@@ -447,6 +463,132 @@ def sell_order_buttons(order_id: str) -> InlineKeyboardMarkup:
 # ─────────────────────────────────────────
 # 📦 ORDER MONITOR LOOP — handles BUY + SELL
 # ─────────────────────────────────────────
+async def _flw_autopay(bot, chat_id, order_id, order_detail):
+    """Execute Flutterwave payment for a BUY order then mark it as paid on Bybit."""
+    from flutterwave import resolve_bank_code, verify_account, send_transfer, get_transfer_status
+
+    try:
+        # Get seller payment details
+        pay_term = order_detail.get("confirmedPayTerm", {}) or {}
+        if not pay_term:
+            terms    = order_detail.get("paymentTermList", [])
+            pay_term = terms[0] if terms else {}
+
+        account_no   = pay_term.get("accountNo", "").strip()
+        bank_name    = pay_term.get("bankName",  "").strip()
+        pay_cfg      = pay_term.get("paymentConfigVo", {}) or pay_term.get("paymentConfig", {}) or {}
+        pay_type_name = pay_cfg.get("paymentName", "").strip()
+        amount_str   = order_detail.get("amount", "0")
+        seller_name  = pay_term.get("realName", order_detail.get("sellerRealName", "Seller"))
+
+        if not account_no:
+            await bot.send_message(chat_id=chat_id,
+                text=f"❌ *FLW Auto-Pay* — Order `{order_id}`\nNo account number found.",
+                parse_mode="Markdown")
+            return
+
+        bank_code = resolve_bank_code(bank_name, pay_type_name)
+        if not bank_code:
+            await bot.send_message(chat_id=chat_id,
+                text=(
+                    f"❌ *FLW Auto-Pay* — Order `{order_id}`\n"
+                    f"Unknown bank: `{bank_name or pay_type_name}`\n"
+                    "Please mark this order manually."
+                ),
+                parse_mode="Markdown")
+            return
+
+        amount = float(amount_str)
+        logger.info(f"[FLW] AutoPay: {amount} NGN → {account_no} @ {bank_code} ({bank_name})")
+
+        await bot.send_message(chat_id=chat_id,
+            text=(
+                f"⏳ *FLW Auto-Pay initiated*\n"
+                f"Order: `{order_id}`\n"
+                f"Sending *{amount:,.2f} NGN* to `{account_no}` ({bank_name or pay_type_name})"
+            ),
+            parse_mode="Markdown")
+
+        # Step 1: Verify account
+        verify = await asyncio.get_event_loop().run_in_executor(
+            None, verify_account, account_no, bank_code
+        )
+        if verify.get("status") not in ("success", "200") and "error" in verify:
+            await bot.send_message(chat_id=chat_id,
+                text=f"⚠️ *FLW* Account verification warning for `{order_id}`\n`{verify}`\nProceeding anyway...",
+                parse_mode="Markdown")
+
+        # Step 2: Initiate transfer
+        ref    = f"p2p{order_id[-12:]}"
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, send_transfer,
+            account_no, bank_code, amount,
+            f"P2P payment to {seller_name}", ref
+        )
+
+        if "error" in result:
+            await bot.send_message(chat_id=chat_id,
+                text=f"❌ *FLW transfer failed* — `{order_id}`\n`{result['error']}`",
+                parse_mode="Markdown")
+            return
+
+        transfer_id = result.get("data", {}).get("id", "")
+        status      = result.get("data", {}).get("status", "")
+        logger.info(f"[FLW] Transfer created: {transfer_id} | status={status}")
+
+        # Step 3: Poll for final status (up to 30 seconds)
+        final_status = status
+        for attempt in range(6):
+            await asyncio.sleep(5)
+            if final_status in ("SUCCESSFUL", "FAILED"):
+                break
+            poll = await asyncio.get_event_loop().run_in_executor(
+                None, get_transfer_status, transfer_id
+            )
+            final_status = poll.get("data", {}).get("status", final_status)
+            logger.info(f"[FLW] Poll {attempt+1}: {transfer_id} → {final_status}")
+
+        if final_status == "SUCCESSFUL":
+            # Step 4: Mark Bybit order as paid
+            pay_type   = str(pay_term.get("paymentType", ""))
+            payment_id = str(pay_term.get("id", ""))
+            if pay_type and payment_id:
+                pr = await asyncio.get_event_loop().run_in_executor(
+                    None, mark_order_paid, order_id, pay_type, payment_id
+                )
+                bybit_ok = pr.get("retCode", -1) == 0
+            else:
+                bybit_ok = False
+
+            paid_order_ids.add(order_id)
+            logger.info(f"[FLW] ✅ Transfer SUCCESSFUL: {transfer_id} | Bybit mark paid: {bybit_ok}")
+            await bot.send_message(chat_id=chat_id,
+                text=(
+                    f"✅ *FLW Auto-Pay SUCCESS*\n\n"
+                    f"Order: `{order_id}`\n"
+                    f"Amount: *{amount:,.2f} NGN*\n"
+                    f"Transfer ID: `{transfer_id}`\n"
+                    f"Bybit marked paid: {'✅' if bybit_ok else '⚠️ Manual mark needed'}"
+                ),
+                parse_mode="Markdown")
+        else:
+            logger.error(f"[FLW] ❌ Transfer {final_status}: {transfer_id}")
+            await bot.send_message(chat_id=chat_id,
+                text=(
+                    f"❌ *FLW Transfer {final_status}*\n\n"
+                    f"Order: `{order_id}`\n"
+                    f"Transfer ID: `{transfer_id}`\n"
+                    "Please mark this order manually."
+                ),
+                parse_mode="Markdown")
+
+    except Exception as e:
+        logger.error(f"[FLW] _flw_autopay error: {e}")
+        await bot.send_message(chat_id=chat_id,
+            text=f"❌ *FLW Auto-Pay error* — `{order_id}`\n`{e}`",
+            parse_mode="Markdown")
+
+
 async def order_monitor_loop(bot, chat_id):
     global order_monitor_running, auto_pay_enabled
     global seen_order_ids, paid_order_ids
@@ -500,8 +642,15 @@ async def order_monitor_loop(bot, chat_id):
                     seen_order_ids.add(order_id)
                     logger.info(f"[BUY] Notified: {order_id}")
 
-                    # Auto-pay
-                    if auto_pay_enabled and order_id not in paid_order_ids:
+                    # ── Flutterwave Auto-Pay ──
+                    if flw_pay_enabled and order_id not in paid_order_ids:
+                        await asyncio.sleep(5)
+                        if not order_monitor_running:
+                            break
+                        await _flw_autopay(bot, chat_id, order_id, order_detail)
+
+                    # ── Bybit Auto-Pay (mark paid only, no real transfer) ──
+                    elif auto_pay_enabled and order_id not in paid_order_ids:
                         avg_release = seller_info.get("averageReleaseTime", "0")
                         try:
                             release_mins = float(avg_release)
@@ -768,6 +917,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("❌ Unauthorized")
         return
+    _admin_chat_ids.add(update.message.chat_id)  # register for FLW webhook notifications
     await update.message.reply_text(
         main_menu_text(), reply_markup=main_menu_keyboard(), parse_mode="Markdown"
     )
@@ -815,7 +965,7 @@ async def ping_bybit_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 # ─────────────────────────────────────────
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global refresh_task, refresh_running, current_price, ad_data
-    global order_monitor_task, order_monitor_running, auto_pay_enabled
+    global order_monitor_task, order_monitor_running, auto_pay_enabled, flw_pay_enabled
     global seen_order_ids, paid_order_ids
     global seen_sell_order_ids, released_order_ids
     global sell_msg_enabled, sell_custom_msg, sell_msg_count
@@ -963,6 +1113,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         released_order_ids  = set()
         sell_msg_enabled    = False
         sell_msg_count      = 1
+        auto_pay_enabled    = False
+        flw_pay_enabled     = False
         set_active_account(0)  # reset to Account 1
         for k, v in [("ad_id",""),("bybit_uid",""),("mode","fixed"),
                      ("increment","0.05"),("float_pct",""),("ngn_usdt_ref",""),("interval",2)]:
@@ -1035,13 +1187,48 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
     # ── 🗑 Clear Seen Orders ──
-    # ── 💳 Toggle Auto-Pay ──
+    # ── 💳 Toggle Auto-Pay (Bybit mark only) ──
     elif data == "toggle_auto_pay":
         auto_pay_enabled = not auto_pay_enabled
-        status = "✅ ENABLED" if auto_pay_enabled else "❌ DISABLED"
+        if auto_pay_enabled and flw_pay_enabled:
+            flw_pay_enabled = False
         await query.edit_message_text(
-            f"💳 *Auto-Pay {status}*\n\n{autopay_section_text()}",
-            reply_markup=autopay_section_keyboard(), parse_mode="Markdown"
+            autopay_section_text(), reply_markup=autopay_section_keyboard(), parse_mode="Markdown"
+        )
+
+    # ── 🟢 Toggle Flutterwave Pay ──
+    elif data == "toggle_flw_pay":
+        from config import FLW_CLIENT_ID, FLW_CLIENT_SECRET
+        if not flw_pay_enabled and (not FLW_CLIENT_ID or not FLW_CLIENT_SECRET):
+            await query.answer(
+                "❌ FLW_CLIENT_ID and FLW_CLIENT_SECRET not set in Render environment.",
+                show_alert=True
+            )
+            return
+        flw_pay_enabled = not flw_pay_enabled
+        if flw_pay_enabled and auto_pay_enabled:
+            auto_pay_enabled = False
+        await query.edit_message_text(
+            autopay_section_text(), reply_markup=autopay_section_keyboard(), parse_mode="Markdown"
+        )
+
+    # ── ℹ️ FLW info ──
+    elif data == "flw_info":
+        await query.edit_message_text(
+            "ℹ️ *How Flutterwave Auto-Pay Works*\n\n"
+            "1. Order Monitor must be running\n"
+            "2. New BUY order arrives → bot waits 5 seconds\n"
+            "3. Reads seller's account number, bank name, amount\n"
+            "4. Maps bank name to Flutterwave bank code\n"
+            "5. Verifies the account\n"
+            "6. Sends instant NGN transfer via Flutterwave\n"
+            "7. Polls for transfer status (up to 30 seconds)\n"
+            "8. If SUCCESSFUL → marks Bybit order as paid\n"
+            "9. Notifies you of result in Telegram\n\n"
+            "⚠️ Cannot run together with Bybit Auto-Pay.\n"
+            "⚠️ Ensure your Flutterwave account has enough NGN balance.",
+            reply_markup=InlineKeyboardMarkup(back_section("section_autopay")),
+            parse_mode="Markdown"
         )
 
     # ── ✅ Mark as Paid ──
