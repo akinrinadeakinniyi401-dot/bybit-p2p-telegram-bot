@@ -60,3 +60,8 @@ if not ADMIN_IDS:
 
 if not ADMIN_IDS:
     raise ValueError("No admin IDs set. Add ADMIN_ID_1 to Render environment variables.")
+
+# ── Flutterwave credentials (optional) ──
+FLW_CLIENT_ID     = os.getenv("FLW_CLIENT_ID", "")
+FLW_CLIENT_SECRET = os.getenv("FLW_CLIENT_SECRET", "")
+FLW_SECRET_HASH   = os.getenv("FLW_SECRET_HASH", "")
