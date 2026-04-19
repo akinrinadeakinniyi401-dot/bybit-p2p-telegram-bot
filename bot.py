@@ -20,6 +20,17 @@ from bybit import (
 
 logger = logging.getLogger(__name__)
 
+
+async def _get_current_ip() -> str:
+    """Fetch current server public IP."""
+    import requests as _r
+    for svc in ["https://api.ipify.org", "https://ifconfig.me/ip"]:
+        try:
+            return _r.get(svc, timeout=4).text.strip()
+        except Exception:
+            continue
+    return "unknown"
+
 # ─────────────────────────────────────────
 # 🧠 State
 # ─────────────────────────────────────────
@@ -509,13 +520,27 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
             ),
             parse_mode="Markdown")
 
-        # Step 1: Verify account
+        # Step 1: Verify account (non-blocking — proceed even if it fails)
         verify = await asyncio.get_event_loop().run_in_executor(
             None, verify_account, account_no, bank_code
         )
-        if verify.get("status") not in ("success", "200") and "error" in verify:
+        if "error" in verify:
+            err_msg = verify["error"]
+            # If it's an IP whitelist issue, show clear message and abort
+            if "IP not whitelisted" in err_msg or "Empty response" in err_msg:
+                await bot.send_message(chat_id=chat_id,
+                    text=(
+                        f"❌ *FLW Auto-Pay blocked* — Order `{order_id}`\n\n"
+                        f"Flutterwave is rejecting requests from this server.\n"
+                        f"👉 Go to Flutterwave dashboard → Settings → API → IP Whitelist\n"
+                        f"👉 Add your server IP (tap 🌍 Get My IP on the bot menu)"
+                    ),
+                    parse_mode="Markdown")
+                return
+            # Other verify errors — log warning but continue
+            logger.warning(f"[FLW] Account verify warning: {err_msg}")
             await bot.send_message(chat_id=chat_id,
-                text=f"⚠️ *FLW* Account verification warning for `{order_id}`\n`{verify}`\nProceeding anyway...",
+                text=f"⚠️ *FLW* Account verify warning for `{order_id}`\n`{err_msg[:100]}`\nProceeding...",
                 parse_mode="Markdown")
 
         # Step 2: Initiate transfer
@@ -527,9 +552,20 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
         )
 
         if "error" in result:
-            await bot.send_message(chat_id=chat_id,
-                text=f"❌ *FLW transfer failed* — `{order_id}`\n`{result['error']}`",
-                parse_mode="Markdown")
+            err_msg = result["error"]
+            if "IP not whitelisted" in err_msg or "Empty response" in err_msg:
+                await bot.send_message(chat_id=chat_id,
+                    text=(
+                        f"❌ *FLW Transfer blocked* — Order `{order_id}`\n\n"
+                        f"Flutterwave is rejecting requests — IP not whitelisted.\n"
+                        f"👉 Flutterwave dashboard → Settings → API → IP Whitelist\n"
+                        f"👉 Add: `{await _get_current_ip()}`"
+                    ),
+                    parse_mode="Markdown")
+            else:
+                await bot.send_message(chat_id=chat_id,
+                    text=f"❌ *FLW transfer error* — `{order_id}`\n`{err_msg[:200]}`",
+                    parse_mode="Markdown")
             return
 
         transfer_id = result.get("data", {}).get("id", "")
