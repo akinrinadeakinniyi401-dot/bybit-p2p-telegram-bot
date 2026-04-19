@@ -309,7 +309,7 @@ def orders_section_text():
 # ─────────────────────────────────────────
 def autopay_section_keyboard():
     pay     = "💳 Disable Auto-Pay (Bybit)" if auto_pay_enabled  else "💳 Enable Auto-Pay (Bybit)"
-    flw     = "🟢 Disable Flutterwave Pay"  if flw_pay_enabled   else "🔴 Enable Flutterwave Pay"
+    flw     = "🟢 Disable Flutterwave Pay ✅" if flw_pay_enabled else "🔴 Enable Flutterwave Pay"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(pay, callback_data="toggle_auto_pay")],
         [InlineKeyboardButton(flw, callback_data="toggle_flw_pay")],
@@ -476,25 +476,24 @@ def sell_order_buttons(order_id: str) -> InlineKeyboardMarkup:
 # ─────────────────────────────────────────
 async def _flw_autopay(bot, chat_id, order_id, order_detail):
     """Execute Flutterwave payment for a BUY order then mark it as paid on Bybit."""
-    from flutterwave import resolve_bank_code, verify_account, send_transfer, get_transfer_status
+    from flutterwave import resolve_bank_code, send_transfer, get_transfer_status
 
     try:
-        # Get seller payment details
         pay_term = order_detail.get("confirmedPayTerm", {}) or {}
         if not pay_term:
             terms    = order_detail.get("paymentTermList", [])
             pay_term = terms[0] if terms else {}
 
-        account_no   = pay_term.get("accountNo", "").strip()
-        bank_name    = pay_term.get("bankName",  "").strip()
-        pay_cfg      = pay_term.get("paymentConfigVo", {}) or pay_term.get("paymentConfig", {}) or {}
+        account_no    = pay_term.get("accountNo", "").strip()
+        bank_name     = pay_term.get("bankName",  "").strip()
+        pay_cfg       = pay_term.get("paymentConfigVo", {}) or pay_term.get("paymentConfig", {}) or {}
         pay_type_name = pay_cfg.get("paymentName", "").strip()
-        amount_str   = order_detail.get("amount", "0")
-        seller_name  = pay_term.get("realName", order_detail.get("sellerRealName", "Seller"))
+        amount_str    = order_detail.get("amount", "0")
+        seller_name   = pay_term.get("realName", order_detail.get("sellerRealName", "Seller"))
 
         if not account_no:
             await bot.send_message(chat_id=chat_id,
-                text=f"❌ *FLW Auto-Pay* — Order `{order_id}`\nNo account number found.",
+                text=f"❌ *FLW Auto-Pay* — Order `{order_id}`\nNo account number found in order.",
                 parse_mode="Markdown")
             return
 
@@ -510,40 +509,17 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
             return
 
         amount = float(amount_str)
-        logger.info(f"[FLW] AutoPay: {amount} NGN → {account_no} @ {bank_code} ({bank_name})")
+        logger.info(f"[FLW] AutoPay: {amount} NGN → {account_no} @ {bank_code} ({bank_name or pay_type_name})")
 
         await bot.send_message(chat_id=chat_id,
             text=(
                 f"⏳ *FLW Auto-Pay initiated*\n"
                 f"Order: `{order_id}`\n"
-                f"Sending *{amount:,.2f} NGN* to `{account_no}` ({bank_name or pay_type_name})"
+                f"Sending *{amount:,.2f} NGN* → `{account_no}` ({bank_name or pay_type_name})"
             ),
             parse_mode="Markdown")
 
-        # Step 1: Verify account (non-blocking — proceed even if it fails)
-        verify = await asyncio.get_event_loop().run_in_executor(
-            None, verify_account, account_no, bank_code
-        )
-        if "error" in verify:
-            err_msg = verify["error"]
-            # If it's an IP whitelist issue, show clear message and abort
-            if "IP not whitelisted" in err_msg or "Empty response" in err_msg:
-                await bot.send_message(chat_id=chat_id,
-                    text=(
-                        f"❌ *FLW Auto-Pay blocked* — Order `{order_id}`\n\n"
-                        f"Flutterwave is rejecting requests from this server.\n"
-                        f"👉 Go to Flutterwave dashboard → Settings → API → IP Whitelist\n"
-                        f"👉 Add your server IP (tap 🌍 Get My IP on the bot menu)"
-                    ),
-                    parse_mode="Markdown")
-                return
-            # Other verify errors — log warning but continue
-            logger.warning(f"[FLW] Account verify warning: {err_msg}")
-            await bot.send_message(chat_id=chat_id,
-                text=f"⚠️ *FLW* Account verify warning for `{order_id}`\n`{err_msg[:100]}`\nProceeding...",
-                parse_mode="Markdown")
-
-        # Step 2: Initiate transfer
+        # Initiate transfer (no account verify step — not available on production)
         ref    = f"p2p{order_id[-12:]}"
         result = await asyncio.get_event_loop().run_in_executor(
             None, send_transfer,
@@ -553,75 +529,88 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
 
         if "error" in result:
             err_msg = result["error"]
-            if "IP not whitelisted" in err_msg or "Empty response" in err_msg:
+            if "IP" in err_msg or "Empty response" in err_msg or "whitelist" in err_msg.lower():
+                ip = await _get_current_ip()
                 await bot.send_message(chat_id=chat_id,
                     text=(
-                        f"❌ *FLW Transfer blocked* — Order `{order_id}`\n\n"
-                        f"Flutterwave is rejecting requests — IP not whitelisted.\n"
+                        f"❌ *FLW blocked* — Order `{order_id}`\n\n"
+                        f"Flutterwave is rejecting the request.\n"
                         f"👉 Flutterwave dashboard → Settings → API → IP Whitelist\n"
-                        f"👉 Add: `{await _get_current_ip()}`"
+                        f"👉 Add: `{ip}`"
                     ),
                     parse_mode="Markdown")
             else:
                 await bot.send_message(chat_id=chat_id,
-                    text=f"❌ *FLW transfer error* — `{order_id}`\n`{err_msg[:200]}`",
+                    text=f"❌ *FLW transfer error* — `{order_id}`\n`{err_msg[:300]}`",
                     parse_mode="Markdown")
             return
 
-        transfer_id = result.get("data", {}).get("id", "")
-        status      = result.get("data", {}).get("status", "")
+        # Transfer created — status starts as NEW
+        transfer_data = result.get("data", {})
+        transfer_id   = transfer_data.get("id", "")
+        status        = transfer_data.get("status", "NEW")
         logger.info(f"[FLW] Transfer created: {transfer_id} | status={status}")
 
-        # Step 3: Poll for final status (up to 30 seconds)
+        # Poll for final status (up to 60 seconds, every 5 seconds)
         final_status = status
-        for attempt in range(6):
+        for attempt in range(12):
             await asyncio.sleep(5)
             if final_status in ("SUCCESSFUL", "FAILED"):
                 break
             poll = await asyncio.get_event_loop().run_in_executor(
                 None, get_transfer_status, transfer_id
             )
-            final_status = poll.get("data", {}).get("status", final_status)
+            poll_data    = poll.get("data", {})
+            final_status = poll_data.get("status", final_status)
             logger.info(f"[FLW] Poll {attempt+1}: {transfer_id} → {final_status}")
 
         if final_status == "SUCCESSFUL":
-            # Step 4: Mark Bybit order as paid
             pay_type   = str(pay_term.get("paymentType", ""))
             payment_id = str(pay_term.get("id", ""))
+            bybit_ok   = False
             if pay_type and payment_id:
-                pr = await asyncio.get_event_loop().run_in_executor(
+                pr       = await asyncio.get_event_loop().run_in_executor(
                     None, mark_order_paid, order_id, pay_type, payment_id
                 )
                 bybit_ok = pr.get("retCode", -1) == 0
-            else:
-                bybit_ok = False
-
             paid_order_ids.add(order_id)
-            logger.info(f"[FLW] ✅ Transfer SUCCESSFUL: {transfer_id} | Bybit mark paid: {bybit_ok}")
+            logger.info(f"[FLW] ✅ SUCCESSFUL: {transfer_id} | Bybit marked: {bybit_ok}")
             await bot.send_message(chat_id=chat_id,
                 text=(
-                    f"✅ *FLW Auto-Pay SUCCESS*\n\n"
+                    f"✅ *FLW Payment SUCCESS*\n\n"
                     f"Order: `{order_id}`\n"
                     f"Amount: *{amount:,.2f} NGN*\n"
                     f"Transfer ID: `{transfer_id}`\n"
-                    f"Bybit marked paid: {'✅' if bybit_ok else '⚠️ Manual mark needed'}"
+                    f"Bybit order marked paid: {'✅' if bybit_ok else '⚠️ Mark manually'}"
                 ),
                 parse_mode="Markdown")
-        else:
-            logger.error(f"[FLW] ❌ Transfer {final_status}: {transfer_id}")
+
+        elif final_status == "FAILED":
+            logger.error(f"[FLW] ❌ FAILED: {transfer_id}")
             await bot.send_message(chat_id=chat_id,
                 text=(
-                    f"❌ *FLW Transfer {final_status}*\n\n"
+                    f"❌ *FLW Transfer FAILED*\n\n"
                     f"Order: `{order_id}`\n"
                     f"Transfer ID: `{transfer_id}`\n"
                     "Please mark this order manually."
+                ),
+                parse_mode="Markdown")
+        else:
+            # Still NEW/PENDING after 60 seconds — webhook will handle final update
+            logger.info(f"[FLW] Transfer still {final_status} after polling: {transfer_id}")
+            await bot.send_message(chat_id=chat_id,
+                text=(
+                    f"⏳ *FLW Transfer Pending*\n\n"
+                    f"Order: `{order_id}`\n"
+                    f"Transfer ID: `{transfer_id}` | Status: `{final_status}`\n"
+                    "You'll receive a notification when it completes via webhook."
                 ),
                 parse_mode="Markdown")
 
     except Exception as e:
         logger.error(f"[FLW] _flw_autopay error: {e}")
         await bot.send_message(chat_id=chat_id,
-            text=f"❌ *FLW Auto-Pay error* — `{order_id}`\n`{e}`",
+            text=f"❌ *FLW Auto-Pay error* — `{order_id}`\n`{str(e)[:200]}`",
             parse_mode="Markdown")
 
 
@@ -993,6 +982,44 @@ async def ping_bybit_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     else:
         await update.message.reply_text(
             f"❌ *API failed*\n`{result.get('retMsg','')}`", parse_mode="Markdown"
+        )
+
+
+async def ping_flutterwave_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    from config import FLW_CLIENT_ID, FLW_CLIENT_SECRET
+    if not FLW_CLIENT_ID or not FLW_CLIENT_SECRET:
+        await update.message.reply_text(
+            "❌ *FLW credentials not set*\n\n"
+            "Add these to Render environment:\n"
+            "`FLW_CLIENT_ID`\n`FLW_CLIENT_SECRET`",
+            parse_mode="Markdown"
+        )
+        return
+    await update.message.reply_text("⏳ Testing Flutterwave connection...")
+    from flutterwave import ping_flutterwave
+    result = await asyncio.get_event_loop().run_in_executor(None, ping_flutterwave)
+    if "error" in result:
+        ip = await _get_current_ip()
+        await update.message.reply_text(
+            f"❌ *Flutterwave connection failed*\n\n"
+            f"`{result['error'][:300]}`\n\n"
+            f"Checklist:\n"
+            f"• ✅/❌ `FLW_CLIENT_ID` correct?\n"
+            f"• ✅/❌ `FLW_CLIENT_SECRET` correct?\n"
+            f"• ✅/❌ IP `{ip}` whitelisted on Flutterwave dashboard?\n"
+            f"  → Settings → API → IP Whitelist",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text(
+            f"✅ *Flutterwave connected!*\n\n"
+            f"Token obtained successfully ✅\n"
+            f"Credentials are valid ✅\n\n"
+            f"⚠️ Make sure your server IP is also whitelisted on Flutterwave\n"
+            f"for transfer requests to work.",
+            parse_mode="Markdown"
         )
 
 
@@ -1724,9 +1751,10 @@ def start_bot():
         .updater(None)
         .build()
     )
-    application.add_handler(CommandHandler("start",     start))
-    application.add_handler(CommandHandler("menu",      menu_command))
-    application.add_handler(CommandHandler("pingbybit", ping_bybit_command))
+    application.add_handler(CommandHandler("start",            start))
+    application.add_handler(CommandHandler("menu",             menu_command))
+    application.add_handler(CommandHandler("pingbybit",        ping_bybit_command))
+    application.add_handler(CommandHandler("pingflutterwave",  ping_flutterwave_command))
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     logger.info("🤖 Bot handlers registered")
