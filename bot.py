@@ -322,8 +322,8 @@ def autopay_section_keyboard():
 def autopay_section_text():
     bybit_status = "✅ ENABLED" if auto_pay_enabled else "❌ DISABLED"
     flw_status   = "✅ ENABLED" if flw_pay_enabled  else "❌ DISABLED"
-    from config import FLW_CLIENT_ID
-    flw_configured = "✅ Configured" if FLW_CLIENT_ID else "❌ Not configured — add FLW_CLIENT_ID & FLW_CLIENT_SECRET to Render"
+    from config import FLW_SECRET_KEY
+    flw_configured = "✅ Configured" if FLW_SECRET_KEY else "❌ Not configured — add FLW_SECRET_KEY to Render"
     return (
         f"💳 *AUTO-PAY*\n\n"
         f"Bybit Mark-Paid: *{bybit_status}*\n"
@@ -988,16 +988,17 @@ async def ping_bybit_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def ping_flutterwave_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-    from config import FLW_CLIENT_ID, FLW_CLIENT_SECRET
-    if not FLW_CLIENT_ID or not FLW_CLIENT_SECRET:
+    from config import FLW_SECRET_KEY
+    if not FLW_SECRET_KEY:
         await update.message.reply_text(
-            "❌ *FLW credentials not set*\n\n"
-            "Add these to Render environment:\n"
-            "`FLW_CLIENT_ID`\n`FLW_CLIENT_SECRET`",
+            "❌ *FLW_SECRET_KEY not set*\n\n"
+            "Add this to Render environment:\n"
+            "`FLW_SECRET_KEY` = your Flutterwave secret key\n\n"
+            "Find it on Flutterwave dashboard → Settings → API Keys",
             parse_mode="Markdown"
         )
         return
-    await update.message.reply_text("⏳ Testing Flutterwave connection...")
+    await update.message.reply_text("⏳ Testing Flutterwave v3 API...")
     from flutterwave import ping_flutterwave
     result = await asyncio.get_event_loop().run_in_executor(None, ping_flutterwave)
     if "error" in result:
@@ -1006,19 +1007,17 @@ async def ping_flutterwave_command(update: Update, context: ContextTypes.DEFAULT
             f"❌ *Flutterwave connection failed*\n\n"
             f"`{result['error'][:300]}`\n\n"
             f"Checklist:\n"
-            f"• ✅/❌ `FLW_CLIENT_ID` correct?\n"
-            f"• ✅/❌ `FLW_CLIENT_SECRET` correct?\n"
-            f"• ✅/❌ IP `{ip}` whitelisted on Flutterwave dashboard?\n"
+            f"• ✅/❌ `FLW_SECRET_KEY` is your live secret key (starts with `FLWSECK_`)\n"
+            f"• ✅/❌ IP `{ip}` whitelisted on Flutterwave?\n"
             f"  → Settings → API → IP Whitelist",
             parse_mode="Markdown"
         )
     else:
         await update.message.reply_text(
-            f"✅ *Flutterwave connected!*\n\n"
-            f"Token obtained successfully ✅\n"
-            f"Credentials are valid ✅\n\n"
-            f"⚠️ Make sure your server IP is also whitelisted on Flutterwave\n"
-            f"for transfer requests to work.",
+            f"✅ *Flutterwave v3 API connected!*\n\n"
+            f"Secret key is valid ✅\n"
+            f"Using standard `/v3/transfers` endpoint ✅\n\n"
+            f"Make sure your server IP is whitelisted on Flutterwave for transfers to work.",
             parse_mode="Markdown"
         )
 
@@ -1261,10 +1260,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── 🟢 Toggle Flutterwave Pay ──
     elif data == "toggle_flw_pay":
-        from config import FLW_CLIENT_ID, FLW_CLIENT_SECRET
-        if not flw_pay_enabled and (not FLW_CLIENT_ID or not FLW_CLIENT_SECRET):
+        from config import FLW_SECRET_KEY
+        if not flw_pay_enabled and not FLW_SECRET_KEY:
             await query.answer(
-                "❌ FLW_CLIENT_ID and FLW_CLIENT_SECRET not set in Render environment.",
+                "❌ FLW_SECRET_KEY not set in Render environment. Add your Flutterwave secret key.",
                 show_alert=True
             )
             return
