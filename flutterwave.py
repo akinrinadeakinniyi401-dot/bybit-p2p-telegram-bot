@@ -1,80 +1,44 @@
 import uuid
 import logging
 import requests
-from datetime import datetime, timedelta
-from config import FLW_CLIENT_ID, FLW_CLIENT_SECRET
+from config import FLW_SECRET_KEY, FLW_SECRET_HASH
 
 logger = logging.getLogger(__name__)
 
-TOKEN_URL = "https://idp.flutterwave.com/realms/flutterwave/protocol/openid-connect/token"
-BASE_URL  = "https://api.flutterwave.com"
+# Standard Flutterwave v3 API — uses secret key directly, no OAuth
+BASE_URL = "https://api.flutterwave.com/v3"
+
 
 # ─────────────────────────────────────────
-# 🔑 Token manager — auto-refresh before expiry
+# 📡 Headers — simple Bearer secret key
 # ─────────────────────────────────────────
-_access_token = None
-_token_expiry = None
-
-
-def _get_token() -> str:
-    global _access_token, _token_expiry
-
-    if _access_token is None or _token_expiry is None or \
-       datetime.now() >= (_token_expiry - timedelta(minutes=1)):
-        logger.info("[FLW] Generating new access token...")
-        resp = requests.post(
-            TOKEN_URL,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            data={
-                "client_id":     FLW_CLIENT_ID,
-                "client_secret": FLW_CLIENT_SECRET,
-                "grant_type":    "client_credentials",
-            },
-            timeout=10
-        )
-        if not resp.text.strip():
-            raise Exception(
-                "Empty response from Flutterwave token endpoint. "
-                "Check FLW_CLIENT_ID and FLW_CLIENT_SECRET are correct."
-            )
-        resp.raise_for_status()
-        data          = resp.json()
-        _access_token = data["access_token"]
-        expires_in    = int(data.get("expires_in", 600))
-        _token_expiry = datetime.now() + timedelta(seconds=expires_in)
-        logger.info(f"[FLW] Token obtained. Expires in {expires_in}s")
-
-    return _access_token
-
-
-def _headers(idempotency_key: str = None, trace_id: str = None) -> dict:
+def _headers() -> dict:
     return {
-        "Authorization":     f"Bearer {_get_token()}",
-        "Content-Type":      "application/json",
-        "X-Idempotency-Key": idempotency_key or uuid.uuid4().hex[:32],
-        "X-Trace-Id":        trace_id or uuid.uuid4().hex,
+        "Authorization": f"Bearer {FLW_SECRET_KEY}",
+        "Content-Type":  "application/json",
     }
 
 
 def _parse(resp, label="") -> dict:
-    logger.info(f"[FLW]{label} HTTP {resp.status_code} | {resp.text[:400]}")
+    logger.info(f"[FLW]{label} HTTP {resp.status_code} | {resp.text[:500]}")
 
     if not resp.text.strip():
         return {
             "error": (
                 f"Empty response from Flutterwave{label} — "
-                "IP likely not whitelisted. Go to Flutterwave dashboard → Settings → API → IP Whitelist."
-            ),
-            "status_code": resp.status_code
+                "IP likely not whitelisted on Flutterwave dashboard → Settings → API → IP Whitelist."
+            )
         }
 
-    if resp.status_code == 404:
-        return {"error": f"404 — endpoint not found{label}: {resp.url}", "status_code": 404}
+    if resp.status_code in (401, 403):
+        return {
+            "error": f"HTTP {resp.status_code} — Invalid or missing FLW_SECRET_KEY. Check Render env vars."
+        }
 
     try:
         return resp.json()
     except Exception as e:
-        return {"error": f"JSON parse error: {e} | body: {resp.text[:200]}"}
+        return {"error": f"JSON parse error: {e} | body: {resp.text[:300]}"}
 
 
 # ─────────────────────────────────────────
@@ -144,59 +108,56 @@ def resolve_bank_code(bank_name: str, payment_name: str = "") -> str | None:
 
 
 # ─────────────────────────────────────────
-# 🏓 Ping — verify FLW credentials work
-# Just gets a token. If it succeeds, credentials are valid.
+# 🏓 Ping — verify secret key works
+# GET /v3/transfers with page=1 (lightweight check)
 # ─────────────────────────────────────────
 def ping_flutterwave() -> dict:
+    if not FLW_SECRET_KEY:
+        return {"error": "FLW_SECRET_KEY not set in Render environment variables."}
     try:
-        token = _get_token()
-        return {"status": "ok", "token_preview": token[:20] + "..."}
+        resp = requests.get(
+            f"{BASE_URL}/transfers?page=1&per_page=1",
+            headers=_headers(),
+            timeout=10
+        )
+        data = _parse(resp, " [ping]")
+        if "error" in data:
+            return data
+        # Success means key is valid
+        return {"status": "ok", "message": "Connected to Flutterwave v3 API"}
     except Exception as e:
         return {"error": str(e)}
 
 
 # ─────────────────────────────────────────
-# 💸 Send NGN direct transfer
-# Docs: POST /direct-transfers
-# NGN payout: source_currency NGN → destination NGN
+# 💸 Send NGN transfer
+# POST /v3/transfers
+# Docs: https://developer.flutterwave.com/docs/bank-transfer.md
 # ─────────────────────────────────────────
 def send_transfer(account_number: str, bank_code: str, amount: float,
                   narration: str = "P2P payment", reference: str = None) -> dict:
-    ref      = reference or f"p2p{uuid.uuid4().hex[:20]}"
-    idem_key = uuid.uuid4().hex[:32]
-    trace_id = uuid.uuid4().hex
+    ref = reference or f"p2p{uuid.uuid4().hex[:20]}"
 
     payload = {
-        "action":   "instant",
-        "type":     "bank",
-        "narration": narration,
-        "reference": ref,
-        "payment_instruction": {
-            "amount": {
-                "value":      amount,
-                "applies_to": "destination_currency"
-            },
-            "source_currency":      "NGN",
-            "destination_currency": "NGN",
-            "recipient": {
-                "bank": {
-                    "code":           bank_code,
-                    "account_number": account_number
-                }
-            }
-        }
+        "account_bank":    bank_code,
+        "account_number":  account_number,
+        "amount":          amount,
+        "narration":       narration,
+        "currency":        "NGN",
+        "reference":       ref,
+        "debit_currency":  "NGN",
     }
 
-    logger.info(f"[FLW] Transfer: {amount} NGN → {account_number} @ {bank_code} | ref={ref}")
+    logger.info(f"[FLW] v3 Transfer: {amount} NGN → {account_number} @ {bank_code} | ref={ref}")
 
     try:
         resp = requests.post(
-            f"{BASE_URL}/direct-transfers",
-            headers=_headers(idempotency_key=idem_key, trace_id=trace_id),
+            f"{BASE_URL}/transfers",
+            headers=_headers(),
             json=payload,
             timeout=15
         )
-        return _parse(resp, " [direct-transfers]")
+        return _parse(resp, " [v3/transfers]")
     except Exception as e:
         logger.error(f"[FLW] send_transfer error: {e}")
         return {"error": str(e)}
@@ -204,7 +165,7 @@ def send_transfer(account_number: str, bank_code: str, amount: float,
 
 # ─────────────────────────────────────────
 # 🔍 Get transfer status
-# Docs: GET /transfers/{id}   ← correct endpoint
+# GET /v3/transfers/{id}
 # ─────────────────────────────────────────
 def get_transfer_status(transfer_id: str) -> dict:
     logger.info(f"[FLW] Status check: {transfer_id}")
@@ -214,7 +175,7 @@ def get_transfer_status(transfer_id: str) -> dict:
             headers=_headers(),
             timeout=10
         )
-        return _parse(resp, " [transfers/status]")
+        return _parse(resp, " [v3/transfers/status]")
     except Exception as e:
         logger.error(f"[FLW] get_transfer_status error: {e}")
         return {"error": str(e)}
