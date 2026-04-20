@@ -476,7 +476,7 @@ def sell_order_buttons(order_id: str) -> InlineKeyboardMarkup:
 # ─────────────────────────────────────────
 async def _flw_autopay(bot, chat_id, order_id, order_detail):
     """Two-step Flutterwave payment: verify account then transfer."""
-    from flutterwave import resolve_bank_code, verify_account, send_transfer, get_transfer_status
+    from flutterwave import match_bank_code, verify_account, send_transfer, get_transfer_status
 
     try:
         pay_term = order_detail.get("confirmedPayTerm", {}) or {}
@@ -497,7 +497,7 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
                 parse_mode="Markdown")
             return
 
-        bank_code = resolve_bank_code(bank_name, pay_type_name)
+        bank_code = match_bank_code(bank_name, pay_type_name)
         if not bank_code:
             await bot.send_message(chat_id=chat_id,
                 text=(
@@ -531,7 +531,9 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
             return
 
         verified_name = verify.get("data", {}).get("account_name", seller_name)
-        logger.info(f"[FLW] Verified: {verified_name} | {account_no} @ {bank_code}")
+        # If a fallback code worked, use it for the transfer
+        working_code  = verify.get("_working_bank_code", bank_code)
+        logger.info(f"[FLW] Verified: {verified_name} | {account_no} @ {working_code}")
 
         await bot.send_message(chat_id=chat_id,
             text=(
@@ -544,7 +546,7 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
         # Step 2: Send transfer
         ref    = f"p2p{order_id[-12:]}"
         result = await asyncio.get_event_loop().run_in_executor(
-            None, send_transfer, account_no, bank_code, amount,
+            None, send_transfer, account_no, working_code, amount,
             f"P2P payment to {verified_name}", ref
         )
 
@@ -1033,13 +1035,21 @@ async def ping_flutterwave_command(update: Update, context: ContextTypes.DEFAULT
             parse_mode="Markdown"
         )
     else:
-        await update.message.reply_text(
-            f"✅ *Flutterwave v3 API connected!*\n\n"
-            f"Secret key is valid ✅\n"
-            f"Using standard `/v3/transfers` endpoint ✅\n\n"
-            f"Make sure your server IP is whitelisted on Flutterwave for transfers to work.",
-            parse_mode="Markdown"
-        )
+        banks = result.get("banks", [])
+        if banks:
+            lines = [f"✅ *Flutterwave Connected!* `{len(banks)}` Nigerian banks:\n"]
+            for bank in banks[:60]:
+                lines.append(f"`{bank['code']}` — {bank['name']}")
+            msg = "\n".join(lines)
+            if len(msg) > 4000:
+                msg = msg[:4000] + "\n...(truncated — tap /pingflutterwave again to refresh)"
+            await update.message.reply_text(msg, parse_mode="Markdown")
+        else:
+            await update.message.reply_text(
+                "✅ *Flutterwave v3 Connected!*\n\nSecret key valid ✅\n"
+                "Dynamic bank matching active ✅",
+                parse_mode="Markdown"
+            )
 
 
 # ─────────────────────────────────────────
