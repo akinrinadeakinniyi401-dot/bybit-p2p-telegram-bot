@@ -574,14 +574,21 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
 
         if status == "FAILED":
             complete_msg = transfer_data.get("complete_message", "Rejected by bank")
-            logger.error(f"[FLW] \u274c FAILED: {transfer_id} \u2014 {complete_msg}")
-            await bot.send_message(chat_id=chat_id,
-                text=(
-                    f"\u274c *FLW FAILED* \u2014 Order `{order_id}`\n"
-                    f"Transfer ID: `{transfer_id}`\nReason: `{complete_msg}`\n"
-                    "Mark order manually."
-                ),
-                parse_mode="Markdown")
+            logger.error(f"[FLW] FAILED: {transfer_id} — {complete_msg}")
+            if "insufficient" in complete_msg.lower() or "funds" in complete_msg.lower():
+                fail_text = (
+                    f"❌ *FLW Failed — Insufficient Funds*\n\n"
+                    f"Order: `{order_id}`\nAmount needed: *{amount:,.2f} NGN*\n\n"
+                    f"👉 Top up: Flutterwave dashboard → Balances → Fund Wallet\n"
+                    f"Mark order manually for now."
+                )
+            else:
+                fail_text = (
+                    f"❌ *FLW Transfer Failed*\n\n"
+                    f"Order: `{order_id}`\nTransfer ID: `{transfer_id}`\n"
+                    f"Reason: `{complete_msg}`\nMark order manually."
+                )
+            await bot.send_message(chat_id=chat_id, text=fail_text, parse_mode="Markdown")
             return
 
         # Step 3: Poll status (up to 60 seconds)
@@ -613,13 +620,25 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
                 ),
                 parse_mode="Markdown")
         elif final_status == "FAILED":
-            logger.error(f"[FLW] \u274c FAILED: {transfer_id}")
-            await bot.send_message(chat_id=chat_id,
-                text=(
-                    f"\u274c *FLW Transfer FAILED*\n\nOrder: `{order_id}`\n"
-                    f"Transfer ID: `{transfer_id}`\nMark order manually."
-                ),
-                parse_mode="Markdown")
+            logger.error(f"[FLW] FAILED: {transfer_id}")
+            # Try to get complete_message from last poll
+            last_poll = await asyncio.get_event_loop().run_in_executor(None, get_transfer_status, transfer_id)
+            complete_msg = last_poll.get("data", {}).get("complete_message", "")
+            if "insufficient" in complete_msg.lower() or "funds" in complete_msg.lower():
+                fail_text = (
+                    f"❌ *FLW Failed — Insufficient Funds*\n\n"
+                    f"Order: `{order_id}`\nAmount: *{amount:,.2f} NGN*\n\n"
+                    f"👉 Top up: Flutterwave dashboard → Balances → Fund Wallet\n"
+                    f"Mark order manually for now."
+                )
+            else:
+                fail_text = (
+                    f"❌ *FLW Transfer FAILED*\n\n"
+                    f"Order: `{order_id}`\nTransfer ID: `{transfer_id}`\n"
+                    f"{'Reason: `' + complete_msg + '`' + chr(10) if complete_msg else ''}"
+                    "Mark order manually."
+                )
+            await bot.send_message(chat_id=chat_id, text=fail_text, parse_mode="Markdown")
         else:
             await bot.send_message(chat_id=chat_id,
                 text=(
