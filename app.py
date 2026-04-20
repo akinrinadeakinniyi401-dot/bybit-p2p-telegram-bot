@@ -46,28 +46,43 @@ def webhook():
 
 
 # 💸 Flutterwave webhook
-# Flutterwave signs payloads with HMAC-SHA256 using your secret hash
-# and sends the result (base64) in the `flutterwave-signature` header.
 @app.route("/flw-webhook", methods=["POST"])
 def flw_webhook():
     from config import FLW_SECRET_HASH
 
-    raw_body  = request.get_data()        # raw bytes for signature check
+    raw_body  = request.get_data()        # raw bytes — must use this for signature
     signature = request.headers.get("flutterwave-signature", "")
 
     # ── Verify signature ──
-    if FLW_SECRET_HASH:
+    # Only enforce if both FLW_SECRET_HASH and signature are present
+    if FLW_SECRET_HASH and signature:
+        # Flutterwave signs with HMAC-SHA256 and sends result as base64
         expected = base64.b64encode(
             hmac.new(
                 FLW_SECRET_HASH.encode("utf-8"),
-                raw_body,
+                raw_body,                  # raw bytes — do NOT decode
                 hashlib.sha256
             ).digest()
         ).decode("utf-8")
 
         if signature != expected:
-            logger.warning(f"[FLW Webhook] Invalid signature. Got: {signature}")
+            logger.warning(
+                f"[FLW Webhook] Signature mismatch.\n"
+                f"  Got:      {signature[:40]}...\n"
+                f"  Expected: {expected[:40]}...\n"
+                f"  Check FLW_SECRET_HASH matches Flutterwave dashboard → Settings → Webhooks"
+            )
             return jsonify({"status": "unauthorized"}), 401
+
+    elif FLW_SECRET_HASH and not signature:
+        # Signature expected but not sent — Flutterwave dashboard may not have secret hash set
+        logger.warning(
+            "[FLW Webhook] No signature header received. "
+            "Set the same FLW_SECRET_HASH value on Flutterwave dashboard → Settings → Webhooks → Secret Hash. "
+            "Accepting webhook anyway."
+        )
+    else:
+        logger.info("[FLW Webhook] No FLW_SECRET_HASH set — skipping signature check")
 
     try:
         payload     = request.get_json(force=True)
