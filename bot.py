@@ -475,8 +475,8 @@ def sell_order_buttons(order_id: str) -> InlineKeyboardMarkup:
 # 📦 ORDER MONITOR LOOP — handles BUY + SELL
 # ─────────────────────────────────────────
 async def _flw_autopay(bot, chat_id, order_id, order_detail):
-    """Execute Flutterwave payment for a BUY order then mark it as paid on Bybit."""
-    from flutterwave import resolve_bank_code, send_transfer, get_transfer_status
+    """Two-step Flutterwave payment: verify account then transfer."""
+    from flutterwave import resolve_bank_code, verify_account, send_transfer, get_transfer_status
 
     try:
         pay_term = order_detail.get("confirmedPayTerm", {}) or {}
@@ -493,7 +493,7 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
 
         if not account_no:
             await bot.send_message(chat_id=chat_id,
-                text=f"❌ *FLW Auto-Pay* — Order `{order_id}`\nNo account number found in order.",
+                text=f"\u274c *FLW Auto-Pay* \u2014 Order `{order_id}`\nNo account number found.",
                 parse_mode="Markdown")
             return
 
@@ -501,116 +501,136 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
         if not bank_code:
             await bot.send_message(chat_id=chat_id,
                 text=(
-                    f"❌ *FLW Auto-Pay* — Order `{order_id}`\n"
-                    f"Unknown bank: `{bank_name or pay_type_name}`\n"
-                    "Please mark this order manually."
+                    f"\u274c *FLW Auto-Pay* \u2014 Order `{order_id}`\n"
+                    f"Unknown bank: `{bank_name or pay_type_name}`\nMark this order manually."
                 ),
                 parse_mode="Markdown")
             return
 
         amount = float(amount_str)
-        logger.info(f"[FLW] AutoPay: {amount} NGN → {account_no} @ {bank_code} ({bank_name or pay_type_name})")
+        logger.info(f"[FLW] AutoPay: {amount} NGN \u2192 {account_no} @ {bank_code}")
+
+        # Step 1: Verify account
+        await bot.send_message(chat_id=chat_id,
+            text=f"\u23f3 *FLW* Verifying account `{account_no}` ({bank_name or pay_type_name})...",
+            parse_mode="Markdown")
+
+        verify = await asyncio.get_event_loop().run_in_executor(
+            None, verify_account, account_no, bank_code
+        )
+
+        if verify.get("status") != "success" or "error" in verify:
+            err = verify.get("message", verify.get("error", "Unknown error"))
+            await bot.send_message(chat_id=chat_id,
+                text=(
+                    f"\u274c *FLW Account Invalid* \u2014 Order `{order_id}`\n\n"
+                    f"Account `{account_no}` @ `{bank_name or pay_type_name}` failed verification.\n"
+                    f"Reason: `{err}`\n\nTransfer aborted. Mark order manually."
+                ),
+                parse_mode="Markdown")
+            return
+
+        verified_name = verify.get("data", {}).get("account_name", seller_name)
+        logger.info(f"[FLW] Verified: {verified_name} | {account_no} @ {bank_code}")
 
         await bot.send_message(chat_id=chat_id,
             text=(
-                f"⏳ *FLW Auto-Pay initiated*\n"
-                f"Order: `{order_id}`\n"
-                f"Sending *{amount:,.2f} NGN* → `{account_no}` ({bank_name or pay_type_name})"
+                f"\u2705 *Account Verified*: *{verified_name}*\n"
+                f"Account: `{account_no}` ({bank_name or pay_type_name})\n\n"
+                f"\u23f3 Sending *{amount:,.2f} NGN*..."
             ),
             parse_mode="Markdown")
 
-        # Initiate transfer (no account verify step — not available on production)
+        # Step 2: Send transfer
         ref    = f"p2p{order_id[-12:]}"
         result = await asyncio.get_event_loop().run_in_executor(
-            None, send_transfer,
-            account_no, bank_code, amount,
-            f"P2P payment to {seller_name}", ref
+            None, send_transfer, account_no, bank_code, amount,
+            f"P2P payment to {verified_name}", ref
         )
 
         if "error" in result:
             err_msg = result["error"]
-            if "IP" in err_msg or "Empty response" in err_msg or "whitelist" in err_msg.lower():
-                ip = await _get_current_ip()
+            ip = await _get_current_ip()
+            if "Empty response" in err_msg or "401" in err_msg or "403" in err_msg:
                 await bot.send_message(chat_id=chat_id,
                     text=(
-                        f"❌ *FLW blocked* — Order `{order_id}`\n\n"
-                        f"Flutterwave is rejecting the request.\n"
-                        f"👉 Flutterwave dashboard → Settings → API → IP Whitelist\n"
-                        f"👉 Add: `{ip}`"
+                        f"\u274c *FLW blocked* \u2014 Order `{order_id}`\n\n"
+                        f"`{err_msg[:200]}`\n\n"
+                        f"\ud83d\udc49 Add `{ip}` to Flutterwave IP Whitelist"
                     ),
                     parse_mode="Markdown")
             else:
                 await bot.send_message(chat_id=chat_id,
-                    text=f"❌ *FLW transfer error* — `{order_id}`\n`{err_msg[:300]}`",
+                    text=f"\u274c *FLW error* \u2014 `{order_id}`\n`{err_msg[:300]}`",
                     parse_mode="Markdown")
             return
 
-        # Transfer created — status starts as NEW
         transfer_data = result.get("data", {})
-        transfer_id   = transfer_data.get("id", "")
+        transfer_id   = str(transfer_data.get("id", ""))
         status        = transfer_data.get("status", "NEW")
         logger.info(f"[FLW] Transfer created: {transfer_id} | status={status}")
 
-        # Poll for final status (up to 60 seconds, every 5 seconds)
+        if status == "FAILED":
+            complete_msg = transfer_data.get("complete_message", "Rejected by bank")
+            logger.error(f"[FLW] \u274c FAILED: {transfer_id} \u2014 {complete_msg}")
+            await bot.send_message(chat_id=chat_id,
+                text=(
+                    f"\u274c *FLW FAILED* \u2014 Order `{order_id}`\n"
+                    f"Transfer ID: `{transfer_id}`\nReason: `{complete_msg}`\n"
+                    "Mark order manually."
+                ),
+                parse_mode="Markdown")
+            return
+
+        # Step 3: Poll status (up to 60 seconds)
         final_status = status
         for attempt in range(12):
             await asyncio.sleep(5)
             if final_status in ("SUCCESSFUL", "FAILED"):
                 break
-            poll = await asyncio.get_event_loop().run_in_executor(
-                None, get_transfer_status, transfer_id
-            )
-            poll_data    = poll.get("data", {})
-            final_status = poll_data.get("status", final_status)
-            logger.info(f"[FLW] Poll {attempt+1}: {transfer_id} → {final_status}")
+            poll         = await asyncio.get_event_loop().run_in_executor(None, get_transfer_status, transfer_id)
+            final_status = poll.get("data", {}).get("status", final_status)
+            logger.info(f"[FLW] Poll {attempt+1}: {transfer_id} \u2192 {final_status}")
 
         if final_status == "SUCCESSFUL":
             pay_type   = str(pay_term.get("paymentType", ""))
             payment_id = str(pay_term.get("id", ""))
             bybit_ok   = False
             if pay_type and payment_id:
-                pr       = await asyncio.get_event_loop().run_in_executor(
-                    None, mark_order_paid, order_id, pay_type, payment_id
-                )
+                pr       = await asyncio.get_event_loop().run_in_executor(None, mark_order_paid, order_id, pay_type, payment_id)
                 bybit_ok = pr.get("retCode", -1) == 0
             paid_order_ids.add(order_id)
-            logger.info(f"[FLW] ✅ SUCCESSFUL: {transfer_id} | Bybit marked: {bybit_ok}")
+            logger.info(f"[FLW] \u2705 SUCCESSFUL: {transfer_id} | Bybit: {bybit_ok}")
             await bot.send_message(chat_id=chat_id,
                 text=(
-                    f"✅ *FLW Payment SUCCESS*\n\n"
+                    f"\u2705 *FLW Payment SUCCESS*\n\n"
                     f"Order: `{order_id}`\n"
-                    f"Amount: *{amount:,.2f} NGN*\n"
+                    f"Amount: *{amount:,.2f} NGN* \u2192 `{verified_name}`\n"
                     f"Transfer ID: `{transfer_id}`\n"
-                    f"Bybit order marked paid: {'✅' if bybit_ok else '⚠️ Mark manually'}"
+                    f"Bybit marked paid: {'\u2705' if bybit_ok else '\u26a0\ufe0f Mark manually'}"
                 ),
                 parse_mode="Markdown")
-
         elif final_status == "FAILED":
-            logger.error(f"[FLW] ❌ FAILED: {transfer_id}")
+            logger.error(f"[FLW] \u274c FAILED: {transfer_id}")
             await bot.send_message(chat_id=chat_id,
                 text=(
-                    f"❌ *FLW Transfer FAILED*\n\n"
-                    f"Order: `{order_id}`\n"
-                    f"Transfer ID: `{transfer_id}`\n"
-                    "Please mark this order manually."
+                    f"\u274c *FLW Transfer FAILED*\n\nOrder: `{order_id}`\n"
+                    f"Transfer ID: `{transfer_id}`\nMark order manually."
                 ),
                 parse_mode="Markdown")
         else:
-            # Still NEW/PENDING after 60 seconds — webhook will handle final update
-            logger.info(f"[FLW] Transfer still {final_status} after polling: {transfer_id}")
             await bot.send_message(chat_id=chat_id,
                 text=(
-                    f"⏳ *FLW Transfer Pending*\n\n"
-                    f"Order: `{order_id}`\n"
+                    f"\u23f3 *FLW Transfer Pending*\n\nOrder: `{order_id}`\n"
                     f"Transfer ID: `{transfer_id}` | Status: `{final_status}`\n"
-                    "You'll receive a notification when it completes via webhook."
+                    "Webhook will notify you when complete."
                 ),
                 parse_mode="Markdown")
 
     except Exception as e:
         logger.error(f"[FLW] _flw_autopay error: {e}")
         await bot.send_message(chat_id=chat_id,
-            text=f"❌ *FLW Auto-Pay error* — `{order_id}`\n`{str(e)[:200]}`",
+            text=f"\u274c *FLW error* \u2014 `{order_id}`\n`{str(e)[:200]}`",
             parse_mode="Markdown")
 
 
