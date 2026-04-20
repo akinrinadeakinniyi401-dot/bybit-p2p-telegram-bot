@@ -1,17 +1,13 @@
 import uuid
 import logging
 import requests
-from config import FLW_SECRET_KEY, FLW_SECRET_HASH
+from config import FLW_SECRET_KEY
 
 logger = logging.getLogger(__name__)
 
-# Standard Flutterwave v3 API — uses secret key directly, no OAuth
 BASE_URL = "https://api.flutterwave.com/v3"
 
 
-# ─────────────────────────────────────────
-# 📡 Headers — simple Bearer secret key
-# ─────────────────────────────────────────
 def _headers() -> dict:
     return {
         "Authorization": f"Bearer {FLW_SECRET_KEY}",
@@ -20,20 +16,13 @@ def _headers() -> dict:
 
 
 def _parse(resp, label="") -> dict:
-    logger.info(f"[FLW]{label} HTTP {resp.status_code} | {resp.text[:500]}")
+    logger.info(f"[FLW]{label} HTTP {resp.status_code} | {resp.text[:600]}")
 
     if not resp.text.strip():
-        return {
-            "error": (
-                f"Empty response from Flutterwave{label} — "
-                "IP likely not whitelisted on Flutterwave dashboard → Settings → API → IP Whitelist."
-            )
-        }
+        return {"error": f"Empty response{label} — check IP whitelist on Flutterwave dashboard"}
 
     if resp.status_code in (401, 403):
-        return {
-            "error": f"HTTP {resp.status_code} — Invalid or missing FLW_SECRET_KEY. Check Render env vars."
-        }
+        return {"error": f"HTTP {resp.status_code} — Invalid FLW_SECRET_KEY"}
 
     try:
         return resp.json()
@@ -108,8 +97,7 @@ def resolve_bank_code(bank_name: str, payment_name: str = "") -> str | None:
 
 
 # ─────────────────────────────────────────
-# 🏓 Ping — verify secret key works
-# GET /v3/transfers with page=1 (lightweight check)
+# 🏓 Ping — verify secret key
 # ─────────────────────────────────────────
 def ping_flutterwave() -> dict:
     if not FLW_SECRET_KEY:
@@ -123,32 +111,54 @@ def ping_flutterwave() -> dict:
         data = _parse(resp, " [ping]")
         if "error" in data:
             return data
-        # Success means key is valid
         return {"status": "ok", "message": "Connected to Flutterwave v3 API"}
     except Exception as e:
         return {"error": str(e)}
 
 
 # ─────────────────────────────────────────
-# 💸 Send NGN transfer
+# ✅ Step 1: Verify / resolve bank account
+# POST /v3/accounts/resolve
+# Returns account_name if valid, error if not
+# ─────────────────────────────────────────
+def verify_account(account_number: str, bank_code: str) -> dict:
+    logger.info(f"[FLW] Resolving account {account_number} @ {bank_code}")
+    try:
+        resp = requests.post(
+            f"{BASE_URL}/accounts/resolve",
+            headers=_headers(),
+            json={
+                "account_number": account_number,
+                "account_bank":   bank_code
+            },
+            timeout=10
+        )
+        return _parse(resp, " [accounts/resolve]")
+    except Exception as e:
+        logger.error(f"[FLW] verify_account error: {e}")
+        return {"error": str(e)}
+
+
+# ─────────────────────────────────────────
+# 💸 Step 2: Send NGN transfer
 # POST /v3/transfers
-# Docs: https://developer.flutterwave.com/docs/bank-transfer.md
+# Only call this AFTER verify_account succeeds
 # ─────────────────────────────────────────
 def send_transfer(account_number: str, bank_code: str, amount: float,
                   narration: str = "P2P payment", reference: str = None) -> dict:
     ref = reference or f"p2p{uuid.uuid4().hex[:20]}"
 
     payload = {
-        "account_bank":    bank_code,
-        "account_number":  account_number,
-        "amount":          amount,
-        "narration":       narration,
-        "currency":        "NGN",
-        "reference":       ref,
-        "debit_currency":  "NGN",
+        "account_bank":   bank_code,
+        "account_number": account_number,
+        "amount":         amount,
+        "narration":      narration,
+        "currency":       "NGN",
+        "reference":      ref,
+        "debit_currency": "NGN",
     }
 
-    logger.info(f"[FLW] v3 Transfer: {amount} NGN → {account_number} @ {bank_code} | ref={ref}")
+    logger.info(f"[FLW] Transfer: {amount} NGN → {account_number} @ {bank_code} | ref={ref}")
 
     try:
         resp = requests.post(
