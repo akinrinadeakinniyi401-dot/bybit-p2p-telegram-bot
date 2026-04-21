@@ -12,7 +12,7 @@ import bybit
 from bybit import (
     get_ad_details, get_my_ads, modify_ad,
     get_btc_usdt_price, get_max_float_pct,
-    get_pending_orders, get_sell_orders, get_order_detail,
+    get_pending_orders, get_sell_orders, get_incoming_sell_orders, get_order_detail,
     get_counterparty_info, mark_order_paid,
     send_chat_message, get_payment_name, release_assets,
     set_active_account, get_active_account, get_all_accounts
@@ -42,6 +42,7 @@ user_settings = {
     "float_pct":    "",
     "ngn_usdt_ref": "",
     "interval":     2,
+    "sender_name":  "Akinrinade Akinniyi",  # Your name shown in FLW transfer narration
 }
 
 ad_data               = {}
@@ -52,11 +53,14 @@ current_price         = Decimal("0")
 order_monitor_task    = None
 order_monitor_running = False
 auto_pay_enabled      = False
-flw_pay_enabled       = False   # Flutterwave auto-pay toggle
-seen_order_ids        = set()   # BUY orders notified
-paid_order_ids        = set()   # BUY orders marked paid
-seen_sell_order_ids   = set()   # SELL orders notified
-released_order_ids    = set()   # SELL orders released
+flw_pay_enabled       = False
+seen_order_ids        = set()
+paid_order_ids        = set()
+seen_sell_order_ids   = set()
+released_order_ids    = set()
+
+# Unpaid orders log — stores orders bot didn't pay and why
+unpaid_orders_log: list = []   # list of dicts: {order_id, account_name, account_no, amount, reason, timestamp}
 
 # Sell order custom message settings
 sell_msg_enabled = False
@@ -313,7 +317,9 @@ def autopay_section_keyboard():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(pay, callback_data="toggle_auto_pay")],
         [InlineKeyboardButton(flw, callback_data="toggle_flw_pay")],
-        [InlineKeyboardButton("ℹ️ How Auto-Pay Works",       callback_data="autopay_info")],
+        [InlineKeyboardButton("✏️ Set My Sender Name", callback_data="set_sender_name")],
+        [InlineKeyboardButton("📋 View Unpaid Orders",  callback_data="view_unpaid_orders")],
+        [InlineKeyboardButton("ℹ️ How Auto-Pay Works",        callback_data="autopay_info")],
         [InlineKeyboardButton("ℹ️ How Flutterwave Pay Works", callback_data="flw_info")],
         *back_main()
     ])
@@ -324,14 +330,20 @@ def autopay_section_text():
     flw_status   = "✅ ENABLED" if flw_pay_enabled  else "❌ DISABLED"
     from config import FLW_SECRET_KEY
     flw_configured = "✅ Configured" if FLW_SECRET_KEY else "❌ Not configured — add FLW_SECRET_KEY to Render"
+    sender_name    = user_settings.get("sender_name", "Not set")
+    unpaid_count   = len(unpaid_orders_log)
     return (
         f"💳 *AUTO-PAY*\n\n"
         f"Bybit Mark-Paid: *{bybit_status}*\n"
         f"Flutterwave Pay: *{flw_status}*\n\n"
-        f"Flutterwave credentials: {flw_configured}\n\n"
+        f"Flutterwave credentials: {flw_configured}\n"
+        f"✏️ Sender name (FLW narration): `{sender_name}`\n"
+        f"📋 Unpaid orders this session: `{unpaid_count}`\n\n"
         "⚠️ Enable only ONE mode at a time.\n"
         "Bybit marks the order paid without sending money.\n"
-        "Flutterwave actually sends the money then marks paid."
+        "Flutterwave actually sends the money then marks paid.\n\n"
+        "ℹ️ FLW Auto-Pay skips sellers with release time ≥ 30 min\n"
+        "  and falls back to Bybit mark-paid + warning message."
     )
 
 
@@ -508,11 +520,45 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
             return
 
         amount = float(amount_str)
-        logger.info(f"[FLW] AutoPay: {amount} NGN \u2192 {account_no} @ {bank_code}")
+        logger.info(f"[FLW] AutoPay: {amount} NGN → {account_no} @ {bank_code}")
 
-        # Step 1: Verify account
+        # ── Release time check: if seller is slow, warn + skip FLW payment ──
+        # seller_info is passed via order_detail extra key set by caller
+        release_mins = float(order_detail.get("_seller_release_mins", 0))
+        if release_mins >= 30:
+            reason = f"Seller avg release time too long ({release_mins:.0f} min)"
+            logger.info(f"[FLW] Skipping payment — {reason}")
+            unpaid_orders_log.append({
+                "order_id":   order_id,
+                "account_no": account_no,
+                "bank":       bank_name or pay_type_name,
+                "amount":     amount,
+                "reason":     reason,
+                "timestamp":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            })
+            # Fall back to Bybit mark-paid + warning message instead
+            pay_type   = str(pay_term.get("paymentType", ""))
+            payment_id = str(pay_term.get("id", ""))
+            if pay_type and payment_id:
+                await asyncio.get_event_loop().run_in_executor(
+                    None, mark_order_paid, order_id, pay_type, payment_id
+                )
+                paid_order_ids.add(order_id)
+            await asyncio.get_event_loop().run_in_executor(
+                None, send_chat_message, order_id, SELLER_WARN_MSG
+            )
+            await bot.send_message(chat_id=chat_id,
+                text=(
+                    f"⚠️ *FLW Skipped* — Order `{order_id}`\n\n"
+                    f"Seller release time: `{release_mins:.0f} min` (≥ 30 min)\n"
+                    f"Action: Marked paid on Bybit + warning sent to seller."
+                ),
+                parse_mode="Markdown")
+            return
+
+        # ── Step 1: Verify account ──
         await bot.send_message(chat_id=chat_id,
-            text=f"\u23f3 *FLW* Verifying account `{account_no}` ({bank_name or pay_type_name})...",
+            text=f"⏳ *FLW* Verifying account `{account_no}` ({bank_name or pay_type_name})...",
             parse_mode="Markdown")
 
         verify = await asyncio.get_event_loop().run_in_executor(
@@ -521,9 +567,17 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
 
         if verify.get("status") != "success" or "error" in verify:
             err = verify.get("message", verify.get("error", "Unknown error"))
+            unpaid_orders_log.append({
+                "order_id":   order_id,
+                "account_no": account_no,
+                "bank":       bank_name or pay_type_name,
+                "amount":     amount,
+                "reason":     f"Account verification failed: {err}",
+                "timestamp":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            })
             await bot.send_message(chat_id=chat_id,
                 text=(
-                    f"\u274c *FLW Account Invalid* \u2014 Order `{order_id}`\n\n"
+                    f"❌ *FLW Account Invalid* — Order `{order_id}`\n\n"
                     f"Account `{account_no}` @ `{bank_name or pay_type_name}` failed verification.\n"
                     f"Reason: `{err}`\n\nTransfer aborted. Mark order manually."
                 ),
@@ -531,23 +585,23 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
             return
 
         verified_name = verify.get("data", {}).get("account_name", seller_name)
-        # If a fallback code worked, use it for the transfer
         working_code  = verify.get("_working_bank_code", bank_code)
         logger.info(f"[FLW] Verified: {verified_name} | {account_no} @ {working_code}")
 
         await bot.send_message(chat_id=chat_id,
             text=(
-                f"\u2705 *Account Verified*: *{verified_name}*\n"
+                f"✅ *Account Verified*: *{verified_name}*\n"
                 f"Account: `{account_no}` ({bank_name or pay_type_name})\n\n"
-                f"\u23f3 Sending *{amount:,.2f} NGN*..."
+                f"⏳ Sending *{amount:,.2f} NGN*..."
             ),
             parse_mode="Markdown")
 
-        # Step 2: Send transfer
+        # ── Step 2: Send transfer with your name in narration ──
+        sender_name = user_settings.get("sender_name", "Akinrinade Akinniyi")
         ref    = f"p2p{order_id[-12:]}"
         result = await asyncio.get_event_loop().run_in_executor(
             None, send_transfer, account_no, working_code, amount,
-            f"P2P payment to {verified_name}", ref
+            f"{sender_name} payment to {verified_name}", ref
         )
 
         if "error" in result:
@@ -575,6 +629,12 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
         if status == "FAILED":
             complete_msg = transfer_data.get("complete_message", "Rejected by bank")
             logger.error(f"[FLW] FAILED: {transfer_id} — {complete_msg}")
+            unpaid_orders_log.append({
+                "order_id":   order_id, "account_no": account_no,
+                "bank":       bank_name or pay_type_name, "amount": amount,
+                "reason":     complete_msg or "Transfer failed on creation",
+                "timestamp":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            })
             if "insufficient" in complete_msg.lower() or "funds" in complete_msg.lower():
                 fail_text = (
                     f"❌ *FLW Failed — Insufficient Funds*\n\n"
@@ -599,7 +659,7 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
                 break
             poll         = await asyncio.get_event_loop().run_in_executor(None, get_transfer_status, transfer_id)
             final_status = poll.get("data", {}).get("status", final_status)
-            logger.info(f"[FLW] Poll {attempt+1}: {transfer_id} \u2192 {final_status}")
+            logger.info(f"[FLW] Poll {attempt+1}: {transfer_id} → {final_status}")
 
         if final_status == "SUCCESSFUL":
             pay_type   = str(pay_term.get("paymentType", ""))
@@ -609,21 +669,27 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
                 pr       = await asyncio.get_event_loop().run_in_executor(None, mark_order_paid, order_id, pay_type, payment_id)
                 bybit_ok = pr.get("retCode", -1) == 0
             paid_order_ids.add(order_id)
-            logger.info(f"[FLW] \u2705 SUCCESSFUL: {transfer_id} | Bybit: {bybit_ok}")
+            logger.info(f"[FLW] ✅ SUCCESSFUL: {transfer_id} | Bybit: {bybit_ok}")
+            sender_name = user_settings.get("sender_name", "Akinrinade Akinniyi")
             await bot.send_message(chat_id=chat_id,
                 text=(
-                    f"\u2705 *FLW Payment SUCCESS*\n\n"
+                    f"✅ *FLW Payment SUCCESS*\n\n"
                     f"Order: `{order_id}`\n"
-                    f"Amount: *{amount:,.2f} NGN* \u2192 `{verified_name}`\n"
+                    f"Amount: *{amount:,.2f} NGN* → `{verified_name}`\n"
                     f"Transfer ID: `{transfer_id}`\n"
-                    f"Bybit marked paid: {'\u2705' if bybit_ok else '\u26a0\ufe0f Mark manually'}"
+                    f"Bybit marked paid: {'✅' if bybit_ok else '⚠️ Mark manually'}"
                 ),
                 parse_mode="Markdown")
         elif final_status == "FAILED":
             logger.error(f"[FLW] FAILED: {transfer_id}")
-            # Try to get complete_message from last poll
-            last_poll = await asyncio.get_event_loop().run_in_executor(None, get_transfer_status, transfer_id)
+            last_poll    = await asyncio.get_event_loop().run_in_executor(None, get_transfer_status, transfer_id)
             complete_msg = last_poll.get("data", {}).get("complete_message", "")
+            unpaid_orders_log.append({
+                "order_id":   order_id, "account_no": account_no,
+                "bank":       bank_name or pay_type_name, "amount": amount,
+                "reason":     complete_msg or "Transfer FAILED after polling",
+                "timestamp":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            })
             if "insufficient" in complete_msg.lower() or "funds" in complete_msg.lower():
                 fail_text = (
                     f"❌ *FLW Failed — Insufficient Funds*\n\n"
@@ -662,186 +728,51 @@ async def order_monitor_loop(bot, chat_id):
     global sell_msg_enabled, sell_custom_msg, sell_msg_count
 
     order_monitor_running = True
-    logger.info("🔔 ORDER MONITOR STARTED — BUY (status 10 side 0) + SELL (status 10 side 1 → status 20)")
+    logger.info("🔔 ORDER MONITOR STARTED")
 
     while order_monitor_running:
         try:
-            # ── ONE call fetches ALL status=10 orders (both BUY and SELL) ──
-            # side=0 → I am the BUYER (I need to pay the seller)
-            # side=1 → I am the SELLER (buyer needs to pay me)
-            all_result = await asyncio.get_event_loop().run_in_executor(None, get_pending_orders)
-            if all_result.get("retCode", all_result.get("ret_code", -1)) == 0:
-                all_items = all_result.get("result", {}).get("items", [])
+            # Run all 3 API calls concurrently — no waiting between them
+            buy_res, sell_incoming_res, sell_paid_res = await asyncio.gather(
+                asyncio.get_event_loop().run_in_executor(None, get_pending_orders),
+                asyncio.get_event_loop().run_in_executor(None, get_incoming_sell_orders),
+                asyncio.get_event_loop().run_in_executor(None, get_sell_orders),
+            )
 
-                buy_items  = [i for i in all_items if str(i.get("side", "")) == "0"]
-                sell_items = [i for i in all_items if str(i.get("side", "")) == "1"]
-                logger.info(f"[Orders] status=10 → I am BUYER (side=0): {len(buy_items)} | I am SELLER awaiting payment (side=1): {len(sell_items)}")
+            buy_items         = buy_res.get("result", {}).get("items", [])           if buy_res.get("retCode", buy_res.get("ret_code",-1)) == 0 else []
+            sell_incoming     = sell_incoming_res.get("result", {}).get("items", []) if sell_incoming_res.get("retCode", sell_incoming_res.get("ret_code",-1)) == 0 else []
+            sell_paid_items   = sell_paid_res.get("result", {}).get("items", [])     if sell_paid_res.get("retCode", sell_paid_res.get("ret_code",-1)) == 0 else []
 
-                # ── BUY orders: I need to pay seller ──
-                for item in buy_items:
-                    order_id = item.get("id")
-                    if not order_id or order_id in seen_order_ids:
-                        continue
+            logger.info(f"[Orders] BUY={len(buy_items)} | SELL incoming={len(sell_incoming)} | SELL paid={len(sell_paid_items)}")
 
-                    logger.info(f"[BUY] New order: {order_id}")
-                    det = await asyncio.get_event_loop().run_in_executor(None, get_order_detail, order_id)
-                    if det.get("retCode", -1) != 0:
-                        continue
-                    order_detail = det.get("result", {})
-                    seller_uid   = order_detail.get("targetUserId", "")
+            # New orders dispatch as independent tasks — run in parallel
+            tasks = []
 
-                    seller_info = {}
-                    if seller_uid:
-                        si = await asyncio.get_event_loop().run_in_executor(
-                            None, get_counterparty_info, str(seller_uid), order_id
-                        )
-                        if si.get("retCode", -1) == 0:
-                            seller_info = si.get("result", {})
+            for item in buy_items:
+                oid = item.get("id")
+                if oid and oid not in seen_order_ids:
+                    seen_order_ids.add(oid)
+                    tasks.append(asyncio.create_task(_handle_buy_order(bot, chat_id, oid)))
 
-                    msg = format_order_message(order_detail, seller_info)
-                    await bot.send_message(
-                        chat_id=chat_id,
-                        text=f"🛒 *BUY Order — Pay Seller*\n{msg}",
-                        reply_markup=order_buttons(order_id),
-                        parse_mode="Markdown"
-                    )
-                    seen_order_ids.add(order_id)
-                    logger.info(f"[BUY] Notified: {order_id}")
+            for item in sell_incoming:
+                oid = item.get("id")
+                if oid and oid not in seen_sell_order_ids:
+                    seen_sell_order_ids.add(oid)
+                    tasks.append(asyncio.create_task(_handle_sell_incoming(bot, chat_id, oid)))
 
-                    # ── Flutterwave Auto-Pay ──
-                    if flw_pay_enabled and order_id not in paid_order_ids:
-                        await asyncio.sleep(5)
-                        if not order_monitor_running:
-                            break
-                        await _flw_autopay(bot, chat_id, order_id, order_detail)
-
-                    # ── Bybit Auto-Pay (mark paid only, no real transfer) ──
-                    elif auto_pay_enabled and order_id not in paid_order_ids:
-                        avg_release = seller_info.get("averageReleaseTime", "0")
-                        try:
-                            release_mins = float(avg_release)
-                        except (ValueError, TypeError):
-                            release_mins = 0
-
-                        await asyncio.sleep(5)
-                        if not order_monitor_running:
-                            break
-
-                        pay_term = order_detail.get("confirmedPayTerm", {}) or {}
-                        if not pay_term:
-                            terms    = order_detail.get("paymentTermList", [])
-                            pay_term = terms[0] if terms else {}
-
-                        payment_type = str(pay_term.get("paymentType", ""))
-                        payment_id   = str(pay_term.get("id", ""))
-
-                        if payment_type and payment_id:
-                            pr = await asyncio.get_event_loop().run_in_executor(
-                                None, mark_order_paid, order_id, payment_type, payment_id
-                            )
-                            if pr.get("retCode", -1) == 0:
-                                paid_order_ids.add(order_id)
-                                note = ""
-                                if release_mins >= 30:
-                                    await asyncio.get_event_loop().run_in_executor(
-                                        None, send_chat_message, order_id, SELLER_WARN_MSG
-                                    )
-                                    note = f"\n⚠️ Release time `{release_mins:.0f} min` — warning sent"
-                                await bot.send_message(
-                                    chat_id=chat_id,
-                                    text=f"💳 *Auto-Pay ✅* Order `{order_id}` marked paid{note}",
-                                    parse_mode="Markdown"
-                                )
-                            else:
-                                await bot.send_message(
-                                    chat_id=chat_id,
-                                    text=f"❌ *Auto-Pay failed* `{order_id}`\n`{pr.get('retMsg','')}`",
-                                    parse_mode="Markdown"
-                                )
-
-                # ── SELL orders awaiting buyer payment (status=10, side=1) ──
-                # Buyer has NOT yet paid — show details + send custom message
-                for item in sell_items:
-                    order_id = item.get("id")
-                    if not order_id or order_id in seen_sell_order_ids:
-                        continue
-
-                    logger.info(f"[SELL] New order awaiting buyer payment: {order_id}")
-                    det = await asyncio.get_event_loop().run_in_executor(None, get_order_detail, order_id)
-                    if det.get("retCode", -1) != 0:
-                        continue
-                    order_detail = det.get("result", {})
-                    buyer_uid    = order_detail.get("targetUserId", "")
-
-                    buyer_info = {}
-                    if buyer_uid:
-                        bi = await asyncio.get_event_loop().run_in_executor(
-                            None, get_counterparty_info, str(buyer_uid), order_id
-                        )
-                        if bi.get("retCode", -1) == 0:
-                            buyer_info = bi.get("result", {})
-
-                    msg = format_sell_order_message(order_detail, buyer_info)
-                    await bot.send_message(
-                        chat_id=chat_id,
-                        text=f"💰 *SELL Order — Awaiting Buyer Payment*\n{msg}",
-                        parse_mode="Markdown"
-                        # No buttons yet — buyer hasn't paid, no action needed from us
-                    )
-                    seen_sell_order_ids.add(order_id)
-                    logger.info(f"[SELL] Notified (awaiting payment): {order_id}")
-
-                    # Send custom message to buyer immediately
-                    if sell_msg_enabled and sell_custom_msg:
-                        for i in range(sell_msg_count):
-                            await asyncio.get_event_loop().run_in_executor(
-                                None, send_chat_message, order_id, sell_custom_msg
-                            )
-                            logger.info(f"[SELL] Custom msg {i+1}/{sell_msg_count} → {order_id}")
-                            if i < sell_msg_count - 1:
-                                await asyncio.sleep(1)
-
-            # ── SELL orders where BUYER HAS PAID (status=20, side=1) → show release button ──
-            # side=1 means I am the SELLER. side=0 at status=20 means I am the BUYER
-            # waiting for the seller to release to me — not actionable for me here.
-            paid_sell_result = await asyncio.get_event_loop().run_in_executor(None, get_sell_orders)
-            if paid_sell_result.get("retCode", paid_sell_result.get("ret_code", -1)) == 0:
-                all_status20 = paid_sell_result.get("result", {}).get("items", [])
-                # Only process where I am the seller (side=1)
-                paid_sell_items = [i for i in all_status20 if str(i.get("side", "")) == "1"]
-                logger.info(f"[Orders] status=20 side=1 (buyer paid, I must release): {len(paid_sell_items)}")
-
-                for item in paid_sell_items:
-                    order_id = item.get("id")
-                    # Use a separate key so we re-notify when order moves from status=10 to status=20
-                    release_key = f"paid_{order_id}"
-                    if not order_id or release_key in seen_sell_order_ids:
-                        continue
-
-                    logger.info(f"[SELL] Buyer paid, release needed: {order_id}")
-                    det = await asyncio.get_event_loop().run_in_executor(None, get_order_detail, order_id)
-                    if det.get("retCode", -1) != 0:
-                        continue
-                    order_detail = det.get("result", {})
-                    buyer_uid    = order_detail.get("targetUserId", "")
-
-                    buyer_info = {}
-                    if buyer_uid:
-                        bi = await asyncio.get_event_loop().run_in_executor(
-                            None, get_counterparty_info, str(buyer_uid), order_id
-                        )
-                        if bi.get("retCode", -1) == 0:
-                            buyer_info = bi.get("result", {})
-
-                    msg = format_sell_order_message(order_detail, buyer_info)
-                    await bot.send_message(
-                        chat_id=chat_id,
-                        text=f"✅ *SELL Order — Buyer Has Paid! Release Coin Now*\n{msg}",
-                        reply_markup=sell_order_buttons(order_id),
-                        parse_mode="Markdown"
-                    )
+            for item in sell_paid_items:
+                oid        = item.get("id")
+                release_key = f"paid_{oid}"
+                if oid and release_key not in seen_sell_order_ids:
                     seen_sell_order_ids.add(release_key)
-                    logger.info(f"[SELL] Release notification sent: {order_id}")
+                    tasks.append(asyncio.create_task(_handle_sell_paid(bot, chat_id, oid)))
+
+            # Wait for all dispatched tasks (non-blocking for next poll cycle)
+            if tasks:
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for r in results:
+                    if isinstance(r, Exception):
+                        logger.error(f"[Orders] Task error: {r}")
 
         except Exception as e:
             logger.error(f"[Orders] Loop error: {e}")
@@ -849,6 +780,149 @@ async def order_monitor_loop(bot, chat_id):
         await asyncio.sleep(10)
 
     logger.info("🔕 ORDER MONITOR STOPPED")
+
+
+async def _handle_buy_order(bot, chat_id, order_id):
+    """Handle a single BUY order — notify + auto-pay if enabled."""
+    try:
+        det = await asyncio.get_event_loop().run_in_executor(None, get_order_detail, order_id)
+        if det.get("retCode", -1) != 0:
+            return
+        order_detail = det.get("result", {})
+        seller_uid   = order_detail.get("targetUserId", "")
+
+        seller_info = {}
+        if seller_uid:
+            si = await asyncio.get_event_loop().run_in_executor(
+                None, get_counterparty_info, str(seller_uid), order_id
+            )
+            if si.get("retCode", -1) == 0:
+                seller_info = si.get("result", {})
+
+        msg = format_order_message(order_detail, seller_info)
+        await bot.send_message(
+            chat_id=chat_id,
+            text=f"🛒 *BUY Order — Pay Seller*\n{msg}",
+            reply_markup=order_buttons(order_id),
+            parse_mode="Markdown"
+        )
+        logger.info(f"[BUY] Notified: {order_id}")
+
+        if flw_pay_enabled and order_id not in paid_order_ids:
+            await asyncio.sleep(5)
+            try:
+                seller_release = float(seller_info.get("averageReleaseTime", "0") or 0)
+            except (ValueError, TypeError):
+                seller_release = 0
+            order_detail["_seller_release_mins"] = seller_release
+            await _flw_autopay(bot, chat_id, order_id, order_detail)
+
+        elif auto_pay_enabled and order_id not in paid_order_ids:
+            try:
+                release_mins = float(seller_info.get("averageReleaseTime", "0") or 0)
+            except (ValueError, TypeError):
+                release_mins = 0
+
+            await asyncio.sleep(5)
+            pay_term = order_detail.get("confirmedPayTerm", {}) or {}
+            if not pay_term:
+                terms    = order_detail.get("paymentTermList", [])
+                pay_term = terms[0] if terms else {}
+
+            payment_type = str(pay_term.get("paymentType", ""))
+            payment_id   = str(pay_term.get("id", ""))
+
+            if payment_type and payment_id:
+                pr = await asyncio.get_event_loop().run_in_executor(
+                    None, mark_order_paid, order_id, payment_type, payment_id
+                )
+                if pr.get("retCode", -1) == 0:
+                    paid_order_ids.add(order_id)
+                    note = ""
+                    if release_mins >= 30:
+                        await asyncio.get_event_loop().run_in_executor(
+                            None, send_chat_message, order_id, SELLER_WARN_MSG
+                        )
+                        note = f"\n⚠️ Release time `{release_mins:.0f} min` — warning sent"
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=f"💳 *Auto-Pay ✅* Order `{order_id}` marked paid{note}",
+                        parse_mode="Markdown"
+                    )
+                else:
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=f"❌ *Auto-Pay failed* `{order_id}`\n`{pr.get('retMsg','')}`",
+                        parse_mode="Markdown"
+                    )
+    except Exception as e:
+        logger.error(f"[BUY] _handle_buy_order {order_id} error: {e}")
+
+
+async def _handle_sell_incoming(bot, chat_id, order_id):
+    """Handle a new SELL order — buyer hasn't paid yet. Notify + send custom message."""
+    try:
+        det = await asyncio.get_event_loop().run_in_executor(None, get_order_detail, order_id)
+        if det.get("retCode", -1) != 0:
+            return
+        order_detail = det.get("result", {})
+        buyer_uid    = order_detail.get("targetUserId", "")
+
+        buyer_info = {}
+        if buyer_uid:
+            bi = await asyncio.get_event_loop().run_in_executor(
+                None, get_counterparty_info, str(buyer_uid), order_id
+            )
+            if bi.get("retCode", -1) == 0:
+                buyer_info = bi.get("result", {})
+
+        msg = format_sell_order_message(order_detail, buyer_info)
+        await bot.send_message(
+            chat_id=chat_id,
+            text=f"💰 *SELL Order — Awaiting Buyer Payment*\n{msg}",
+            parse_mode="Markdown"
+        )
+        logger.info(f"[SELL] Notified incoming: {order_id}")
+
+        if sell_msg_enabled and sell_custom_msg:
+            for i in range(sell_msg_count):
+                await asyncio.get_event_loop().run_in_executor(
+                    None, send_chat_message, order_id, sell_custom_msg
+                )
+                logger.info(f"[SELL] Custom msg {i+1}/{sell_msg_count} → {order_id}")
+                if i < sell_msg_count - 1:
+                    await asyncio.sleep(1)
+    except Exception as e:
+        logger.error(f"[SELL incoming] _handle_sell_incoming {order_id} error: {e}")
+
+
+async def _handle_sell_paid(bot, chat_id, order_id):
+    """Handle SELL order where buyer has paid — show release coin button."""
+    try:
+        det = await asyncio.get_event_loop().run_in_executor(None, get_order_detail, order_id)
+        if det.get("retCode", -1) != 0:
+            return
+        order_detail = det.get("result", {})
+        buyer_uid    = order_detail.get("targetUserId", "")
+
+        buyer_info = {}
+        if buyer_uid:
+            bi = await asyncio.get_event_loop().run_in_executor(
+                None, get_counterparty_info, str(buyer_uid), order_id
+            )
+            if bi.get("retCode", -1) == 0:
+                buyer_info = bi.get("result", {})
+
+        msg = format_sell_order_message(order_detail, buyer_info)
+        await bot.send_message(
+            chat_id=chat_id,
+            text=f"✅ *SELL Order — Buyer Has Paid! Release Coin Now*\n{msg}",
+            reply_markup=sell_order_buttons(order_id),
+            parse_mode="Markdown"
+        )
+        logger.info(f"[SELL] Release notification sent: {order_id}")
+    except Exception as e:
+        logger.error(f"[SELL paid] _handle_sell_paid {order_id} error: {e}")
 
 
 # ─────────────────────────────────────────
@@ -1080,6 +1154,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global seen_order_ids, paid_order_ids
     global seen_sell_order_ids, released_order_ids
     global sell_msg_enabled, sell_custom_msg, sell_msg_count
+    global unpaid_orders_log
 
     query   = update.callback_query
     await query.answer()
@@ -1305,6 +1380,61 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             flw_pay_enabled = False
         await query.edit_message_text(
             autopay_section_text(), reply_markup=autopay_section_keyboard(), parse_mode="Markdown"
+        )
+
+    # ── ✏️ Set Sender Name ──
+    elif data == "set_sender_name":
+        user_state["action"] = "sender_name"
+        cur = user_settings.get("sender_name", "Not set")
+        await query.edit_message_text(
+            f"✏️ *Set Your Sender Name*\n\n"
+            f"Current: `{cur}`\n\n"
+            "This name appears in the Flutterwave transfer narration:\n"
+            f"`[Your Name] payment to [Receiver Name]`\n\n"
+            "Send your full name.\nExample: `Akinrinade Akinniyi`",
+            reply_markup=InlineKeyboardMarkup(back_section("section_autopay")),
+            parse_mode="Markdown"
+        )
+
+    # ── 📋 View Unpaid Orders ──
+    elif data == "view_unpaid_orders":
+        if not unpaid_orders_log:
+            await query.edit_message_text(
+                "📋 *Unpaid Orders*\n\nNo unpaid orders recorded this session. ✅",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🗑 Clear Log", callback_data="clear_unpaid_log")],
+                    *back_section("section_autopay")
+                ])
+            )
+            return
+
+        lines = [f"📋 *Unpaid Orders ({len(unpaid_orders_log)}):*\n"]
+        for i, entry in enumerate(unpaid_orders_log[-20:], 1):  # show last 20
+            lines.append(
+                f"*{i}.* `{entry['order_id']}`\n"
+                f"  👤 `{entry.get('account_no','—')}` ({entry.get('bank','—')})\n"
+                f"  💵 `{entry.get('amount',0):,.2f} NGN`\n"
+                f"  ❌ {entry.get('reason','Unknown')}\n"
+                f"  🕐 {entry.get('timestamp','')}\n"
+            )
+        msg = "\n".join(lines)
+        if len(msg) > 4000:
+            msg = msg[:4000] + "\n...(truncated)"
+        await query.edit_message_text(
+            msg,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🗑 Clear Log", callback_data="clear_unpaid_log")],
+                *back_section("section_autopay")
+            ]),
+            parse_mode="Markdown"
+        )
+
+    # ── 🗑 Clear Unpaid Log ──
+    elif data == "clear_unpaid_log":
+        unpaid_orders_log.clear()
+        await query.edit_message_text(
+            "✅ Unpaid orders log cleared.",
+            reply_markup=InlineKeyboardMarkup(back_section("section_autopay"))
         )
 
     # ── 🟢 Toggle Flutterwave Pay ──
@@ -1766,6 +1896,14 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await reply(f"✅ Interval: every `{val}` min\n\n_{next_setup_hint()}_")
         except Exception:
             await reply("❌ Send a whole number like `2`")
+
+    elif action == "sender_name":
+        user_settings["sender_name"] = text.strip()
+        user_state["action"] = None
+        await reply(
+            f"✅ Sender name set to `{text.strip()}`\n\n"
+            f"FLW narration will now show:\n`{text.strip()} payment to [receiver]`"
+        )
 
     elif action == "sell_custom_msg":
         sell_custom_msg = text
