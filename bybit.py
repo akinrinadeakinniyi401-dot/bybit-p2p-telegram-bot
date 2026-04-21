@@ -187,15 +187,39 @@ def get_my_ads() -> dict:
 
 
 # ─────────────────────────────────────────
-# 📦 Pending Orders (status 10 = awaiting buyer payment)
+# 📦 Get BUY orders (status=10, side=0 — I need to pay)
 # ─────────────────────────────────────────
 def get_pending_orders() -> dict:
-    return _post("/v5/p2p/order/pending/simplifyList", {"status": 10, "page": 1, "size": 30})
+    return _post("/v5/p2p/order/pending/simplifyList", {
+        "status": 10,
+        "side":   0,      # I am the buyer
+        "page":   1,
+        "size":   30
+    })
 
 
 # ─────────────────────────────────────────
-# 📄 Order Detail
+# 📦 Get SELL orders awaiting release (status=20, side=1 — buyer paid, I release)
 # ─────────────────────────────────────────
+def get_sell_orders() -> dict:
+    return _post("/v5/p2p/order/pending/simplifyList", {
+        "status": 20,
+        "side":   1,      # I am the seller, buyer already paid
+        "page":   1,
+        "size":   30
+    })
+
+
+# ─────────────────────────────────────────
+# 📦 Get incoming SELL orders (status=10, side=1 — buyer hasn't paid yet)
+# ─────────────────────────────────────────
+def get_incoming_sell_orders() -> dict:
+    return _post("/v5/p2p/order/pending/simplifyList", {
+        "status": 10,
+        "side":   1,      # I am the seller, waiting for buyer to pay
+        "page":   1,
+        "size":   30
+    })
 def get_order_detail(order_id: str) -> dict:
     return _post("/v5/p2p/order/info", {"orderId": order_id})
 
@@ -229,14 +253,6 @@ def mark_order_paid(order_id: str, payment_type: str, payment_id: str) -> dict:
 def release_assets(order_id: str) -> dict:
     logger.info(f"[Bybit] Releasing assets for order: {order_id}")
     return _post("/v5/p2p/order/finish", {"orderId": order_id})
-
-
-# ─────────────────────────────────────────
-# 📦 Get Sell Orders (status 20 = awaiting seller release)
-# ─────────────────────────────────────────
-def get_sell_orders() -> dict:
-    return _post("/v5/p2p/order/pending/simplifyList", {"status": 20, "page": 1, "size": 30})
-
 
 # ─────────────────────────────────────────
 # 💬 Send Chat Message
