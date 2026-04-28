@@ -59,6 +59,7 @@ order_monitor_task    = None
 order_monitor_running = False
 auto_pay_enabled      = False
 flw_pay_enabled       = False
+paga_pay_enabled      = False
 seen_order_ids        = set()
 paid_order_ids        = set()
 seen_sell_order_ids   = set()
@@ -343,11 +344,13 @@ def orders_section_text():
 def autopay_section_keyboard():
     pay     = "💳 Disable Auto-Pay (Bybit)" if auto_pay_enabled  else "💳 Enable Auto-Pay (Bybit)"
     flw     = "🟢 Disable Flutterwave Pay ✅" if flw_pay_enabled else "🔴 Enable Flutterwave Pay"
+    paga    = "🟡 Disable Paga Pay ✅" if paga_pay_enabled else "🟡 Enable Paga Pay"
     bp_tog  = f"🛡 Buyer Protection: {'ON ✅' if buyer_protection_enabled else 'OFF ❌'}"
     nm_tog  = f"🔍 Name Match: {'ON ✅' if name_match_enabled else 'OFF ❌'}"
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(pay, callback_data="toggle_auto_pay")],
-        [InlineKeyboardButton(flw, callback_data="toggle_flw_pay")],
+        [InlineKeyboardButton(pay,  callback_data="toggle_auto_pay")],
+        [InlineKeyboardButton(flw,  callback_data="toggle_flw_pay")],
+        [InlineKeyboardButton(paga, callback_data="toggle_paga_pay")],
         [InlineKeyboardButton("✏️ Set My Sender Name",        callback_data="set_sender_name")],
         [InlineKeyboardButton("🛡 Buyer Protection Settings", callback_data="buyer_protection_menu")],
         [InlineKeyboardButton(bp_tog,                         callback_data="toggle_buyer_protection")],
@@ -355,25 +358,31 @@ def autopay_section_keyboard():
         [InlineKeyboardButton("📋 View Unpaid Orders",        callback_data="view_unpaid_orders")],
         [InlineKeyboardButton("ℹ️ How Auto-Pay Works",        callback_data="autopay_info")],
         [InlineKeyboardButton("ℹ️ How Flutterwave Pay Works", callback_data="flw_info")],
+        [InlineKeyboardButton("ℹ️ How Paga Pay Works",        callback_data="paga_info")],
         *back_main()
     ])
 
 
 def autopay_section_text():
-    bybit_status = "✅ ENABLED" if auto_pay_enabled else "❌ DISABLED"
-    flw_status   = "✅ ENABLED" if flw_pay_enabled  else "❌ DISABLED"
-    from config import FLW_SECRET_KEY
-    flw_configured = "✅ Configured" if FLW_SECRET_KEY else "❌ Not configured — add FLW_SECRET_KEY"
-    sender_name    = user_settings.get("sender_name", "Not set")
-    unpaid_count   = len(unpaid_orders_log)
-    bp_status      = f"✅ ON — threshold: {buyer_protection_threshold} min" if buyer_protection_enabled else "❌ OFF"
-    nm_status      = "✅ ON — skips orders with missing account info" if name_match_enabled else "❌ OFF"
+    bybit_status = "✅ ENABLED" if auto_pay_enabled  else "❌ DISABLED"
+    flw_status   = "✅ ENABLED" if flw_pay_enabled   else "❌ DISABLED"
+    paga_status  = "✅ ENABLED" if paga_pay_enabled  else "❌ DISABLED"
+    from config import FLW_SECRET_KEY, PAGA_PUBLIC_KEY, PAGA_SECRET_KEY, PAGA_HASH_KEY
+    flw_configured  = "✅ Configured" if FLW_SECRET_KEY else "❌ Not configured — add FLW_SECRET_KEY"
+    paga_configured = "✅ Configured" if (PAGA_PUBLIC_KEY and PAGA_SECRET_KEY and PAGA_HASH_KEY) \
+                      else "❌ Not configured — add PAGA_PUBLIC_KEY / PAGA_SECRET_KEY / PAGA_HASH_KEY"
+    sender_name  = user_settings.get("sender_name", "Not set")
+    unpaid_count = len(unpaid_orders_log)
+    bp_status    = f"✅ ON — threshold: {buyer_protection_threshold} min" if buyer_protection_enabled else "❌ OFF"
+    nm_status    = "✅ ON — skips orders with missing account info" if name_match_enabled else "❌ OFF"
     return (
         f"💳 *AUTO-PAY*\n\n"
         f"Bybit Mark-Paid: *{bybit_status}*\n"
-        f"Flutterwave Pay: *{flw_status}*\n\n"
-        f"Flutterwave credentials: {flw_configured}\n"
-        f"✏️ Sender name (FLW narration): `{sender_name}`\n"
+        f"Flutterwave Pay: *{flw_status}*\n"
+        f"Paga Pay: *{paga_status}*\n\n"
+        f"Flutterwave: {flw_configured}\n"
+        f"Paga: {paga_configured}\n"
+        f"✏️ Sender name: `{sender_name}`\n"
         f"📋 Unpaid orders this session: `{unpaid_count}`\n\n"
         f"🛡 *Buyer Protection:* {bp_status}\n"
         f"🔍 *Name Match:* {nm_status}\n\n"
@@ -822,6 +831,236 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
             parse_mode="Markdown")
 
 
+# ─────────────────────────────────────────
+# 🟡 PAGA AUTO-PAY
+# Flow: Name Match → Buyer Protection → validate account → depositToBank → poll → mark paid
+# ─────────────────────────────────────────
+async def _paga_autopay(bot, chat_id, order_id, order_detail):
+    from paga import match_bank_uuid, validate_deposit, deposit_to_bank, get_operation_status
+    import os
+
+    try:
+        # ── Name Match check ──
+        if name_match_enabled:
+            has_info, _, _ = _has_account_info(order_detail)
+            if not has_info:
+                logger.info(f"[Paga NameMatch] Missing info on order {order_id} — marking paid + warn")
+                pay_term_nm = order_detail.get("confirmedPayTerm", {}) or {}
+                if not pay_term_nm:
+                    terms_nm    = order_detail.get("paymentTermList", [])
+                    pay_term_nm = terms_nm[0] if terms_nm else {}
+                pt  = str(pay_term_nm.get("paymentType", ""))
+                pid = str(pay_term_nm.get("id", ""))
+                if pt and pid:
+                    await asyncio.get_event_loop().run_in_executor(
+                        None, mark_order_paid, order_id, pt, pid
+                    )
+                    paid_order_ids.add(order_id)
+                await asyncio.get_event_loop().run_in_executor(
+                    None, send_chat_message, order_id, NO_ACCOUNT_WARN_MSG
+                )
+                await bot.send_message(chat_id=chat_id,
+                    text=(
+                        f"🔍 *Name Match — Missing Info*\n\n"
+                        f"Order: `{order_id}`\n"
+                        f"Account details incomplete — Paga transfer skipped.\n"
+                        f"Marked paid on Bybit + seller asked to cancel."
+                    ),
+                    parse_mode="Markdown")
+                return
+
+        pay_term = order_detail.get("confirmedPayTerm", {}) or {}
+        if not pay_term:
+            terms    = order_detail.get("paymentTermList", [])
+            pay_term = terms[0] if terms else {}
+
+        account_no    = pay_term.get("accountNo", "").strip()
+        bank_name     = pay_term.get("bankName",  "").strip()
+        pay_cfg       = pay_term.get("paymentConfigVo", {}) or pay_term.get("paymentConfig", {}) or {}
+        pay_type_name = pay_cfg.get("paymentName", "").strip()
+        amount_str    = order_detail.get("amount", "0")
+        seller_name   = pay_term.get("realName", order_detail.get("sellerRealName", "Seller"))
+
+        if not account_no:
+            await bot.send_message(chat_id=chat_id,
+                text=f"❌ *Paga Auto-Pay* — Order `{order_id}`\nNo account number found.",
+                parse_mode="Markdown")
+            return
+
+        bank_uuid = match_bank_uuid(bank_name, pay_type_name)
+        if not bank_uuid:
+            await bot.send_message(chat_id=chat_id,
+                text=(
+                    f"❌ *Paga Auto-Pay* — Order `{order_id}`\n"
+                    f"Unknown bank: `{bank_name or pay_type_name}`\nMark this order manually."
+                ),
+                parse_mode="Markdown")
+            return
+
+        amount = float(amount_str)
+
+        # ── Buyer Protection ──
+        if buyer_protection_enabled:
+            release_mins = float(order_detail.get("_seller_release_mins", 0))
+            if release_mins >= buyer_protection_threshold:
+                reason = f"Seller avg release time ({release_mins:.0f} min) ≥ threshold ({buyer_protection_threshold} min)"
+                logger.info(f"[Paga BuyerProtection] Skipping — {reason}")
+                unpaid_orders_log.append({
+                    "order_id":   order_id,
+                    "account_no": account_no,
+                    "bank":       bank_name or pay_type_name,
+                    "amount":     amount,
+                    "reason":     reason,
+                    "timestamp":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                })
+                pay_type   = str(pay_term.get("paymentType", ""))
+                payment_id = str(pay_term.get("id", ""))
+                if pay_type and payment_id:
+                    await asyncio.get_event_loop().run_in_executor(
+                        None, mark_order_paid, order_id, pay_type, payment_id
+                    )
+                    paid_order_ids.add(order_id)
+                await asyncio.get_event_loop().run_in_executor(
+                    None, send_chat_message, order_id, SELLER_WARN_MSG
+                )
+                await bot.send_message(chat_id=chat_id,
+                    text=(
+                        f"🛡 *Buyer Protection Triggered* — Order `{order_id}`\n\n"
+                        f"Seller release time: `{release_mins:.0f} min` ≥ `{buyer_protection_threshold} min`\n"
+                        f"✅ Marked paid on Bybit + warning sent.\n"
+                        f"Paga transfer was skipped."
+                    ),
+                    parse_mode="Markdown")
+                return
+
+        # ── Step 1: Validate account ──
+        await bot.send_message(chat_id=chat_id,
+            text=f"⏳ *Paga* Validating account `{account_no}` ({bank_name or pay_type_name})...",
+            parse_mode="Markdown")
+
+        validate = await asyncio.get_event_loop().run_in_executor(
+            None, validate_deposit, account_no, bank_uuid, amount
+        )
+
+        if validate.get("responseCode") != 0 or "error" in validate:
+            err = validate.get("message", validate.get("error", "Unknown error"))
+            unpaid_orders_log.append({
+                "order_id":   order_id,
+                "account_no": account_no,
+                "bank":       bank_name or pay_type_name,
+                "amount":     amount,
+                "reason":     f"Paga account validation failed: {err}",
+                "timestamp":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            })
+            await bot.send_message(chat_id=chat_id,
+                text=(
+                    f"❌ *Paga Account Invalid* — Order `{order_id}`\n\n"
+                    f"Account `{account_no}` @ `{bank_name or pay_type_name}` failed validation.\n"
+                    f"Reason: `{err}`\n\nTransfer aborted. Mark order manually."
+                ),
+                parse_mode="Markdown")
+            return
+
+        verified_name = validate.get("destinationAccountHolderNameAtBank", seller_name)
+        fee           = validate.get("fee", 0)
+        logger.info(f"[Paga] Validated: {verified_name} | fee={fee}")
+
+        await bot.send_message(chat_id=chat_id,
+            text=(
+                f"✅ *Account Verified*: *{verified_name}*\n"
+                f"Account: `{account_no}` ({bank_name or pay_type_name})\n"
+                f"Fee: `₦{fee:,.2f}`\n\n"
+                f"⏳ Sending *{amount:,.2f} NGN*..."
+            ),
+            parse_mode="Markdown")
+
+        # ── Step 2: Send transfer ──
+        render_url   = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+        callback_url = f"{render_url}/paga-webhook" if render_url else ""
+        sender_name  = user_settings.get("sender_name", "Akinrinade Akinniyi")
+        ref          = f"p2p{order_id[-16:]}"
+        narration    = f"{sender_name[:14]} P2P"   # Paga remarks limit: 30 chars
+
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, deposit_to_bank,
+            account_no, bank_uuid, amount,
+            verified_name, narration, callback_url, ref
+        )
+
+        if "error" in result:
+            err_msg = result["error"]
+            ip = await _get_current_ip()
+            if "Empty response" in err_msg or "401" in err_msg or "403" in err_msg:
+                await bot.send_message(chat_id=chat_id,
+                    text=(
+                        f"❌ *Paga blocked* — Order `{order_id}`\n\n"
+                        f"`{err_msg[:200]}`\n\n"
+                        f"👉 Whitelist IP `{ip}` on Paga dashboard → Settings → IP Whitelist"
+                    ),
+                    parse_mode="Markdown")
+            else:
+                await bot.send_message(chat_id=chat_id,
+                    text=f"❌ *Paga error* — `{order_id}`\n`{err_msg[:300]}`",
+                    parse_mode="Markdown")
+            return
+
+        response_code = result.get("responseCode", -1)
+        txn_id        = result.get("transactionId", "")
+        message_txt   = result.get("message", "")
+        holder_name   = result.get("destinationAccountHolderNameAtBank", verified_name)
+
+        if response_code == 0:
+            # ── Success: mark Bybit order as paid ──
+            pay_type   = str(pay_term.get("paymentType", ""))
+            payment_id = str(pay_term.get("id", ""))
+            bybit_ok   = False
+            if pay_type and payment_id:
+                pr       = await asyncio.get_event_loop().run_in_executor(None, mark_order_paid, order_id, pay_type, payment_id)
+                bybit_ok = pr.get("retCode", -1) == 0
+            paid_order_ids.add(order_id)
+            logger.info(f"[Paga] ✅ SUCCESS: txnId={txn_id} | Bybit={bybit_ok}")
+            await bot.send_message(chat_id=chat_id,
+                text=(
+                    f"✅ *Paga Payment SUCCESS*\n\n"
+                    f"Order: `{order_id}`\n"
+                    f"Amount: *{amount:,.2f} NGN* → `{holder_name}`\n"
+                    f"Transaction ID: `{txn_id}`\n"
+                    f"Reference: `{ref}`\n"
+                    f"Bybit marked paid: {'✅' if bybit_ok else '⚠️ Mark manually'}"
+                ),
+                parse_mode="Markdown")
+        else:
+            # ── Failed ──
+            err_lower = message_txt.lower()
+            unpaid_orders_log.append({
+                "order_id":   order_id,
+                "account_no": account_no,
+                "bank":       bank_name or pay_type_name,
+                "amount":     amount,
+                "reason":     message_txt or f"Paga responseCode={response_code}",
+                "timestamp":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            })
+            if "insufficient" in err_lower or "balance" in err_lower or "funds" in err_lower:
+                fail_text = (
+                    f"❌ *Paga Failed — Insufficient Funds*\n\n"
+                    f"Order: `{order_id}`\nAmount needed: *{amount:,.2f} NGN*\n\n"
+                    f"👉 Top up your Paga business account balance."
+                )
+            else:
+                fail_text = (
+                    f"❌ *Paga Transfer Failed*\n\n"
+                    f"Order: `{order_id}`\nCode: `{response_code}`\n"
+                    f"Message: `{message_txt[:200]}`\nMark order manually."
+                )
+            await bot.send_message(chat_id=chat_id, text=fail_text, parse_mode="Markdown")
+
+    except Exception as e:
+        logger.error(f"[Paga] _paga_autopay error: {e}")
+        await bot.send_message(chat_id=chat_id,
+            text=f"❌ *Paga error* — `{order_id}`\n`{str(e)[:200]}`",
+            parse_mode="Markdown")
+
+
 async def order_monitor_loop(bot, chat_id):
     global order_monitor_running
     order_monitor_running = True
@@ -898,7 +1137,7 @@ async def _handle_buy_order(bot, chat_id, order_id):
         )
 
         # ── Name Match check (Bybit auto-pay path) ──
-        if name_match_enabled and (auto_pay_enabled or flw_pay_enabled):
+        if name_match_enabled and (auto_pay_enabled or flw_pay_enabled or paga_pay_enabled):
             has_info, _, _ = _has_account_info(order_detail)
             if not has_info and order_id not in paid_order_ids:
                 pay_term_nm = order_detail.get("confirmedPayTerm", {}) or {}
@@ -924,13 +1163,19 @@ async def _handle_buy_order(bot, chat_id, order_id):
                     parse_mode="Markdown")
                 return
 
-        if flw_pay_enabled and order_id not in paid_order_ids:
+        # ── compute seller release time once (shared by all pay paths) ──
+        try:
+            seller_release = float(seller_info.get("averageReleaseTime", "0") or 0)
+        except (ValueError, TypeError):
+            seller_release = 0
+        order_detail["_seller_release_mins"] = seller_release
+
+        if paga_pay_enabled and order_id not in paid_order_ids:
             await asyncio.sleep(5)
-            try:
-                seller_release = float(seller_info.get("averageReleaseTime", "0") or 0)
-            except (ValueError, TypeError):
-                seller_release = 0
-            order_detail["_seller_release_mins"] = seller_release
+            await _paga_autopay(bot, chat_id, order_id, order_detail)
+
+        elif flw_pay_enabled and order_id not in paid_order_ids:
+            await asyncio.sleep(5)
             await _flw_autopay(bot, chat_id, order_id, order_detail)
 
         elif auto_pay_enabled and order_id not in paid_order_ids:
@@ -1267,12 +1512,55 @@ async def ping_flutterwave_command(update: Update, context: ContextTypes.DEFAULT
             )
 
 
+async def ping_paga_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    from config import PAGA_PUBLIC_KEY, PAGA_SECRET_KEY as PAGA_SK, PAGA_HASH_KEY
+    if not (PAGA_PUBLIC_KEY and PAGA_SK and PAGA_HASH_KEY):
+        await update.message.reply_text(
+            "❌ *Paga credentials not fully set*\n\n"
+            "Add these to Render environment:\n"
+            "• `PAGA_PUBLIC_KEY` — your Paga Business Public Key\n"
+            "• `PAGA_SECRET_KEY` — your Paga Business Secret Key\n"
+            "• `PAGA_HASH_KEY`   — your Paga HMAC Hash Key",
+            parse_mode="Markdown"
+        )
+        return
+    await update.message.reply_text("⏳ Testing Paga Business API...")
+    from paga import ping_paga
+    result = await asyncio.get_event_loop().run_in_executor(None, ping_paga)
+    if "error" in result:
+        ip = await _get_current_ip()
+        await update.message.reply_text(
+            f"❌ *Paga connection failed*\n\n`{result['error'][:300]}`\n\n"
+            f"Checklist:\n"
+            f"• Verify `PAGA_PUBLIC_KEY`, `PAGA_SECRET_KEY`, `PAGA_HASH_KEY` are correct\n"
+            f"• Whitelist IP `{ip}` on Paga dashboard → Settings → IP Whitelist",
+            parse_mode="Markdown"
+        )
+    else:
+        banks = result.get("banks", [])
+        if banks:
+            lines = [f"✅ *Paga Connected!* `{len(banks)}` banks available:\n"]
+            for bank in banks[:50]:
+                lines.append(f"`{bank.get('uuid','')[:8]}...` — {bank.get('name','')}")
+            msg = "\n".join(lines)
+            if len(msg) > 4000:
+                msg = msg[:4000] + "\n...(truncated)"
+            await update.message.reply_text(msg, parse_mode="Markdown")
+        else:
+            await update.message.reply_text(
+                "✅ *Paga Connected!*\nCredentials valid ✅\nDynamic bank UUID matching active ✅",
+                parse_mode="Markdown"
+            )
+
+
 # ─────────────────────────────────────────
 # 🎛️ BUTTON HANDLER
 # ─────────────────────────────────────────
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global refresh_task, refresh_running, current_price, ad_data
-    global order_monitor_task, order_monitor_running, auto_pay_enabled, flw_pay_enabled
+    global order_monitor_task, order_monitor_running, auto_pay_enabled, flw_pay_enabled, paga_pay_enabled
     global seen_order_ids, paid_order_ids, seen_sell_order_ids, released_order_ids
     global sell_msg_enabled, sell_custom_msg, sell_msg_count
     global unpaid_orders_log
@@ -1379,7 +1667,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "reset_do":
         refresh_running = False; order_monitor_running = False
-        auto_pay_enabled = False; flw_pay_enabled = False
+        auto_pay_enabled = False; flw_pay_enabled = False; paga_pay_enabled = False
         buyer_protection_enabled = False; name_match_enabled = False
         if refresh_task:      refresh_task.cancel();      refresh_task = None
         if order_monitor_task: order_monitor_task.cancel(); order_monitor_task = None
@@ -1482,6 +1770,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         auto_pay_enabled = not auto_pay_enabled
         if auto_pay_enabled and flw_pay_enabled:
             flw_pay_enabled = False
+        if auto_pay_enabled and paga_pay_enabled:
+            paga_pay_enabled = False
         await edit_menu(query, autopay_section_text(), autopay_section_keyboard())
 
     # ── 🟢 Toggle Flutterwave Pay ──
@@ -1493,7 +1783,44 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         flw_pay_enabled = not flw_pay_enabled
         if flw_pay_enabled and auto_pay_enabled:
             auto_pay_enabled = False
+        if flw_pay_enabled and paga_pay_enabled:
+            paga_pay_enabled = False
         await edit_menu(query, autopay_section_text(), autopay_section_keyboard())
+
+    # ── 🟡 Toggle Paga Pay ──
+    elif data == "toggle_paga_pay":
+        from config import PAGA_PUBLIC_KEY, PAGA_SECRET_KEY as PAGA_SK, PAGA_HASH_KEY
+        if not paga_pay_enabled and not (PAGA_PUBLIC_KEY and PAGA_SK and PAGA_HASH_KEY):
+            await query.answer(
+                "❌ Paga credentials not set. Add PAGA_PUBLIC_KEY, PAGA_SECRET_KEY, PAGA_HASH_KEY to Render.",
+                show_alert=True
+            )
+            return
+        paga_pay_enabled = not paga_pay_enabled
+        if paga_pay_enabled and auto_pay_enabled:
+            auto_pay_enabled = False
+        if paga_pay_enabled and flw_pay_enabled:
+            flw_pay_enabled = False
+        await edit_menu(query, autopay_section_text(), autopay_section_keyboard())
+
+    # ── ℹ️ Paga info ──
+    elif data == "paga_info":
+        await edit_menu(query,
+            "ℹ️ *How Paga Auto-Pay Works*\n\n"
+            "1. Order Monitor must be running\n"
+            "2. New BUY order → bot waits 5 seconds\n"
+            "3. 🔍 Name Match: if account info missing → mark paid + ask seller to cancel\n"
+            "4. 🛡 Buyer Protection: if seller release time ≥ threshold → mark paid + warn seller (no Paga transfer)\n"
+            "5. Fetches bank UUID from Paga's bank list\n"
+            "6. Validates seller's bank account via Paga\n"
+            "7. Sends NGN transfer via Paga depositToBank\n"
+            "8. If successful → marks Bybit order paid\n"
+            "9. Paga webhook notifies you in Telegram of transfer status\n\n"
+            "⚠️ Only ONE of Bybit, Flutterwave, or Paga can be active at a time.\n"
+            "⚠️ Keep enough NGN balance on your Paga business account.\n"
+            "⚠️ Whitelist your Render IP on Paga dashboard → Settings → IP Whitelist.",
+            InlineKeyboardMarkup(back_section("section_autopay"))
+        )
 
     # ── ✏️ Set Sender Name ──
     elif data == "set_sender_name":
@@ -2042,6 +2369,7 @@ def start_bot():
     application.add_handler(CommandHandler("menu",            menu_command))
     application.add_handler(CommandHandler("pingbybit",       ping_bybit_command))
     application.add_handler(CommandHandler("pingflutterwave", ping_flutterwave_command))
+    application.add_handler(CommandHandler("pingpaga",        ping_paga_command))
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     logger.info("🤖 Bot handlers registered")
