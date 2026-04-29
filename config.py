@@ -5,6 +5,7 @@ load_dotenv()
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
 # ── Multiple Bybit accounts ──
+# Set BYBIT_API_KEY_1, BYBIT_API_SECRET_1, BYBIT_ACCOUNT_LABEL_1 etc. in Render
 BYBIT_ACCOUNTS = []
 for i in range(1, 10):
     key    = os.getenv(f"BYBIT_API_KEY_{i}")
@@ -16,7 +17,7 @@ for i in range(1, 10):
             "secret": secret.strip(),
         })
 
-# Fallback to legacy single key
+# Fallback: legacy single key
 if not BYBIT_ACCOUNTS:
     key    = os.getenv("BYBIT_API_KEY")
     secret = os.getenv("BYBIT_API_SECRET")
@@ -33,7 +34,8 @@ if not BYBIT_ACCOUNTS:
         "Add BYBIT_API_KEY_1 and BYBIT_API_SECRET_1 to Render environment."
     )
 
-# ── Multiple admin IDs ──
+# ── Multiple admin Telegram IDs ──
+# Set ADMIN_ID_1, ADMIN_ID_2 etc. in Render
 ADMIN_IDS = set()
 for i in range(1, 10):
     val = os.getenv(f"ADMIN_ID_{i}")
@@ -43,6 +45,7 @@ for i in range(1, 10):
         except ValueError:
             pass
 
+# Fallback: legacy single admin ID
 if not ADMIN_IDS:
     val = os.getenv("ADMIN_TELEGRAM_ID")
     if val:
@@ -58,13 +61,25 @@ if not ADMIN_IDS:
 FLW_CLIENT_ID     = os.getenv("FLW_CLIENT_ID", "")
 FLW_CLIENT_SECRET = os.getenv("FLW_CLIENT_SECRET", "")
 FLW_SECRET_HASH   = os.getenv("FLW_SECRET_HASH", "")
-FLW_SECRET_KEY    = os.getenv("FLW_SECRET_KEY", "")
+FLW_SECRET_KEY    = os.getenv("FLW_SECRET_KEY", "")   # Standard v3 API secret key
 
 # ── Paga credentials (optional) ──
 # Set these in your Render environment:
-#   PAGA_PUBLIC_KEY   → Your Paga Business Public Key (publicId)
-#   PAGA_SECRET_KEY   → Your Paga Business Secret Key (password/credentials)
-#   PAGA_HASH_KEY     → Your Paga HMAC Hash Key (given by Paga for SHA-512 signing)
-PAGA_PUBLIC_KEY = os.getenv("PAGA_PUBLIC_KEY", "")
-PAGA_SECRET_KEY = os.getenv("PAGA_SECRET_KEY", "")
-PAGA_HASH_KEY   = os.getenv("PAGA_HASH_KEY",   "")
+#
+#   PAGA_PRINCIPAL   → Your Paga Business Public Key / Principal
+#                      (labelled "Public Key" or "Principal" on Paga dashboard)
+#
+#   PAGA_CREDENTIAL  → Your Paga Business Live Primary Secret Key / Credential
+#                      (labelled "Live Primary Secret Key" or "Credential" on Paga dashboard)
+#                      ⚠️  This is NOT the Hash Key — do not confuse them
+#
+#   PAGA_API_KEY     → Your Paga HMAC Hash Key
+#                      (labelled "Hash Key" or "API Key" on Paga dashboard)
+#                      Used by the library for request signing — separate from auth
+#
+# The paga-business-client library maps them as:
+#   BusinessClientCore(principal=PAGA_PRINCIPAL, credential=PAGA_CREDENTIAL, api_key=PAGA_API_KEY)
+#
+PAGA_PRINCIPAL  = os.getenv("PAGA_PRINCIPAL",  "")
+PAGA_CREDENTIAL = os.getenv("PAGA_CREDENTIAL", "")
+PAGA_API_KEY    = os.getenv("PAGA_API_KEY",    "")
