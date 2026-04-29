@@ -961,8 +961,10 @@ async def _paga_autopay(bot, chat_id, order_id, order_detail):
                 parse_mode="Markdown")
             return
 
-        verified_name = validate.get("destinationAccountHolderNameAtBank", seller_name)
-        fee           = validate.get("fee", 0)
+        # Use helper functions that try all known field names (visible in Render logs)
+        from paga import _extract_account_name, _extract_fee
+        verified_name = _extract_account_name(validate, fallback=seller_name)
+        fee           = _extract_fee(validate)
         logger.info(f"[Paga] Validated: {verified_name} | fee={fee}")
 
         await bot.send_message(chat_id=chat_id,
@@ -973,7 +975,6 @@ async def _paga_autopay(bot, chat_id, order_id, order_detail):
                 f"⏳ Sending *{amount:,.2f} NGN*..."
             ),
             parse_mode="Markdown")
-
         # ── Step 2: Send transfer ──
         render_url   = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
         callback_url = f"{render_url}/paga-webhook" if render_url else ""
@@ -1008,7 +1009,8 @@ async def _paga_autopay(bot, chat_id, order_id, order_detail):
         response_code = result.get("responseCode", -1)
         txn_id        = result.get("transactionId", "")
         message_txt   = result.get("message", "")
-        holder_name   = result.get("destinationAccountHolderNameAtBank", verified_name)
+        from paga import _extract_account_name
+        holder_name   = _extract_account_name(result, fallback=verified_name)
 
         if response_code == 0:
             # ── Success: mark Bybit order as paid ──
