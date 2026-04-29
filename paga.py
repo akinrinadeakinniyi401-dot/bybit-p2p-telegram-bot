@@ -38,7 +38,6 @@ def _get_client():
         _client = BusinessClientCore(
             principal=PAGA_PRINCIPAL,
             credentials=PAGA_CREDENTIAL,
-            test=False,        # False = Live environment
             api_key=PAGA_API_KEY
         )
         logger.info("[Paga] BusinessClientCore initialised (Live mode)")
@@ -58,9 +57,9 @@ def fetch_banks() -> list:
     global _banks_cache
     logger.info("[Paga] Fetching bank list...")
     try:
+        # Pass only reference_number — avoid optional kwargs that vary by library version
         response = _get_client().get_banks(
-            reference_number=_ref(),
-            locale="en"
+            reference_number=_ref()
         )
         logger.info(f"[Paga] getBanks response: {str(response)[:400]}")
 
@@ -173,8 +172,6 @@ def validate_account(account_number: str, bank_uuid: str, amount: float = 100) -
             currency="NGN",
             destination_bank_uuid=bank_uuid,
             destination_bank_acct_no=account_number,
-            recipient_name=None,
-            locale="en"
         )
         logger.info(f"[Paga] validateDepositToBank: {str(response)[:400]}")
         return response
