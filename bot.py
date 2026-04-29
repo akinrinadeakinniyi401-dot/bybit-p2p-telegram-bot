@@ -367,10 +367,10 @@ def autopay_section_text():
     bybit_status = "✅ ENABLED" if auto_pay_enabled  else "❌ DISABLED"
     flw_status   = "✅ ENABLED" if flw_pay_enabled   else "❌ DISABLED"
     paga_status  = "✅ ENABLED" if paga_pay_enabled  else "❌ DISABLED"
-    from config import FLW_SECRET_KEY, PAGA_PUBLIC_KEY, PAGA_SECRET_KEY, PAGA_HASH_KEY
+    from config import FLW_SECRET_KEY, PAGA_PRINCIPAL, PAGA_CREDENTIAL, PAGA_API_KEY
     flw_configured  = "✅ Configured" if FLW_SECRET_KEY else "❌ Not configured — add FLW_SECRET_KEY"
-    paga_configured = "✅ Configured" if (PAGA_PUBLIC_KEY and PAGA_SECRET_KEY and PAGA_HASH_KEY) \
-                      else "❌ Not configured — add PAGA_PUBLIC_KEY / PAGA_SECRET_KEY / PAGA_HASH_KEY"
+    paga_configured = "✅ Configured" if (PAGA_PRINCIPAL and PAGA_CREDENTIAL and PAGA_API_KEY) \
+                      else "❌ Not configured — add PAGA_PRINCIPAL / PAGA_CREDENTIAL / PAGA_API_KEY"
     sender_name  = user_settings.get("sender_name", "Not set")
     unpaid_count = len(unpaid_orders_log)
     bp_status    = f"✅ ON — threshold: {buyer_protection_threshold} min" if buyer_protection_enabled else "❌ OFF"
@@ -836,7 +836,7 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
 # Flow: Name Match → Buyer Protection → validate account → depositToBank → poll → mark paid
 # ─────────────────────────────────────────
 async def _paga_autopay(bot, chat_id, order_id, order_detail):
-    from paga import match_bank_uuid, validate_deposit, deposit_to_bank, get_operation_status
+    from paga import match_bank_uuid, validate_account, deposit_to_bank, check_status
     import os
 
     try:
@@ -939,7 +939,7 @@ async def _paga_autopay(bot, chat_id, order_id, order_detail):
             parse_mode="Markdown")
 
         validate = await asyncio.get_event_loop().run_in_executor(
-            None, validate_deposit, account_no, bank_uuid, amount
+            None, validate_account, account_no, bank_uuid, amount
         )
 
         if validate.get("responseCode") != 0 or "error" in validate:
@@ -979,18 +979,19 @@ async def _paga_autopay(bot, chat_id, order_id, order_detail):
         callback_url = f"{render_url}/paga-webhook" if render_url else ""
         sender_name  = user_settings.get("sender_name", "Akinrinade Akinniyi")
         ref          = f"p2p{order_id[-16:]}"
-        narration    = f"{sender_name[:14]} P2P"   # Paga remarks limit: 30 chars
+        narration    = f"{sender_name[:14]} P2P"   # Paga remarks: 30 char limit
 
         result = await asyncio.get_event_loop().run_in_executor(
             None, deposit_to_bank,
             account_no, bank_uuid, amount,
-            verified_name, narration, callback_url, ref
+            verified_name, "",          # recipient_name, recipient_phone
+            narration, callback_url, ref
         )
 
         if "error" in result:
             err_msg = result["error"]
             ip = await _get_current_ip()
-            if "Empty response" in err_msg or "401" in err_msg or "403" in err_msg:
+            if "401" in err_msg or "403" in err_msg or "IP" in err_msg:
                 await bot.send_message(chat_id=chat_id,
                     text=(
                         f"❌ *Paga blocked* — Order `{order_id}`\n\n"
@@ -1515,14 +1516,16 @@ async def ping_flutterwave_command(update: Update, context: ContextTypes.DEFAULT
 async def ping_paga_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-    from config import PAGA_PUBLIC_KEY, PAGA_SECRET_KEY as PAGA_SK, PAGA_HASH_KEY
-    if not (PAGA_PUBLIC_KEY and PAGA_SK and PAGA_HASH_KEY):
+    from config import PAGA_PRINCIPAL, PAGA_CREDENTIAL, PAGA_API_KEY
+    if not (PAGA_PRINCIPAL and PAGA_CREDENTIAL and PAGA_API_KEY):
         await update.message.reply_text(
             "❌ *Paga credentials not fully set*\n\n"
-            "Add these to Render environment:\n"
-            "• `PAGA_PUBLIC_KEY` — your Paga Business Public Key\n"
-            "• `PAGA_SECRET_KEY` — your Paga Business Secret Key\n"
-            "• `PAGA_HASH_KEY`   — your Paga HMAC Hash Key",
+            "Add these 3 variables to your Render environment:\n\n"
+            "• `PAGA_PRINCIPAL`  — your Paga Business Public Key / Principal\n"
+            "• `PAGA_CREDENTIAL` — your Paga Live Primary Secret Key / Credential\n"
+            "• `PAGA_API_KEY`    — your Paga HMAC Hash Key\n\n"
+            "⚠️ PAGA\\_CREDENTIAL is your *password/secret*, not the hash key.\n"
+            "⚠️ PAGA\\_API\\_KEY is the *hash/HMAC key*, separate from the password.",
             parse_mode="Markdown"
         )
         return
@@ -1534,7 +1537,9 @@ async def ping_paga_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"❌ *Paga connection failed*\n\n`{result['error'][:300]}`\n\n"
             f"Checklist:\n"
-            f"• Verify `PAGA_PUBLIC_KEY`, `PAGA_SECRET_KEY`, `PAGA_HASH_KEY` are correct\n"
+            f"• `PAGA_PRINCIPAL` = Public Key / Principal on Paga dashboard\n"
+            f"• `PAGA_CREDENTIAL` = Live Primary Secret Key (NOT the hash key)\n"
+            f"• `PAGA_API_KEY` = Hash Key / HMAC Key\n"
             f"• Whitelist IP `{ip}` on Paga dashboard → Settings → IP Whitelist",
             parse_mode="Markdown"
         )
@@ -1543,7 +1548,7 @@ async def ping_paga_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if banks:
             lines = [f"✅ *Paga Connected!* `{len(banks)}` banks available:\n"]
             for bank in banks[:50]:
-                lines.append(f"`{bank.get('uuid','')[:8]}...` — {bank.get('name','')}")
+                lines.append(f"`{bank.get('uuid','?')[:8]}...` — {bank.get('name','')}")
             msg = "\n".join(lines)
             if len(msg) > 4000:
                 msg = msg[:4000] + "\n...(truncated)"
@@ -1789,10 +1794,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── 🟡 Toggle Paga Pay ──
     elif data == "toggle_paga_pay":
-        from config import PAGA_PUBLIC_KEY, PAGA_SECRET_KEY as PAGA_SK, PAGA_HASH_KEY
-        if not paga_pay_enabled and not (PAGA_PUBLIC_KEY and PAGA_SK and PAGA_HASH_KEY):
+        from config import PAGA_PRINCIPAL, PAGA_CREDENTIAL, PAGA_API_KEY
+        if not paga_pay_enabled and not (PAGA_PRINCIPAL and PAGA_CREDENTIAL and PAGA_API_KEY):
             await query.answer(
-                "❌ Paga credentials not set. Add PAGA_PUBLIC_KEY, PAGA_SECRET_KEY, PAGA_HASH_KEY to Render.",
+                "❌ Paga credentials not set. Add PAGA_PRINCIPAL, PAGA_CREDENTIAL, PAGA_API_KEY to Render.",
                 show_alert=True
             )
             return
