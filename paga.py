@@ -51,6 +51,24 @@ def _ref() -> str:
     return str(uuid.uuid4())
 
 
+def _parse(response) -> dict:
+    """
+    The paga-business-client library returns a JSON string, not a parsed dict.
+    This normalises every response to a dict before we call .get() on it.
+    """
+    import json
+    if isinstance(response, dict):
+        return response
+    if isinstance(response, (str, bytes)):
+        try:
+            return json.loads(response)
+        except Exception as e:
+            logger.error(f"[Paga] _parse failed: {e} | raw={str(response)[:300]}")
+            return {"error": f"Unparseable response: {str(response)[:300]}"}
+    logger.error(f"[Paga] _parse: unknown type {type(response)}: {str(response)[:200]}")
+    return {"error": f"Unknown response type: {str(response)[:200]}"}
+
+
 def _log_full(label: str, response) -> None:
     """
     Log the COMPLETE raw response from every Paga call.
@@ -91,7 +109,7 @@ def fetch_banks() -> list:
     logger.info("[Paga] Fetching bank list...")
     try:
         # Both args positional — library version requires locale as 2nd positional arg
-        response = _get_client().get_banks(_ref(), "en")
+        response = _parse(_get_client().get_banks(_ref(), "en"))
         _log_full("GET_BANKS", response)
 
         if _rc(response) == 0:
@@ -191,7 +209,7 @@ def match_bank_uuid(bank_name: str, payment_name: str = "") -> str | None:
 def validate_account(account_number: str, bank_uuid: str, amount: float = 100) -> dict:
     logger.info(f"[Paga] Validating account {account_number} @ bank_uuid={bank_uuid}")
     try:
-        response = _get_client().validate_deposit_to_bank(
+        response = _parse(_get_client().validate_deposit_to_bank(
             _ref(),         # reference_number
             str(amount),    # amount
             "NGN",          # currency
@@ -199,7 +217,7 @@ def validate_account(account_number: str, bank_uuid: str, amount: float = 100) -
             account_number, # destination_bank_acct_no
             None,           # recipient_name
             "en"            # locale
-        )
+        ))
         _log_full("VALIDATE_DEPOSIT_TO_BANK", response)
 
         # Try every known field name Paga may use for account holder name
@@ -278,7 +296,7 @@ def deposit_to_bank(
         f"[Paga] Transfer {amount} NGN → {account_number} @ {bank_uuid} | ref={ref}"
     )
     try:
-        response = _get_client().deposit_to_bank(
+        response = _parse(_get_client().deposit_to_bank(
             ref,                         # reference_number
             str(amount),                 # amount
             "NGN",                       # currency
@@ -286,7 +304,7 @@ def deposit_to_bank(
             account_number,              # destination_bank_acct_no
             recipient_phone or None,     # recipient_phone_number
             recipient_name or None,      # recipient_name
-        )
+        ))
         _log_full("DEPOSIT_TO_BANK", response)
         response["_ref"] = ref
         return response
@@ -302,7 +320,7 @@ def deposit_to_bank(
 def check_status(reference: str) -> dict:
     logger.info(f"[Paga] Status poll: {reference}")
     try:
-        response = _get_client().get_operation_status(reference)
+        response = _parse(_get_client().get_operation_status(reference))
         _log_full("GET_OPERATION_STATUS", response)
         return response
     except Exception as e:
