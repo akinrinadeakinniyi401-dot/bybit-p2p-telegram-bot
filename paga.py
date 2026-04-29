@@ -37,7 +37,7 @@ def _get_client():
         from paga_business_client import BusinessClientCore
         _client = BusinessClientCore(
             principal=PAGA_PRINCIPAL,
-            credential=PAGA_CREDENTIAL,
+            credentials=PAGA_CREDENTIAL,
             test=False,        # False = Live environment
             api_key=PAGA_API_KEY
         )
