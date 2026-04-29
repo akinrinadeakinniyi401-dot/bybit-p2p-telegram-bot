@@ -6,10 +6,9 @@ Render environment variables required:
     PAGA_CREDENTIAL  → Your Paga Business Live Primary Secret Key (password)
     PAGA_API_KEY     → Your Paga HMAC Hash Key / API Key
 
-Correct init signature (positional, required):
+Correct init (all positional):
     BusinessClientCore(principal, credential, test, api_key)
-    - test = False  →  Live server
-    - test = True   →  Test/beta server
+    test = False → Live server
 
 Add to requirements.txt:
     paga-business-client
@@ -22,14 +21,12 @@ from config import PAGA_PRINCIPAL, PAGA_CREDENTIAL, PAGA_API_KEY
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────
-# 🏦 Bank UUID cache — fetched once per session
+# 🏦 Bank UUID cache
 # ─────────────────────────────────────────
 _banks_cache: list = []
 
 # ─────────────────────────────────────────
-# 🔌 Paga client — lazily initialised on first use
-# Correct positional args: (principal, credential, test, api_key)
-# The library handles Basic Auth + HMAC SHA-512 signing automatically.
+# 🔌 Paga client — lazily initialised
 # ─────────────────────────────────────────
 _client = None
 
@@ -38,47 +35,82 @@ def _get_client():
     global _client
     if _client is None:
         from paga_business_client import BusinessClientCore
-        # IMPORTANT: all four args are positional — the library does NOT accept kwargs here
-        # principal   = your Paga publicId / Public Key
-        # credential  = your Paga password / Live Primary Secret Key
-        # test        = False means Live server, True means Test/beta server
-        # api_key     = your Paga HMAC Hash Key (used for request signing)
+        # Strictly positional — library does NOT accept keyword args
+        # (principal, credential, test, api_key)
         _client = BusinessClientCore(
-            PAGA_PRINCIPAL,    # principal
-            PAGA_CREDENTIAL,   # credential (password)
-            False,             # test = False → Live server
-            PAGA_API_KEY       # api_key (hash/HMAC key)
+            PAGA_PRINCIPAL,   # publicId
+            PAGA_CREDENTIAL,  # password / secret key
+            False,            # test=False → Live server
+            PAGA_API_KEY      # HMAC hash key
         )
         logger.info("[Paga] BusinessClientCore initialised — Live server")
     return _client
 
 
 def _ref() -> str:
-    """Generate a unique reference number for each Paga request."""
     return str(uuid.uuid4())
 
 
+def _log_full(label: str, response) -> None:
+    """
+    Log the COMPLETE raw response from every Paga call.
+    This lets us see the exact field names in Render logs
+    without guessing — no more 'wrong field name' errors.
+    """
+    logger.info(f"[Paga] ═══ {label} FULL RESPONSE ═══")
+    logger.info(f"[Paga] type={type(response)}")
+    try:
+        if isinstance(response, dict):
+            for k, v in response.items():
+                logger.info(f"[Paga]   {k!r}: {v!r}")
+        else:
+            logger.info(f"[Paga]   raw: {response}")
+    except Exception as e:
+        logger.info(f"[Paga]   (could not iterate: {e}) raw={response}")
+    logger.info(f"[Paga] ═══ END {label} ═══")
+
+
+def _rc(response: dict) -> int:
+    """
+    Safely extract responseCode from Paga response.
+    Handles int 0, string '0', and alternate field name response_code.
+    """
+    rc = response.get("responseCode", response.get("response_code", -1))
+    try:
+        return int(rc)
+    except (TypeError, ValueError):
+        return -1
+
+
 # ─────────────────────────────────────────
-# 🏦 Get Banks (UUID list)
-# Returns a list of bank dicts, each with 'uuid' and 'name'.
-# No hash header required — the library handles all auth.
+# 🏦 Get Banks
+# Positional args: (reference_number, locale)
 # ─────────────────────────────────────────
 def fetch_banks() -> list:
     global _banks_cache
     logger.info("[Paga] Fetching bank list...")
     try:
-        # Positional args only — avoid kwargs that vary by library version
-        response = _get_client().get_banks(_ref())
-        logger.info(f"[Paga] getBanks response: {str(response)[:500]}")
+        # Both args positional — library version requires locale as 2nd positional arg
+        response = _get_client().get_banks(_ref(), "en")
+        _log_full("GET_BANKS", response)
 
-        rc = response.get("responseCode", response.get("response_code", -1))
-        if str(rc) == "0" or rc == 0:
-            banks = response.get("banks", response.get("bank", []))
+        if _rc(response) == 0:
+            # Try every known field name Paga uses for the bank list
+            banks = (
+                response.get("banks")
+                or response.get("bank")
+                or response.get("bankList")
+                or response.get("bank_list")
+                or []
+            )
             _banks_cache = banks
-            logger.info(f"[Paga] Fetched {len(banks)} banks")
+            logger.info(f"[Paga] ✅ Fetched {len(banks)} banks")
             return banks
 
-        logger.error(f"[Paga] getBanks failed — code={rc} | msg={response.get('message','')}")
+        logger.error(
+            f"[Paga] ❌ getBanks failed — "
+            f"code={_rc(response)} | msg={response.get('message','')}"
+        )
         return []
 
     except Exception as e:
@@ -87,7 +119,6 @@ def fetch_banks() -> list:
 
 
 def get_banks() -> list:
-    """Return cached bank list, fetching from Paga if empty."""
     if not _banks_cache:
         fetch_banks()
     return _banks_cache
@@ -95,8 +126,6 @@ def get_banks() -> list:
 
 # ─────────────────────────────────────────
 # 🔍 Match bank name → Paga UUID
-# Tries exact → partial → reverse match against live bank list.
-# Falls back to hardcoded UUIDs for major banks.
 # ─────────────────────────────────────────
 KNOWN_UUIDS = {
     "access":      "40090E2F-7446-4217-9345-7BBAB7043C4C",
@@ -123,78 +152,116 @@ KNOWN_UUIDS = {
 
 def match_bank_uuid(bank_name: str, payment_name: str = "") -> str | None:
     banks = get_banks()
-
     for search in [bank_name, payment_name]:
         if not search:
             continue
         s = search.lower().strip()
-
         if banks:
-            # 1. Exact match on name
             for bank in banks:
                 if s == bank.get("name", "").lower():
                     logger.info(f"[Paga] Exact match: '{search}' → {bank.get('uuid','')}")
                     return bank.get("uuid")
-            # 2. Search string contained in bank name
             for bank in banks:
                 if s in bank.get("name", "").lower():
                     logger.info(f"[Paga] Partial match: '{search}' in '{bank.get('name','')}'")
                     return bank.get("uuid")
-            # 3. Bank name contained in search string (reverse)
             for bank in banks:
                 bn = bank.get("name", "").lower()
                 if len(bn) > 3 and bn in s:
                     logger.info(f"[Paga] Reverse match: '{bank.get('name','')}' in '{search}'")
                     return bank.get("uuid")
-            # 4. Sort code match
             for bank in banks:
                 sc = str(bank.get("sortCode", bank.get("sort_code", ""))).strip()
                 if sc and sc in s:
                     logger.info(f"[Paga] SortCode match: '{sc}' → '{bank.get('name','')}'")
                     return bank.get("uuid")
-
-        # 5. Hardcoded fallback for major traditional banks
         for key, uuid_val in KNOWN_UUIDS.items():
             if key in s or s in key:
                 logger.info(f"[Paga] Hardcoded fallback: '{search}' → {uuid_val}")
                 return uuid_val
-
     logger.warning(f"[Paga] No UUID match for '{bank_name}' / '{payment_name}'")
     return None
 
 
 # ─────────────────────────────────────────
-# ✅ Validate Account (before transfer)
-# Confirms the account number is valid and gets the holder name.
-# Uses positional args to avoid library version kwarg mismatches.
+# ✅ Validate Account (pre-transfer check)
+# Positional args: (ref, amount, currency, bank_uuid, account_no, recipient_name, locale)
+# Logs FULL response so we can see the exact account name field
 # ─────────────────────────────────────────
 def validate_account(account_number: str, bank_uuid: str, amount: float = 100) -> dict:
-    logger.info(f"[Paga] Validating {account_number} @ {bank_uuid}")
+    logger.info(f"[Paga] Validating account {account_number} @ bank_uuid={bank_uuid}")
     try:
-        # Positional arg order per Paga Python library docs:
-        # validate_deposit_to_bank(reference_number, amount, currency,
-        #                          destination_bank_uuid, destination_bank_acct_no,
-        #                          recipient_name, locale)
         response = _get_client().validate_deposit_to_bank(
-            _ref(),            # reference_number
-            str(amount),       # amount
-            "NGN",             # currency
-            bank_uuid,         # destination_bank_uuid
-            account_number,    # destination_bank_acct_no
-            None,              # recipient_name (optional)
-            "en"               # locale
+            _ref(),         # reference_number
+            str(amount),    # amount
+            "NGN",          # currency
+            bank_uuid,      # destination_bank_uuid
+            account_number, # destination_bank_acct_no
+            None,           # recipient_name
+            "en"            # locale
         )
-        logger.info(f"[Paga] validateDepositToBank: {str(response)[:500]}")
+        _log_full("VALIDATE_DEPOSIT_TO_BANK", response)
+
+        # Try every known field name Paga may use for account holder name
+        # We log all of them so we can confirm the real one from Render logs
+        for field in [
+            "destinationAccountHolderNameAtBank",
+            "destinationAccountName",
+            "accountHolderName",
+            "account_name",
+            "account_holder_name",
+            "destination_account_name",
+            "holderName",
+        ]:
+            val = response.get(field)
+            if val:
+                logger.info(f"[Paga] Account name found in field '{field}': {val}")
+                break
+        else:
+            logger.warning("[Paga] Could not find account name field in validate response — check FULL RESPONSE above")
+
         return response
+
     except Exception as e:
         logger.error(f"[Paga] validate_account error: {e}")
         return {"error": str(e)}
 
 
+def _extract_account_name(response: dict, fallback: str = "") -> str:
+    """
+    Extract account holder name from validate response.
+    Tries all known field names — the correct one will be clear from Render logs.
+    """
+    for field in [
+        "destinationAccountHolderNameAtBank",
+        "destinationAccountName",
+        "accountHolderName",
+        "account_name",
+        "account_holder_name",
+        "destination_account_name",
+        "holderName",
+    ]:
+        val = response.get(field, "")
+        if val:
+            return str(val)
+    return fallback
+
+
+def _extract_fee(response: dict) -> float:
+    """Extract transfer fee from validate response — handles multiple field names."""
+    for field in ["fee", "transactionFee", "transaction_fee", "chargeFee", "charge_fee"]:
+        val = response.get(field)
+        if val is not None:
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                pass
+    return 0.0
+
+
 # ─────────────────────────────────────────
 # 💸 Deposit to Bank (actual NGN transfer)
-# Call validate_account first.
-# Stores the reference in result["_ref"] for status polling.
+# Positional args: (ref, amount, currency, bank_uuid, account_no, phone, recipient_name)
 # ─────────────────────────────────────────
 def deposit_to_bank(
     account_number: str,
@@ -207,24 +274,23 @@ def deposit_to_bank(
     reference: str = None
 ) -> dict:
     ref = reference or _ref()
-    logger.info(f"[Paga] Transfer {amount} NGN → {account_number} @ {bank_uuid} | ref={ref}")
+    logger.info(
+        f"[Paga] Transfer {amount} NGN → {account_number} @ {bank_uuid} | ref={ref}"
+    )
     try:
-        # Positional arg order per Paga Python library docs:
-        # deposit_to_bank(reference_number, amount, currency,
-        #                 destination_bank_uuid, destination_bank_acct_no,
-        #                 recipient_phone_number, recipient_name)
         response = _get_client().deposit_to_bank(
-            ref,                        # reference_number
-            str(amount),                # amount
-            "NGN",                      # currency
-            bank_uuid,                  # destination_bank_uuid
-            account_number,             # destination_bank_acct_no
-            recipient_phone or None,    # recipient_phone_number (None if empty)
-            recipient_name or None,     # recipient_name (None if empty)
+            ref,                         # reference_number
+            str(amount),                 # amount
+            "NGN",                       # currency
+            bank_uuid,                   # destination_bank_uuid
+            account_number,              # destination_bank_acct_no
+            recipient_phone or None,     # recipient_phone_number
+            recipient_name or None,      # recipient_name
         )
-        logger.info(f"[Paga] depositToBank: {str(response)[:500]}")
+        _log_full("DEPOSIT_TO_BANK", response)
         response["_ref"] = ref
         return response
+
     except Exception as e:
         logger.error(f"[Paga] deposit_to_bank error: {e}")
         return {"error": str(e), "_ref": ref}
@@ -232,13 +298,12 @@ def deposit_to_bank(
 
 # ─────────────────────────────────────────
 # 🔍 Check Transfer Status
-# Pass the same reference used in deposit_to_bank.
 # ─────────────────────────────────────────
 def check_status(reference: str) -> dict:
     logger.info(f"[Paga] Status poll: {reference}")
     try:
         response = _get_client().get_operation_status(reference)
-        logger.info(f"[Paga] getOperationStatus: {str(response)[:500]}")
+        _log_full("GET_OPERATION_STATUS", response)
         return response
     except Exception as e:
         logger.error(f"[Paga] check_status error: {e}")
@@ -262,7 +327,7 @@ def ping_paga() -> dict:
             "error": (
                 "Could not fetch banks from Paga.\n"
                 "• Verify PAGA_PRINCIPAL and PAGA_CREDENTIAL are correct\n"
-                "• Whitelist your Render server IP on Paga dashboard → Settings → IP Whitelist"
+                "• Whitelist your Render IP on Paga dashboard → Settings → IP Whitelist"
             )
         }
     return {"status": "ok", "message": "Connected", "banks": banks}
