@@ -190,8 +190,11 @@ async def run_bot_setup(render_url):
     await bot.initialize()
     await bot.bot.set_webhook(url=webhook_url)
     await bot.bot.set_my_commands([
-        BotCommand("start",  "Start the bot"),
-        BotCommand("menu",   "Open control panel"),
+        BotCommand("start",            "🤖 Start the bot"),
+        BotCommand("menu",             "📋 Open control panel"),
+        BotCommand("pingbybit",        "🔌 Test Bybit API connection"),
+        BotCommand("pingflutterwave",  "🔌 Test Flutterwave connection"),
+        BotCommand("pingpaga",         "🔌 Test Paga connection"),
     ])
     bot_app = bot
     logger.info("✅ Bot ready")
