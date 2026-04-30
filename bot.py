@@ -67,6 +67,14 @@ released_order_ids    = set()
 
 unpaid_orders_log: list = []
 
+# ── Paga payment queue ──
+# Orders are processed strictly one at a time to avoid Paga rate-limit/rejection
+# when multiple orders arrive simultaneously.
+import asyncio as _asyncio
+_paga_queue: _asyncio.Queue = None          # initialised in start_bot()
+_paga_worker_task           = None          # background worker task
+_paga_queue_list: list      = []            # mirror list for display (order_id, amount, bank)
+
 # ── Sell message settings ──
 sell_msg_enabled = False
 sell_custom_msg  = "Dear buyer, please confirm your payment details are correct. We will release your coins shortly. Thank you."
@@ -832,6 +840,146 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
 
 
 # ─────────────────────────────────────────
+# 🟡 PAGA PAYMENT QUEUE WORKER
+# Processes Paga payments strictly one at a time.
+# Orders arriving while one is processing are queued and notified.
+# ─────────────────────────────────────────
+async def _paga_queue_worker():
+    """
+    Single background worker that drains the Paga payment queue.
+    Each order is fully resolved (success / fail / pending timeout)
+    before the next one starts — prevents Paga rate-limit rejections
+    when multiple Bybit orders arrive simultaneously.
+    """
+    global _paga_queue_list
+    logger.info("[Paga Queue] Worker started")
+    while True:
+        try:
+            item = await _paga_queue.get()
+            if item is None:
+                logger.info("[Paga Queue] Worker received stop signal")
+                break
+
+            bot, chat_id, order_id, order_detail = item
+
+            # Remove from display list
+            _paga_queue_list = [x for x in _paga_queue_list if x[0] != order_id]
+
+            remaining = _paga_queue.qsize()
+            pos_msg   = f"\n\n📋 *{remaining} order(s) still in queue after this.*" if remaining > 0 else ""
+
+            logger.info(f"[Paga Queue] Processing order {order_id} | queue remaining={remaining}")
+
+            if remaining > 0:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"🟡 *Paga Queue* — Processing order `{order_id}`\n"
+                        f"📋 `{remaining}` order(s) waiting after this one."
+                    ),
+                    parse_mode="Markdown"
+                )
+
+            try:
+                await _paga_autopay(bot, chat_id, order_id, order_detail)
+            except Exception as e:
+                logger.error(f"[Paga Queue] Error processing {order_id}: {e}")
+                try:
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=f"❌ *Paga Queue error* — `{order_id}`\n`{str(e)[:200]}`",
+                        parse_mode="Markdown"
+                    )
+                except Exception:
+                    pass
+
+            _paga_queue.task_done()
+
+        except Exception as e:
+            logger.error(f"[Paga Queue] Worker loop error: {e}")
+            await asyncio.sleep(2)
+
+    logger.info("[Paga Queue] Worker stopped")
+
+
+def _enqueue_paga_order(bot, chat_id, order_id, order_detail):
+    """
+    Add a Paga payment job to the queue.
+    Also updates the display list with order summary for status reporting.
+    """
+    global _paga_queue_list
+    amount   = order_detail.get("amount", "?")
+    pay_term = order_detail.get("confirmedPayTerm", {}) or {}
+    if not pay_term:
+        terms    = order_detail.get("paymentTermList", [])
+        pay_term = terms[0] if terms else {}
+    bank = pay_term.get("bankName", "") or pay_term.get("paymentType", "?")
+    _paga_queue_list.append((order_id, amount, bank))
+    _paga_queue.put_nowait((bot, chat_id, order_id, order_detail))
+    pos = _paga_queue.qsize()
+    logger.info(f"[Paga Queue] Enqueued {order_id} | queue size={pos}")
+    return pos
+
+
+# ─────────────────────────────────────────
+# 🟡 PAGA SUCCESS / FAILURE HELPERS
+# ─────────────────────────────────────────
+async def _paga_handle_success(bot, chat_id, order_id, pay_term, amount, holder_name, txn_id, ref):
+    """Mark Bybit order paid and notify admin on Paga success."""
+    global paid_order_ids
+    pay_type   = str(pay_term.get("paymentType", ""))
+    payment_id = str(pay_term.get("id", ""))
+    bybit_ok   = False
+    if pay_type and payment_id:
+        pr       = await asyncio.get_event_loop().run_in_executor(
+            None, mark_order_paid, order_id, pay_type, payment_id
+        )
+        bybit_ok = pr.get("retCode", -1) == 0
+    paid_order_ids.add(order_id)
+    logger.info(f"[Paga] ✅ SUCCESS: txnId={txn_id} | Bybit={bybit_ok}")
+    await bot.send_message(chat_id=chat_id,
+        text=(
+            f"✅ *Paga Payment SUCCESS*\n\n"
+            f"Order: `{order_id}`\n"
+            f"Amount: *{amount:,.2f} NGN* → `{holder_name}`\n"
+            f"Transaction ID: `{txn_id or 'N/A'}`\n"
+            f"Reference: `{ref}`\n"
+            f"Bybit marked paid: {'✅' if bybit_ok else '⚠️ Mark manually'}"
+        ),
+        parse_mode="Markdown")
+
+
+async def _paga_handle_failure(bot, chat_id, order_id, account_no, bank, amount, code, message_txt):
+    """Log unpaid order and notify admin on Paga failure."""
+    global unpaid_orders_log
+    err_lower = (message_txt or "").lower()
+    unpaid_orders_log.append({
+        "order_id":   order_id,
+        "account_no": account_no,
+        "bank":       bank,
+        "amount":     amount,
+        "reason":     message_txt or f"Paga responseCode={code}",
+        "timestamp":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    })
+    logger.error(f"[Paga] ❌ FAILED: order={order_id} code={code} msg={message_txt}")
+    if "insufficient" in err_lower or "balance" in err_lower or "funds" in err_lower:
+        fail_text = (
+            f"❌ *Paga Failed — Insufficient Funds*\n\n"
+            f"Order: `{order_id}`\nAmount needed: *{amount:,.2f} NGN*\n\n"
+            f"👉 Top up your Paga business account balance.\n"
+            f"Mark this order manually."
+        )
+    else:
+        fail_text = (
+            f"❌ *Paga Transfer Failed*\n\n"
+            f"Order: `{order_id}`\n"
+            f"Code: `{code}` | Message: `{(message_txt or 'Unknown')[:200]}`\n\n"
+            f"Mark order manually."
+        )
+    await bot.send_message(chat_id=chat_id, text=fail_text, parse_mode="Markdown")
+
+
+# ─────────────────────────────────────────
 # 🟡 PAGA AUTO-PAY
 # Flow: Name Match → Buyer Protection → validate account → depositToBank → poll → mark paid
 # ─────────────────────────────────────────
@@ -1007,55 +1155,87 @@ async def _paga_autopay(bot, chat_id, order_id, order_detail):
             return
 
         response_code = result.get("responseCode", -1)
-        txn_id        = result.get("transactionId", "")
-        message_txt   = result.get("message", "")
-        from paga import _extract_account_name
+        txn_id        = result.get("transactionId", "") or ""
+        message_txt   = result.get("message", "") or ""
+        from paga import _extract_account_name, check_status
         holder_name   = _extract_account_name(result, fallback=verified_name)
 
+        # ── responseCode meanings from Paga docs ──
+        # 0  → SUCCESS (immediate)
+        # 3  → PENDING (processing, must poll check_status)
+        # anything else → FAILED
+
         if response_code == 0:
-            # ── Success: mark Bybit order as paid ──
-            pay_type   = str(pay_term.get("paymentType", ""))
-            payment_id = str(pay_term.get("id", ""))
-            bybit_ok   = False
-            if pay_type and payment_id:
-                pr       = await asyncio.get_event_loop().run_in_executor(None, mark_order_paid, order_id, pay_type, payment_id)
-                bybit_ok = pr.get("retCode", -1) == 0
-            paid_order_ids.add(order_id)
-            logger.info(f"[Paga] ✅ SUCCESS: txnId={txn_id} | Bybit={bybit_ok}")
+            # Immediate success — mark Bybit paid
+            await _paga_handle_success(
+                bot, chat_id, order_id, pay_term,
+                amount, holder_name, txn_id, ref
+            )
+
+        elif response_code == 3 or message_txt.upper() == "PENDING":
+            # ── PENDING: poll check_status up to 12×10s = 120 seconds ──
+            logger.info(f"[Paga] PENDING — polling check_status for ref={ref}")
             await bot.send_message(chat_id=chat_id,
                 text=(
-                    f"✅ *Paga Payment SUCCESS*\n\n"
+                    f"⏳ *Paga Transfer Pending*\n\n"
                     f"Order: `{order_id}`\n"
                     f"Amount: *{amount:,.2f} NGN* → `{holder_name}`\n"
-                    f"Transaction ID: `{txn_id}`\n"
-                    f"Reference: `{ref}`\n"
-                    f"Bybit marked paid: {'✅' if bybit_ok else '⚠️ Mark manually'}"
+                    f"Reference: `{ref}`\n\n"
+                    f"Polling for status update (up to 2 minutes)..."
                 ),
                 parse_mode="Markdown")
-        else:
-            # ── Failed ──
-            err_lower = message_txt.lower()
-            unpaid_orders_log.append({
-                "order_id":   order_id,
-                "account_no": account_no,
-                "bank":       bank_name or pay_type_name,
-                "amount":     amount,
-                "reason":     message_txt or f"Paga responseCode={response_code}",
-                "timestamp":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            })
-            if "insufficient" in err_lower or "balance" in err_lower or "funds" in err_lower:
-                fail_text = (
-                    f"❌ *Paga Failed — Insufficient Funds*\n\n"
-                    f"Order: `{order_id}`\nAmount needed: *{amount:,.2f} NGN*\n\n"
-                    f"👉 Top up your Paga business account balance."
+
+            final_code = response_code
+            final_msg  = message_txt
+            final_txn  = txn_id
+
+            for attempt in range(12):
+                await asyncio.sleep(10)
+                poll = await asyncio.get_event_loop().run_in_executor(
+                    None, check_status, ref
                 )
+                final_code = poll.get("responseCode", -1)
+                final_msg  = poll.get("message", "") or ""
+                final_txn  = poll.get("transactionId", "") or final_txn
+                logger.info(
+                    f"[Paga] Poll {attempt+1}/12 → code={final_code} "
+                    f"msg={final_msg} txnId={final_txn}"
+                )
+                if final_code == 0:
+                    break
+                if final_code not in (3, -1) and final_msg.upper() != "PENDING":
+                    break  # definitive failure
+
+            if final_code == 0:
+                await _paga_handle_success(
+                    bot, chat_id, order_id, pay_term,
+                    amount, holder_name, final_txn, ref
+                )
+            elif final_code == 3 or final_msg.upper() == "PENDING":
+                # Still pending after 2 min — notify but don't mark failed
+                await bot.send_message(chat_id=chat_id,
+                    text=(
+                        f"⏳ *Paga Still Pending After 2 Min*\n\n"
+                        f"Order: `{order_id}`\n"
+                        f"Reference: `{ref}`\n\n"
+                        f"Paga webhook will notify you when complete.\n"
+                        f"Check your Paga dashboard if no update arrives.\n"
+                        f"Do NOT mark Bybit order paid yet."
+                    ),
+                    parse_mode="Markdown")
             else:
-                fail_text = (
-                    f"❌ *Paga Transfer Failed*\n\n"
-                    f"Order: `{order_id}`\nCode: `{response_code}`\n"
-                    f"Message: `{message_txt[:200]}`\nMark order manually."
+                await _paga_handle_failure(
+                    bot, chat_id, order_id,
+                    account_no, bank_name or pay_type_name,
+                    amount, final_code, final_msg
                 )
-            await bot.send_message(chat_id=chat_id, text=fail_text, parse_mode="Markdown")
+        else:
+            # Immediate failure
+            await _paga_handle_failure(
+                bot, chat_id, order_id,
+                account_no, bank_name or pay_type_name,
+                amount, response_code, message_txt
+            )
 
     except Exception as e:
         logger.error(f"[Paga] _paga_autopay error: {e}")
@@ -1175,7 +1355,20 @@ async def _handle_buy_order(bot, chat_id, order_id):
 
         if paga_pay_enabled and order_id not in paid_order_ids:
             await asyncio.sleep(5)
-            await _paga_autopay(bot, chat_id, order_id, order_detail)
+            # ── Enqueue instead of calling directly ──
+            # This ensures orders are paid one at a time, preventing
+            # Paga rate-limit failures when multiple orders arrive at once.
+            pos = _enqueue_paga_order(bot, chat_id, order_id, order_detail)
+            if pos > 1:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"🟡 *Paga Queue* — Order `{order_id}` added\n"
+                        f"📋 Position: `{pos}` in queue\n"
+                        f"Will be processed after the current order completes."
+                    ),
+                    parse_mode="Markdown"
+                )
 
         elif flw_pay_enabled and order_id not in paid_order_ids:
             await asyncio.sleep(5)
@@ -2366,6 +2559,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # 🔧 BUILD BOT
 # ─────────────────────────────────────────
 def start_bot():
+    global _paga_queue, _paga_worker_task
+
     application = (
         ApplicationBuilder()
         .token(TELEGRAM_TOKEN)
@@ -2379,5 +2574,15 @@ def start_bot():
     application.add_handler(CommandHandler("pingpaga",        ping_paga_command))
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+
+    # ── Initialise Paga payment queue + start worker ──
+    # Must run inside the event loop context — use post_init hook
+    async def _post_init(app):
+        global _paga_queue, _paga_worker_task
+        _paga_queue       = asyncio.Queue()
+        _paga_worker_task = asyncio.create_task(_paga_queue_worker())
+        logger.info("🟡 Paga payment queue worker started")
+
+    application.post_init = _post_init
     logger.info("🤖 Bot handlers registered")
     return application
