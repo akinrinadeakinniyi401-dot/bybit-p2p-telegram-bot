@@ -215,8 +215,10 @@ def validate_account(account_number: str, bank_uuid: str, amount: float = 100) -
             "NGN",          # currency
             bank_uuid,      # destination_bank_uuid
             account_number, # destination_bank_acct_no
+            "",             # recipient_phone_number
+            None,           # recipient_operator_code
             None,           # recipient_email
-            None,           # recipient_name
+            "",             # recipient_name
             "en"            # locale
         ))
         _log_full("VALIDATE_DEPOSIT_TO_BANK", response)
@@ -303,9 +305,11 @@ def deposit_to_bank(
             "NGN",                       # currency
             bank_uuid,                   # destination_bank_uuid
             account_number,              # destination_bank_acct_no
-            recipient_phone or None,     # recipient_phone_number
+            recipient_phone or "",       # recipient_phone_number
+            None,                        # recipient_operator_code
             None,                        # recipient_email
-            recipient_name or None,      # recipient_name
+            recipient_name or "",        # recipient_name
+            "en"                         # locale
         ))
         _log_full("DEPOSIT_TO_BANK", response)
         response["_ref"] = ref
