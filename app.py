@@ -188,6 +188,14 @@ async def run_bot_setup(render_url):
 
     bot = start_bot()
     await bot.initialize()
+
+    # ── Ensure Paga queue worker is running ──
+    import bot as bot_module
+    if bot_module._paga_queue is None:
+        bot_module._paga_queue = asyncio.Queue()
+    if bot_module._paga_worker_task is None or bot_module._paga_worker_task.done():
+        bot_module._paga_worker_task = asyncio.create_task(bot_module._paga_queue_worker())
+        logger.info("🟡 Paga payment queue worker started from app.py")
     await bot.bot.set_webhook(url=webhook_url)
     await bot.bot.set_my_commands([
         BotCommand("start",            "🤖 Start the bot"),
