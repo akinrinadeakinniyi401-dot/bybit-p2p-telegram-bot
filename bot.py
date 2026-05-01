@@ -51,6 +51,12 @@ user_settings = {
     "sender_name":  "Akinrinade Akinniyi",
 }
 
+# ── My Bybit account identity (auto-detected from first message I send) ──
+# Used by chat monitor to filter out own messages.
+# Bybit uses accountId (not userId) to identify the sender in chat messages.
+_my_account_id: str = ""    # auto-learned from outgoing messages
+_my_nick:       str = ""    # auto-learned from outgoing messages
+
 ad_data               = {}
 user_state            = {}   # keys: "action", "prev_section"
 refresh_task          = None
@@ -1280,9 +1286,17 @@ def _get_active_order_ids() -> set:
 async def _poll_order_chat(bot, chat_id: int, order_id: str):
     """
     Fetch latest messages for one order.
-    Forward any new messages to Telegram with a Reply button.
+    Forward only NEW messages from the counterparty to Telegram.
+
+    Own-message detection (multi-layer — all must fail to forward):
+      1. accountId  matches _my_account_id  (most reliable — learned automatically)
+      2. userId     matches bybit_uid setting
+      3. nickName   matches _my_nick        (learned automatically)
+      4. msgType    >= 5 → admin/system     (skip always)
+      5. roleType   == "sys"                (skip always)
+      6. onlyForCustomer == 1               (skip — internal system note)
     """
-    global seen_chat_msg_ids
+    global _my_account_id, _my_nick, seen_chat_msg_ids
 
     try:
         result = await asyncio.get_event_loop().run_in_executor(
@@ -1292,54 +1306,106 @@ async def _poll_order_chat(bot, chat_id: int, order_id: str):
         if rc != 0:
             return
 
-        messages = result.get("result", {}).get("result", [])
+        # Bybit wraps messages in result.result (list)
+        inner   = result.get("result", {})
+        messages = inner.get("result", inner) if isinstance(inner, dict) else inner
         if not isinstance(messages, list):
             return
 
         if order_id not in seen_chat_msg_ids:
-            # First poll — seed the seen set with existing IDs so we don't
-            # spam old messages on startup
+            # First poll — auto-learn my own accountId and nick from messages
+            # by finding messages that match my bybit_uid (userId field)
+            my_uid = str(user_settings.get("bybit_uid", ""))
+            for m in messages:
+                uid = str(m.get("userId", ""))
+                if my_uid and uid == my_uid:
+                    acct = str(m.get("accountId", ""))
+                    nick = str(m.get("nickName", ""))
+                    if acct and not _my_account_id:
+                        _my_account_id = acct
+                        logger.info(f"[ChatMonitor] Auto-learned my accountId={acct}")
+                    if nick and not _my_nick:
+                        _my_nick = nick
+                        logger.info(f"[ChatMonitor] Auto-learned my nick='{nick}'")
+                    break
+            # Seed seen set — don't forward old messages on startup
             seen_chat_msg_ids[order_id] = {str(m.get("id", "")) for m in messages}
             return
 
         already_seen = seen_chat_msg_ids[order_id]
-        # Messages come newest-first — reverse to forward in chronological order
-        for msg in reversed(messages):
-            msg_id   = str(msg.get("id", ""))
-            msg_type = msg.get("msgType", 0)
-            content  = msg.get("message", "").strip()
-            nick     = msg.get("nickName", "Unknown")
-            user_id  = str(msg.get("userId", ""))
-            role     = msg.get("roleType", "")
+        my_uid = str(user_settings.get("bybit_uid", ""))
 
-            # Skip: already seen, system messages, empty, admin/system roles
+        # Reverse: messages are newest-first, forward in chronological order
+        for msg in reversed(messages):
+            msg_id          = str(msg.get("id", ""))
+            msg_type        = int(msg.get("msgType", 0))
+            content         = str(msg.get("message", "")).strip()
+            nick            = str(msg.get("nickName", "Unknown"))
+            user_id         = str(msg.get("userId", ""))
+            account_id      = str(msg.get("accountId", ""))
+            role            = str(msg.get("roleType", ""))
+            only_customer   = int(msg.get("onlyForCustomer", 0))
+
+            # ── Always skip if already seen ──
             if msg_id in already_seen:
                 continue
-            if msg_type == 0 or role == "sys":
-                already_seen.add(msg_id)
-                continue
-            if not content:
-                already_seen.add(msg_id)
-                continue
 
+            # Mark seen immediately so we never double-process
             already_seen.add(msg_id)
 
-            # Determine message type label
-            type_label = {1: "💬 Text", 2: "🖼 Image", 5: "💬 Text", 7: "📄 PDF", 8: "🎥 Video"}.get(msg_type, "💬")
-
-            # My own userId — don't forward my own messages back to myself
-            my_uid = str(user_settings.get("bybit_uid", ""))
-            if my_uid and user_id == my_uid:
+            # ── Layer 1: Skip system / admin message types ──
+            # msgType 0=system, 5=text(admin), 6=image(admin)
+            if msg_type in (0, 5, 6):
                 continue
 
-            # Truncate very long messages
+            # ── Layer 2: Skip system role ──
+            if role == "sys":
+                continue
+
+            # ── Layer 3: Skip internal-only notes ──
+            if only_customer == 1:
+                continue
+
+            # ── Layer 4: Skip empty content ──
+            if not content:
+                continue
+
+            # ── Layer 5: Skip my own messages (accountId — most reliable) ──
+            if _my_account_id and account_id == _my_account_id:
+                # Also update my nick while we're here
+                if nick and not _my_nick:
+                    _my_nick = nick
+                logger.debug(f"[ChatMonitor] Skipping own msg {msg_id} (accountId match)")
+                continue
+
+            # ── Layer 6: Skip my own messages (userId fallback) ──
+            if my_uid and user_id == my_uid:
+                # Auto-learn accountId if we didn't have it yet
+                if account_id and not _my_account_id:
+                    _my_account_id = account_id
+                    logger.info(f"[ChatMonitor] Auto-learned my accountId={account_id} from userId match")
+                if nick and not _my_nick:
+                    _my_nick = nick
+                logger.debug(f"[ChatMonitor] Skipping own msg {msg_id} (userId match)")
+                continue
+
+            # ── Layer 7: Skip my own messages (nick fallback) ──
+            if _my_nick and nick == _my_nick:
+                logger.debug(f"[ChatMonitor] Skipping own msg {msg_id} (nick match '{nick}')")
+                continue
+
+            # ── This is a counterparty message — forward it ──
+            type_label = {
+                1: "💬", 2: "🖼 Image", 7: "📄 PDF", 8: "🎥 Video"
+            }.get(msg_type, "💬")
+
             display_content = content if len(content) <= 300 else content[:297] + "..."
 
             text = (
                 f"💬 *New Bybit Message*\n\n"
                 f"🆔 Order: `{order_id}`\n"
                 f"👤 From: *{nick}*\n"
-                f"{type_label}: _{display_content}_"
+                f"{type_label} _{display_content}_"
             )
 
             reply_kb = InlineKeyboardMarkup([[
@@ -1355,7 +1421,10 @@ async def _poll_order_chat(bot, chat_id: int, order_id: str):
                 reply_markup=reply_kb,
                 parse_mode="Markdown"
             )
-            logger.info(f"[ChatMonitor] Forwarded msg {msg_id} from '{nick}' on order {order_id}")
+            logger.info(
+                f"[ChatMonitor] ✅ Forwarded msg {msg_id} from '{nick}' "
+                f"(acctId={account_id}) on order {order_id}"
+            )
 
     except Exception as e:
         logger.error(f"[ChatMonitor] _poll_order_chat {order_id} error: {e}")
@@ -2019,6 +2088,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_monitor_task = None
         seen_chat_msg_ids.clear()
         reply_state.clear()
+        global _my_account_id, _my_nick
+        _my_account_id = ""
+        _my_nick       = ""
         if refresh_task:      refresh_task.cancel();      refresh_task = None
         if order_monitor_task: order_monitor_task.cancel(); order_monitor_task = None
         current_price = Decimal("0"); ad_data.clear()
