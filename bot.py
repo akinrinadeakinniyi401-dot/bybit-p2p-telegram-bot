@@ -15,7 +15,8 @@ from bybit import (
     get_pending_orders, get_sell_orders, get_incoming_sell_orders, get_order_detail,
     get_counterparty_info, mark_order_paid,
     send_chat_message, get_payment_name, release_assets,
-    set_active_account, get_active_account, get_all_accounts
+    set_active_account, get_active_account, get_all_accounts,
+    get_chat_messages,
 )
 
 logger = logging.getLogger(__name__)
@@ -86,6 +87,14 @@ buyer_protection_threshold = 30   # minutes — configurable
 
 # ── Name Match settings ──
 name_match_enabled = False
+
+# ── Chat Monitor settings ──
+# Tracks the last seen message ID per order to avoid duplicate notifications
+# Format: { order_id: set_of_seen_message_ids }
+chat_monitor_enabled   = False
+chat_monitor_task      = None
+seen_chat_msg_ids: dict = {}     # { order_id: set(msg_id, ...) }
+reply_state: dict       = {}     # { admin_chat_id: {"order_id": ..., "order_nick": ...} }
 
 SELLER_WARN_MSG = (
     "Dear seller, your average release time is too long, I can't proceed with the payment. "
@@ -312,8 +321,10 @@ def ads_section_text():
 def orders_section_keyboard():
     mon      = "🔔 Stop Monitoring" if order_monitor_running else "🔕 Start Monitoring"
     sell_tog = "✉️ Sell Msg: ON — tap to OFF" if sell_msg_enabled else "✉️ Sell Msg: OFF — tap to ON"
+    chat_tog = "💬 Chat Monitor: ON ✅ — tap to OFF" if chat_monitor_enabled else "💬 Chat Monitor: OFF ❌ — tap to ON"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(mon,                        callback_data="toggle_order_monitor")],
+        [InlineKeyboardButton(chat_tog,                   callback_data="toggle_chat_monitor")],
         [InlineKeyboardButton("📋 Check Orders Now",      callback_data="check_orders_now")],
         [InlineKeyboardButton("🗑 Clear Seen Orders",     callback_data="clear_seen_orders")],
         [InlineKeyboardButton(sell_tog,                   callback_data="toggle_sell_msg")],
@@ -332,12 +343,14 @@ def orders_section_text():
     ap_status = "💳 ON — auto marking orders paid" if auto_pay_enabled else "💳 OFF — manual only"
     sm_status = f"✅ ON — sending {sell_msg_count}x per order" if sell_msg_enabled else "❌ OFF"
     msg_preview = sell_custom_msg[:60] + "..." if len(sell_custom_msg) > 60 else sell_custom_msg
+    chat_status = "💬 ON — forwarding messages every 12s" if chat_monitor_enabled else "💬 OFF"
     return (
         "📦 *ORDER MONITOR*\n\n"
         f"Status: {status}\n"
         f"BUY orders seen: `{seen_buy}` | Marked paid: `{paid}`\n"
         f"SELL orders seen: `{seen_sell}` | Released: `{released}`\n\n"
         f"Auto-Pay (BUY): {ap_status}\n\n"
+        f"💬 *Chat Monitor:* {chat_status}\n\n"
         f"✉️ *Sell Order Message: {sm_status}*\n"
         f"Message (`{sell_msg_count}x`): _{msg_preview}_\n\n"
         "_BUY orders → Mark as Paid buttons_\n"
@@ -1244,6 +1257,136 @@ async def _paga_autopay(bot, chat_id, order_id, order_detail):
             parse_mode="Markdown")
 
 
+# ─────────────────────────────────────────
+# 💬 CHAT MONITOR — Poll Bybit order chats
+# Fetches new messages every 12 seconds for all active orders.
+# Forwards new messages to Telegram with a Reply button.
+# ─────────────────────────────────────────
+
+def _get_active_order_ids() -> set:
+    """Return all order IDs currently being tracked (buy + sell, not yet released)."""
+    active = set()
+    # All buy orders seen but not yet paid/cancelled
+    active.update(seen_order_ids - paid_order_ids)
+    # All sell orders seen but not yet released
+    for oid in seen_sell_order_ids:
+        if not oid.startswith("paid_") and oid not in released_order_ids:
+            active.add(oid)
+    # Also include recently paid buy orders (seller may still message)
+    active.update(paid_order_ids)
+    return active
+
+
+async def _poll_order_chat(bot, chat_id: int, order_id: str):
+    """
+    Fetch latest messages for one order.
+    Forward any new messages to Telegram with a Reply button.
+    """
+    global seen_chat_msg_ids
+
+    try:
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, get_chat_messages, order_id, "1", "30"
+        )
+        rc = result.get("retCode", result.get("ret_code", -1))
+        if rc != 0:
+            return
+
+        messages = result.get("result", {}).get("result", [])
+        if not isinstance(messages, list):
+            return
+
+        if order_id not in seen_chat_msg_ids:
+            # First poll — seed the seen set with existing IDs so we don't
+            # spam old messages on startup
+            seen_chat_msg_ids[order_id] = {str(m.get("id", "")) for m in messages}
+            return
+
+        already_seen = seen_chat_msg_ids[order_id]
+        # Messages come newest-first — reverse to forward in chronological order
+        for msg in reversed(messages):
+            msg_id   = str(msg.get("id", ""))
+            msg_type = msg.get("msgType", 0)
+            content  = msg.get("message", "").strip()
+            nick     = msg.get("nickName", "Unknown")
+            user_id  = str(msg.get("userId", ""))
+            role     = msg.get("roleType", "")
+
+            # Skip: already seen, system messages, empty, admin/system roles
+            if msg_id in already_seen:
+                continue
+            if msg_type == 0 or role == "sys":
+                already_seen.add(msg_id)
+                continue
+            if not content:
+                already_seen.add(msg_id)
+                continue
+
+            already_seen.add(msg_id)
+
+            # Determine message type label
+            type_label = {1: "💬 Text", 2: "🖼 Image", 5: "💬 Text", 7: "📄 PDF", 8: "🎥 Video"}.get(msg_type, "💬")
+
+            # My own userId — don't forward my own messages back to myself
+            my_uid = str(user_settings.get("bybit_uid", ""))
+            if my_uid and user_id == my_uid:
+                continue
+
+            # Truncate very long messages
+            display_content = content if len(content) <= 300 else content[:297] + "..."
+
+            text = (
+                f"💬 *New Bybit Message*\n\n"
+                f"🆔 Order: `{order_id}`\n"
+                f"👤 From: *{nick}*\n"
+                f"{type_label}: _{display_content}_"
+            )
+
+            reply_kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "↩️ Reply",
+                    callback_data=f"chatreply_{order_id}_{nick[:20]}"
+                )
+            ]])
+
+            await bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                reply_markup=reply_kb,
+                parse_mode="Markdown"
+            )
+            logger.info(f"[ChatMonitor] Forwarded msg {msg_id} from '{nick}' on order {order_id}")
+
+    except Exception as e:
+        logger.error(f"[ChatMonitor] _poll_order_chat {order_id} error: {e}")
+
+
+async def chat_monitor_loop(bot, chat_id: int):
+    """Background loop — polls all active order chats every 12 seconds."""
+    global chat_monitor_enabled
+    chat_monitor_enabled = True
+    logger.info("💬 CHAT MONITOR STARTED")
+
+    while chat_monitor_enabled:
+        try:
+            active_ids = _get_active_order_ids()
+            if active_ids:
+                tasks = [
+                    asyncio.create_task(_poll_order_chat(bot, chat_id, oid))
+                    for oid in active_ids
+                ]
+                results = await asyncio.gather(*tasks, return_exceptions=True)
+                for r in results:
+                    if isinstance(r, Exception):
+                        logger.error(f"[ChatMonitor] Task error: {r}")
+        except Exception as e:
+            logger.error(f"[ChatMonitor] Loop error: {e}")
+
+        await asyncio.sleep(12)
+
+    logger.info("💬 CHAT MONITOR STOPPED")
+
+
 async def order_monitor_loop(bot, chat_id):
     global order_monitor_running
     order_monitor_running = True
@@ -1766,6 +1909,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global unpaid_orders_log
     global buyer_protection_enabled, buyer_protection_threshold
     global name_match_enabled
+    global chat_monitor_enabled, chat_monitor_task, seen_chat_msg_ids, reply_state
 
     query   = update.callback_query
     await query.answer()
@@ -1869,6 +2013,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         refresh_running = False; order_monitor_running = False
         auto_pay_enabled = False; flw_pay_enabled = False; paga_pay_enabled = False
         buyer_protection_enabled = False; name_match_enabled = False
+        chat_monitor_enabled = False
+        if chat_monitor_task:
+            chat_monitor_task.cancel()
+            chat_monitor_task = None
+        seen_chat_msg_ids.clear()
+        reply_state.clear()
         if refresh_task:      refresh_task.cancel();      refresh_task = None
         if order_monitor_task: order_monitor_task.cancel(); order_monitor_task = None
         current_price = Decimal("0"); ad_data.clear()
@@ -2067,6 +2217,64 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "clear_unpaid_log":
         unpaid_orders_log.clear()
         await edit_menu(query, "✅ Unpaid orders log cleared.", InlineKeyboardMarkup(back_section("section_autopay")))
+
+    # ── 💬 Toggle Chat Monitor ──
+    elif data == "toggle_chat_monitor":
+        global chat_monitor_task, chat_monitor_enabled
+        if chat_monitor_enabled:
+            chat_monitor_enabled = False
+            if chat_monitor_task:
+                chat_monitor_task.cancel()
+                chat_monitor_task = None
+            await edit_menu(query,
+                "💬 *Chat Monitor stopped.*\n\n" + orders_section_text(),
+                orders_section_keyboard()
+            )
+        else:
+            chat_monitor_task = asyncio.create_task(
+                chat_monitor_loop(context.bot, chat_id)
+            )
+            await edit_menu(query,
+                "💬 *Chat Monitor started!*\nPolling Bybit order chats every 12 seconds.\n\n"
+                + orders_section_text(),
+                orders_section_keyboard()
+            )
+
+    # ── ↩️ Chat Reply — set reply state ──
+    elif data.startswith("chatreply_"):
+        # Format: chatreply_{order_id}_{nick}
+        parts    = data.split("_", 2)
+        order_id = parts[1] if len(parts) > 1 else ""
+        nick     = parts[2] if len(parts) > 2 else "counterparty"
+        reply_state[chat_id] = {"order_id": order_id, "nick": nick}
+        user_state["action"]       = "chat_reply"
+        user_state["prev_section"] = "section_orders"
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"↩️ *Reply to {nick}*\n"
+                f"Order: `{order_id}`\n\n"
+                "Type your message and send it.\n"
+                "_Tap ❌ Cancel to cancel._"
+            ),
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Cancel Reply", callback_data="cancel_chat_reply")
+            ]]),
+            parse_mode="Markdown"
+        )
+
+    # ── ❌ Cancel Chat Reply ──
+    elif data == "cancel_chat_reply":
+        reply_state.pop(chat_id, None)
+        user_state["action"] = None
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text="❌ Reply cancelled.",
+        )
 
     # ── 🔔 Toggle Order Monitor ──
     elif data == "toggle_order_monitor":
@@ -2453,7 +2661,32 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Reply with success message + back-to-previous button."""
         await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=back_prev(prev))
 
-    if action == "ad_id":
+    if action == "chat_reply":
+        state    = reply_state.pop(update.message.chat_id, {})
+        order_id = state.get("order_id", "")
+        nick     = state.get("nick", "counterparty")
+        user_state["action"] = None
+        if not order_id:
+            await update.message.reply_text("❌ No active reply state. Tap Reply on a message first.")
+            return
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, send_chat_message, order_id, text
+        )
+        rc = result.get("retCode", result.get("ret_code", -1))
+        if rc == 0:
+            await update.message.reply_text(
+                f"✅ *Message sent to {nick}*\n\nOrder: `{order_id}`\n💬 _{text[:200]}_",
+                parse_mode="Markdown"
+            )
+            logger.info(f"[ChatReply] Sent to order {order_id}: {text[:100]}")
+        else:
+            await update.message.reply_text(
+                f"❌ Failed to send message\n`{result.get('retMsg', result.get('ret_msg',''))}`",
+                parse_mode="Markdown"
+            )
+        return
+
+    elif action == "ad_id":
         user_settings["ad_id"] = text
         ad_data.clear()
         user_state["action"] = None
