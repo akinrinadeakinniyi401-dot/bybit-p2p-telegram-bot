@@ -192,34 +192,36 @@ def get_my_ads() -> dict:
 def get_pending_orders() -> dict:
     return _post("/v5/p2p/order/pending/simplifyList", {
         "status": 10,
-        "side":   0,      # I am the buyer
+        "side":   0,
         "page":   1,
         "size":   30
     })
 
 
 # ─────────────────────────────────────────
-# 📦 Get SELL orders awaiting release (status=20, side=1 — buyer paid, I release)
+# 📦 Get SELL orders awaiting release (status=20, side=1)
 # ─────────────────────────────────────────
 def get_sell_orders() -> dict:
     return _post("/v5/p2p/order/pending/simplifyList", {
         "status": 20,
-        "side":   1,      # I am the seller, buyer already paid
+        "side":   1,
         "page":   1,
         "size":   30
     })
 
 
 # ─────────────────────────────────────────
-# 📦 Get incoming SELL orders (status=10, side=1 — buyer hasn't paid yet)
+# 📦 Get incoming SELL orders (status=10, side=1)
 # ─────────────────────────────────────────
 def get_incoming_sell_orders() -> dict:
     return _post("/v5/p2p/order/pending/simplifyList", {
         "status": 10,
-        "side":   1,      # I am the seller, waiting for buyer to pay
+        "side":   1,
         "page":   1,
         "size":   30
     })
+
+
 def get_order_detail(order_id: str) -> dict:
     return _post("/v5/p2p/order/info", {"orderId": order_id})
 
@@ -248,11 +250,11 @@ def mark_order_paid(order_id: str, payment_type: str, payment_id: str) -> dict:
 
 # ─────────────────────────────────────────
 # 🪙 Release Assets (SELL orders)
-# POST /v5/p2p/order/finish
 # ─────────────────────────────────────────
 def release_assets(order_id: str) -> dict:
     logger.info(f"[Bybit] Releasing assets for order: {order_id}")
     return _post("/v5/p2p/order/finish", {"orderId": order_id})
+
 
 # ─────────────────────────────────────────
 # 💬 Send Chat Message
@@ -264,6 +266,32 @@ def send_chat_message(order_id: str, message: str) -> dict:
         "message":     message,
         "contentType": "str",
         "msgUuid":     uuid.uuid4().hex
+    })
+
+
+# ─────────────────────────────────────────
+# 💬 Get Chat Messages
+# POST /v5/p2p/order/message/listpage
+#
+# msgType values:
+#   0 = system message      (skip — not from counterparty)
+#   1 = text (user)         ✅ forward
+#   2 = image (user)        ✅ forward
+#   5 = text (admin)        skip
+#   6 = image (admin)       skip
+#   7 = pdf (user)          ✅ forward
+#   8 = video (user)        ✅ forward
+#
+# Messages are returned newest-first.
+# Use currentPage="1" + size="30" to always get the latest batch.
+# Compare message IDs against seen set to avoid duplicates.
+# ─────────────────────────────────────────
+def get_chat_messages(order_id: str, page: str = "1", size: str = "30") -> dict:
+    logger.info(f"[Bybit] get_chat_messages: order={order_id} page={page}")
+    return _post("/v5/p2p/order/message/listpage", {
+        "orderId":     order_id,
+        "currentPage": page,
+        "size":        size,
     })
 
 
