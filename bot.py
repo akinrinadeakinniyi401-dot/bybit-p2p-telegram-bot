@@ -2220,7 +2220,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── 💬 Toggle Chat Monitor ──
     elif data == "toggle_chat_monitor":
-        global chat_monitor_task, chat_monitor_enabled
         if chat_monitor_enabled:
             chat_monitor_enabled = False
             if chat_monitor_task:
