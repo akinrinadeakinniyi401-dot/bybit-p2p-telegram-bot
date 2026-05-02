@@ -361,23 +361,50 @@ def post_new_ad(
 
 
 # ─────────────────────────────────────────
-# 🗑 Remove Ad (cancel/delist)
+# 🗑 Permanently Delete Ad
 # POST /v5/p2p/item/cancel
+# Completely removes the ad — cannot be brought back
 # ─────────────────────────────────────────
 def remove_ad(ad_id: str) -> dict:
-    logger.info(f"[Bybit] Remove ad: {ad_id}")
+    logger.info(f"[Bybit] Permanently delete ad: {ad_id}")
     return _post("/v5/p2p/item/cancel", {"itemId": ad_id})
 
 
 # ─────────────────────────────────────────
-# 🔴 Take Ad Offline (CANCEL / delist)
+# 🔴 Take Ad Offline (pause/delist temporarily)
 # POST /v5/p2p/item/update with actionType=CANCEL
-# Same Ad ID — does NOT create a new ad
+# Ad stays in system — can be brought back with actionType=LISTING
 # ─────────────────────────────────────────
-def take_ad_offline(ad_id: str, ad_data: dict) -> dict:
-    """Take ad offline (status 20) without deleting it. Same Ad ID."""
-    logger.info(f"[Bybit] Take offline: {ad_id}")
-    return _post("/v5/p2p/item/update", {"id": ad_id, "actionType": "CANCEL"})
+def take_ad_offline(ad_id: str, ad_data: dict = None) -> dict:
+    """Pause ad (take offline). Same Ad ID. Can be re-listed with put_ad_online."""
+    logger.info(f"[Bybit] Take ad offline (pause): {ad_id}")
+    ad_data = ad_data or {}
+    payment_terms = ad_data.get("paymentTerms", [])
+    payment_ids   = [str(pt["id"]) for pt in payment_terms if pt.get("id")]
+    tps           = ad_data.get("tradingPreferenceSet", {})
+    trading_pref  = {k: str(tps.get(k, "0")) for k in [
+        "hasUnPostAd","isKyc","isEmail","isMobile","hasRegisterTime",
+        "registerTimeThreshold","orderFinishNumberDay30","completeRateDay30",
+        "hasOrderFinishNumberDay30","hasCompleteRateDay30","hasNationalLimit"
+    ]}
+    trading_pref["nationalLimit"] = str(tps.get("nationalLimit", ""))
+    body = {
+        "id":            ad_id,
+        "actionType":    "CANCEL",
+        "priceType":     str(ad_data.get("priceType", "0")),
+        "price":         str(ad_data.get("price", "")),
+        "premium":       str(ad_data.get("premium", "")),
+        "minAmount":     str(ad_data.get("minAmount", "")),
+        "maxAmount":     str(ad_data.get("maxAmount", "")),
+        "quantity":      str(ad_data.get("lastQuantity", ad_data.get("quantity", ""))),
+        "paymentIds":    payment_ids,
+        "paymentPeriod": str(ad_data.get("paymentPeriod", "15")),
+        "remark":        str(ad_data.get("remark", "")),
+        "tradingPreferenceSet": trading_pref,
+    }
+    result = _post("/v5/p2p/item/update", body)
+    logger.info(f"[Bybit] Take offline result: {result}")
+    return result
 
 
 # ─────────────────────────────────────────
