@@ -16,7 +16,7 @@ from bybit import (
     get_counterparty_info, mark_order_paid,
     send_chat_message, get_payment_name, release_assets,
     set_active_account, get_active_account, get_all_accounts,
-    get_chat_messages,
+    get_chat_messages, post_new_ad, remove_ad,
 )
 
 logger = logging.getLogger(__name__)
@@ -266,6 +266,10 @@ def ads_section_keyboard():
     if ad_loaded:
         rows.append([InlineKeyboardButton("🔄 Update Once Now", callback_data="update_now")])
 
+    rows.append([
+        InlineKeyboardButton("📢 Post Ad (clone)",  callback_data="post_ad_prompt"),
+        InlineKeyboardButton("🗑 Remove Ad",         callback_data="remove_ad_confirm"),
+    ])
     rows.append([InlineKeyboardButton(status, callback_data="toggle_refresh")])
     rows += back_main()
     return InlineKeyboardMarkup(rows)
@@ -592,14 +596,24 @@ def format_sell_order_message(order_detail: dict, buyer_info: dict) -> str:
     )
 
 
-def order_buttons(order_id: str) -> InlineKeyboardMarkup:
+def order_buttons(order_id: str, autopay_failed: bool = False) -> InlineKeyboardMarkup | None:
+    """
+    BUY order buttons.
+    - If auto-pay succeeded → return None (no buttons — order is handled)
+    - If auto-pay failed or manual → show Mark Paid buttons
+    """
+    if not autopay_failed and order_id in paid_order_ids:
+        return None   # already paid — remove buttons
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Mark as Paid", callback_data=f"pay_{order_id}")],
+        [InlineKeyboardButton("✅ Mark as Paid",            callback_data=f"pay_{order_id}")],
         [InlineKeyboardButton("⚠️ Paid + Warn Seller 🐌", callback_data=f"paywarn_{order_id}")],
     ])
 
 
-def sell_order_buttons(order_id: str) -> InlineKeyboardMarkup:
+def sell_order_buttons(order_id: str) -> InlineKeyboardMarkup | None:
+    """SELL order buttons — disappear once coins are released."""
+    if order_id in released_order_ids:
+        return None
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🪙 RELEASE COIN", callback_data=f"release_{order_id}")],
     ])
@@ -1372,26 +1386,33 @@ async def _poll_order_chat(bot, chat_id: int, order_id: str):
 
             # ── Layer 5: Skip my own messages (accountId — most reliable) ──
             if _my_account_id and account_id == _my_account_id:
-                # Also update my nick while we're here
                 if nick and not _my_nick:
                     _my_nick = nick
-                logger.debug(f"[ChatMonitor] Skipping own msg {msg_id} (accountId match)")
+                logger.info(f"[ChatMonitor] ⏭ Skipping OWN msg {msg_id} (accountId={account_id})")
                 continue
 
             # ── Layer 6: Skip my own messages (userId fallback) ──
             if my_uid and user_id == my_uid:
-                # Auto-learn accountId if we didn't have it yet
                 if account_id and not _my_account_id:
                     _my_account_id = account_id
                     logger.info(f"[ChatMonitor] Auto-learned my accountId={account_id} from userId match")
                 if nick and not _my_nick:
                     _my_nick = nick
-                logger.debug(f"[ChatMonitor] Skipping own msg {msg_id} (userId match)")
+                logger.info(f"[ChatMonitor] ⏭ Skipping OWN msg {msg_id} (userId={user_id})")
                 continue
 
             # ── Layer 7: Skip my own messages (nick fallback) ──
             if _my_nick and nick == _my_nick:
-                logger.debug(f"[ChatMonitor] Skipping own msg {msg_id} (nick match '{nick}')")
+                logger.info(f"[ChatMonitor] ⏭ Skipping OWN msg {msg_id} (nick='{nick}')")
+                continue
+
+            # ── Layer 8: Also skip if accountId matches bybit_uid numerically ──
+            # Some Bybit accounts have userId == accountId
+            if my_uid and account_id == my_uid:
+                if not _my_account_id:
+                    _my_account_id = account_id
+                    logger.info(f"[ChatMonitor] Auto-learned accountId={account_id} (matches bybit_uid)")
+                logger.info(f"[ChatMonitor] ⏭ Skipping OWN msg {msg_id} (accountId==bybit_uid)")
                 continue
 
             # ── This is a counterparty message — forward it ──
@@ -1432,8 +1453,8 @@ async def _poll_order_chat(bot, chat_id: int, order_id: str):
 
 async def chat_monitor_loop(bot, chat_id: int):
     """Background loop — polls all active order chats every 12 seconds."""
-    global chat_monitor_enabled
-    chat_monitor_enabled = True
+    # Note: chat_monitor_enabled is set to True by the toggle handler BEFORE
+    # this task is created, so the UI reflects the change immediately.
     logger.info("💬 CHAT MONITOR STARTED")
 
     while chat_monitor_enabled:
@@ -2101,6 +2122,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for k, v in [("ad_id",""),("bybit_uid",""),("mode","fixed"),
                      ("increment","0.05"),("float_pct",""),("ngn_usdt_ref",""),("interval",2)]:
             user_settings[k] = v
+        user_settings.pop("manage_ad_id",   None)
+        user_settings.pop("manage_ad_data", None)
+        user_settings.pop("post_ad_qty",    None)
         await edit_menu(query,
             "✅ *Session reset!* All settings cleared.\n\nTap /menu to start fresh.",
             InlineKeyboardMarkup(back_main())
@@ -2302,6 +2326,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 orders_section_keyboard()
             )
         else:
+            # Set flag BEFORE creating task so UI reflects it immediately
+            chat_monitor_enabled = True
             chat_monitor_task = asyncio.create_task(
                 chat_monitor_loop(context.bot, chat_id)
             )
@@ -2362,8 +2388,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             order_monitor_task = asyncio.create_task(
                 order_monitor_loop(context.bot, chat_id)
             )
+            # order_monitor_running is set to True inside the loop itself,
+            # but we set it here immediately so the UI reflects it instantly
+            order_monitor_running = True
             await edit_menu(query,
-                "🔔 *Order monitoring started!*\nChecking every 10 seconds.\n\n" + orders_section_text(),
+                "🔔 *Order monitoring started!*\nChecking every 10 seconds.\n\n"
+                + orders_section_text(),
                 orders_section_keyboard()
             )
 
@@ -2599,6 +2629,208 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await edit_menu(query, f"❌ `{rc}` — `{rm}`", InlineKeyboardMarkup(back_section("section_ads")))
 
+    # ── 📢 Post Ad — independent from auto-update ──
+    # Uses its own manage_ad_id and manage_ad_data, never touches user_settings["ad_id"] or ad_data
+    elif data == "post_ad_prompt":
+        manage_id   = user_settings.get("manage_ad_id", "")
+        manage_info = user_settings.get("manage_ad_data", {})
+        cur_id_line = f"Current Manage Ad ID: `{manage_id}`" if manage_id else "No Manage Ad ID set yet."
+        await edit_menu(query,
+            f"📢 *Post / Remove Ad Manager*\n\n"
+            f"This section is *completely separate* from the Auto Price Update.\n"
+            f"It uses its own Ad ID — setting it here will NOT affect your auto-update.\n\n"
+            f"{cur_id_line}\n\n"
+            f"Steps:\n"
+            f"1️⃣ Set a Manage Ad ID (the ad you want to clone or remove)\n"
+            f"2️⃣ Fetch its details\n"
+            f"3️⃣ Post (clone it as a new ad) or Remove it\n",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("🆔 Set Manage Ad ID",    callback_data="set_manage_ad_id")],
+                [InlineKeyboardButton("📋 Fetch Manage Ad",     callback_data="fetch_manage_ad")],
+                [InlineKeyboardButton("✅ Post (Clone) Ad",     callback_data="post_ad_do")],
+                [InlineKeyboardButton("✏️ Custom Quantity",     callback_data="post_ad_qty")],
+                [InlineKeyboardButton("🗑 Remove This Ad",      callback_data="remove_ad_confirm")],
+                *back_section("section_ads"),
+            ])
+        )
+
+    elif data == "set_manage_ad_id":
+        user_state["action"]       = "manage_ad_id"
+        user_state["prev_section"] = "section_ads"
+        cur = user_settings.get("manage_ad_id", "") or "Not set"
+        await edit_menu(query,
+            f"🆔 *Set Manage Ad ID*\n\n"
+            f"Current: `{cur}`\n\n"
+            f"This is the Ad ID used for *Post* and *Remove* only.\n"
+            f"⚠️ This is separate from the Auto-Update Ad ID (`{user_settings.get('ad_id','not set')}`).\n\n"
+            f"Send the Bybit Ad ID you want to manage.\n"
+            f"Example: `2040156088201854976`",
+            InlineKeyboardMarkup(back_section("section_ads"))
+        )
+
+    elif data == "fetch_manage_ad":
+        manage_id = user_settings.get("manage_ad_id", "")
+        if not manage_id:
+            await edit_menu(query,
+                "❌ Set a Manage Ad ID first (tap 🆔 Set Manage Ad ID).",
+                InlineKeyboardMarkup(back_section("section_ads"))
+            )
+            return
+        await edit_menu(query, f"⏳ Fetching ad `{manage_id}`...", InlineKeyboardMarkup(back_section("section_ads")))
+        result = await asyncio.get_event_loop().run_in_executor(None, get_ad_details, manage_id)
+        rc     = result.get("retCode", result.get("ret_code", -1))
+        if rc == 0:
+            mdata   = result.get("result", {})
+            user_settings["manage_ad_data"] = mdata
+            token    = mdata.get("tokenId", "—")
+            currency = mdata.get("currencyId", "—")
+            side_val = "BUY" if str(mdata.get("side", "1")) == "0" else "SELL"
+            stat     = {10:"🟢 Online", 20:"🔴 Offline", 30:"✅ Done"}.get(mdata.get("status"), "?")
+            await edit_menu(query,
+                f"✅ *Manage Ad Loaded!*\n\n"
+                f"🆔 `{manage_id}`\n"
+                f"💱 `{token}/{currency}` | Side: `{side_val}`\n"
+                f"💲 Price: `{mdata.get('price','—')}` | Qty: `{mdata.get('lastQuantity', mdata.get('quantity','—'))}`\n"
+                f"Min: `{mdata.get('minAmount','—')}` | Max: `{mdata.get('maxAmount','—')}`\n"
+                f"Status: {stat}\n\n"
+                f"_Ready to Post (clone) or Remove._",
+                InlineKeyboardMarkup([
+                    [InlineKeyboardButton("✅ Post (Clone) Ad",  callback_data="post_ad_do")],
+                    [InlineKeyboardButton("🗑 Remove This Ad",   callback_data="remove_ad_confirm")],
+                    *back_section("section_ads"),
+                ])
+            )
+        else:
+            await edit_menu(query,
+                f"❌ `{result.get('retMsg', result.get('ret_msg',''))}`",
+                InlineKeyboardMarkup(back_section("section_ads"))
+            )
+
+    elif data == "post_ad_do":
+        mdata = user_settings.get("manage_ad_data", {})
+        if not mdata:
+            await edit_menu(query,
+                "❌ *No manage ad loaded.*\n\nTap 📋 Fetch Manage Ad first.",
+                InlineKeyboardMarkup(back_section("section_ads"))
+            )
+            return
+        await edit_menu(query, "⏳ Posting new ad...", InlineKeyboardMarkup(back_section("section_ads")))
+
+        tps          = mdata.get("tradingPreferenceSet", {})
+        trading_pref = {k: str(tps.get(k, "0")) for k in [
+            "hasUnPostAd","isKyc","isEmail","isMobile","hasRegisterTime",
+            "registerTimeThreshold","orderFinishNumberDay30","completeRateDay30",
+            "hasOrderFinishNumberDay30","hasCompleteRateDay30","hasNationalLimit"
+        ]}
+        trading_pref["nationalLimit"] = str(tps.get("nationalLimit", ""))
+
+        pay_terms   = mdata.get("paymentTerms", [])
+        payment_ids = [str(pt["id"]) for pt in pay_terms if pt.get("id")]
+        qty = user_settings.get("post_ad_qty", "") or \
+              str(mdata.get("lastQuantity", mdata.get("quantity", "")))
+
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, post_new_ad,
+            mdata.get("tokenId", ""),
+            mdata.get("currencyId", ""),
+            str(mdata.get("side", "1")),
+            str(mdata.get("priceType", "0")),
+            str(mdata.get("premium", "0")),
+            str(mdata.get("price", "")),
+            str(mdata.get("minAmount", "")),
+            str(mdata.get("maxAmount", "")),
+            qty,
+            payment_ids,
+            str(mdata.get("paymentPeriod", "15")),
+            str(mdata.get("remark", "")),
+            trading_pref,
+            str(mdata.get("itemType", "ORIGIN")),
+        )
+        rc      = result.get("retCode", result.get("ret_code", -1))
+        rm      = result.get("retMsg",  result.get("ret_msg", ""))
+        item_id = result.get("result", {}).get("itemId", "")
+        if rc == 0:
+            await edit_menu(query,
+                f"✅ *New Ad Posted!*\n\n"
+                f"🆔 New Item ID: `{item_id}`\n\n"
+                f"Your new ad is now live on Bybit P2P.\n"
+                f"Auto-Update Ad ID is unchanged: `{user_settings.get('ad_id','not set')}`",
+                InlineKeyboardMarkup(back_section("section_ads"))
+            )
+        else:
+            await edit_menu(query,
+                f"❌ *Failed to post ad*\n\nCode: `{rc}`\nMessage: `{rm}`",
+                InlineKeyboardMarkup(back_section("section_ads"))
+            )
+        user_settings.pop("post_ad_qty", None)
+
+    elif data == "post_ad_qty":
+        user_state["action"]       = "post_ad_qty"
+        user_state["prev_section"] = "section_ads"
+        mdata   = user_settings.get("manage_ad_data", {})
+        cur_qty = mdata.get("lastQuantity", mdata.get("quantity", "—")) if mdata else "—"
+        await edit_menu(query,
+            f"✏️ *Custom Quantity for New Ad*\n\n"
+            f"Manage ad current quantity: `{cur_qty}`\n\n"
+            "Send the token quantity for the new ad.\n"
+            "Example: `5000`",
+            InlineKeyboardMarkup(back_section("section_ads"))
+        )
+
+    # ── 🗑 Remove Ad — uses manage_ad_id, NOT auto-update ad_id ──
+    elif data == "remove_ad_confirm":
+        manage_id = user_settings.get("manage_ad_id", "")
+        if not manage_id:
+            await edit_menu(query,
+                "❌ No Manage Ad ID set.\n\nTap 📢 Post/Remove Ad → Set Manage Ad ID first.",
+                InlineKeyboardMarkup(back_section("section_ads"))
+            )
+            return
+        auto_id = user_settings.get("ad_id", "")
+        same_warn = (
+            f"\n\n⚠️ *This is the same as your Auto-Update Ad ID!*\n"
+            f"The auto-update will keep running — stop it manually if needed."
+        ) if manage_id == auto_id else ""
+        await edit_menu(query,
+            f"🗑 *Remove Ad?*\n\n"
+            f"Manage Ad ID: `{manage_id}`\n"
+            f"Auto-Update Ad ID: `{auto_id or 'not set'}` (unchanged)\n"
+            f"{same_warn}\n\n"
+            f"⚠️ This permanently delists the manage ad from Bybit P2P.\n"
+            f"Are you sure?",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Yes, Remove It", callback_data="remove_ad_do")],
+                [InlineKeyboardButton("❌ Cancel",         callback_data="post_ad_prompt")],
+            ])
+        )
+
+    elif data == "remove_ad_do":
+        manage_id = user_settings.get("manage_ad_id", "")
+        if not manage_id:
+            await edit_menu(query, "❌ No Manage Ad ID set.", InlineKeyboardMarkup(back_section("section_ads")))
+            return
+        await edit_menu(query, f"⏳ Removing ad `{manage_id}`...", InlineKeyboardMarkup(back_section("section_ads")))
+
+        # ── Never touch auto-update state here ──
+        result = await asyncio.get_event_loop().run_in_executor(None, remove_ad, manage_id)
+        rc     = result.get("retCode", result.get("ret_code", -1))
+        rm     = result.get("retMsg",  result.get("ret_msg", ""))
+        if rc == 0:
+            # Clear manage ad data but leave auto-update untouched
+            user_settings.pop("manage_ad_data", None)
+            await edit_menu(query,
+                f"✅ *Ad Removed!*\n\n"
+                f"Manage Ad `{manage_id}` has been delisted from Bybit P2P.\n\n"
+                f"Auto-Update Ad ID `{user_settings.get('ad_id','not set')}` is unchanged.\n"
+                f"Auto-price update continues running if it was active.",
+                InlineKeyboardMarkup(back_section("section_ads"))
+            )
+        else:
+            await edit_menu(query,
+                f"❌ *Failed to remove ad*\n\nCode: `{rc}`\nMessage: `{rm}`",
+                InlineKeyboardMarkup(back_section("section_ads"))
+            )
+
     # ── 🟢/🔴 Toggle Price Update ──
     elif data == "toggle_refresh":
         if refresh_running:
@@ -2653,6 +2885,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if result.get("retCode", result.get("ret_code",-1)) == 0:
             paid_order_ids.add(order_id)
+            # Remove the pay buttons from the original message
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
             await context.bot.send_message(chat_id=chat_id,
                 text=f"✅ *Order marked as paid!*\n`{order_id}`", parse_mode="Markdown")
         else:
@@ -2691,6 +2928,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             warn = "✅ Warning sent to seller" \
                    if mr.get("retCode", mr.get("ret_code",-1)) == 0 \
                    else f"⚠️ Warning failed: `{mr.get('retMsg','')}`"
+            # Remove the pay buttons from the original message
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
             await context.bot.send_message(chat_id=chat_id,
                 text=f"✅ *Order paid!* `{order_id}`\n{warn}", parse_mode="Markdown")
         else:
@@ -2707,6 +2949,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ret_msg  = result.get("retMsg",  result.get("ret_msg",  ""))
         if ret_code == 0:
             released_order_ids.add(order_id)
+            # Remove the release button from the original message
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
             await context.bot.send_message(chat_id=chat_id,
                 text=f"🪙 *Coins released!*\n\nOrder: `{order_id}`\nBuyer has received their coins. ✅",
                 parse_mode="Markdown")
@@ -2732,7 +2979,20 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Reply with success message + back-to-previous button."""
         await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=back_prev(prev))
 
-    if action == "chat_reply":
+    if action == "manage_ad_id":
+        user_settings["manage_ad_id"] = text.strip()
+        user_settings.pop("manage_ad_data", None)   # clear old manage ad data
+        user_state["action"] = None
+        auto_id = user_settings.get("ad_id", "not set")
+        await reply_with_back(
+            f"✅ *Manage Ad ID saved!*\n\n"
+            f"Manage Ad ID: `{text.strip()}`\n"
+            f"Auto-Update Ad ID: `{auto_id}` (unchanged)\n\n"
+            f"Now tap *📢 Post/Remove Ad* → *📋 Fetch Manage Ad* to load its details."
+        )
+        return
+
+    elif action == "chat_reply":
         state    = reply_state.pop(update.message.chat_id, {})
         order_id = state.get("order_id", "")
         nick     = state.get("nick", "counterparty")
@@ -2843,6 +3103,19 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await reply_with_back(f"✅ *Message count saved!*\n\nWill send `{val}x` per sell order.")
         except Exception:
             await update.message.reply_text("❌ Send a number between `1` and `5`", parse_mode="Markdown")
+
+    elif action == "post_ad_qty":
+        try:
+            val = Decimal(text)
+            if val <= 0: raise ValueError
+            user_settings["post_ad_qty"] = text
+            user_state["action"] = None
+            await reply_with_back(
+                f"✅ *Custom quantity set:* `{text}`\n\n"
+                "Now tap *📢 Post Ad (clone)* → *Confirm Post* to post the ad."
+            )
+        except Exception:
+            await update.message.reply_text("❌ Send a positive number like `5000`", parse_mode="Markdown")
 
     elif action == "bp_custom_threshold":
         try:
