@@ -274,8 +274,7 @@ def ads_section_keyboard():
         rows.append([InlineKeyboardButton("🔄 Update Once Now", callback_data="update_now")])
 
     rows.append([
-        InlineKeyboardButton("📢 Post Ad (clone)",  callback_data="post_ad_prompt"),
-        InlineKeyboardButton("🗑 Remove Ad",         callback_data="remove_ad_confirm"),
+        InlineKeyboardButton("📢 Post / Remove Ad",  callback_data="post_ad_prompt"),
     ])
     rows.append([InlineKeyboardButton(status, callback_data="toggle_refresh")])
     rows += back_main()
@@ -1309,13 +1308,9 @@ async def _poll_order_chat(bot, chat_id: int, order_id: str):
     Fetch latest messages for one order.
     Forward only NEW messages from the counterparty to Telegram.
 
-    Own-message detection (multi-layer — all must fail to forward):
-      1. accountId  matches _my_account_id  (most reliable — learned automatically)
-      2. userId     matches bybit_uid setting
-      3. nickName   matches _my_nick        (learned automatically)
-      4. msgType    >= 5 → admin/system     (skip always)
-      5. roleType   == "sys"                (skip always)
-      6. onlyForCustomer == 1               (skip — internal system note)
+    Own-message detection uses bybit_uid (set in AD PRICE BOT → Set UID) as the
+    primary identifier, checked against both userId and accountId fields in the message.
+    Auto-learns accountId and nick from the first matching message for faster future matching.
     """
     global _my_account_id, _my_nick, seen_chat_msg_ids
 
@@ -1328,105 +1323,82 @@ async def _poll_order_chat(bot, chat_id: int, order_id: str):
             return
 
         # Bybit wraps messages in result.result (list)
-        inner   = result.get("result", {})
+        inner    = result.get("result", {})
         messages = inner.get("result", inner) if isinstance(inner, dict) else inner
         if not isinstance(messages, list):
             return
 
+        my_uid = str(user_settings.get("bybit_uid", "")).strip()
+
         if order_id not in seen_chat_msg_ids:
-            # First poll — auto-learn my own accountId and nick from messages
-            # by finding messages that match my bybit_uid (userId field)
-            my_uid = str(user_settings.get("bybit_uid", ""))
+            # First poll — learn my accountId and nick by matching bybit_uid
             for m in messages:
-                uid = str(m.get("userId", ""))
-                if my_uid and uid == my_uid:
-                    acct = str(m.get("accountId", ""))
-                    nick = str(m.get("nickName", ""))
+                uid  = str(m.get("userId",    ""))
+                acct = str(m.get("accountId", ""))
+                nck  = str(m.get("nickName",  ""))
+                # Match on userId OR accountId
+                if my_uid and (uid == my_uid or acct == my_uid):
                     if acct and not _my_account_id:
                         _my_account_id = acct
-                        logger.info(f"[ChatMonitor] Auto-learned my accountId={acct}")
-                    if nick and not _my_nick:
-                        _my_nick = nick
-                        logger.info(f"[ChatMonitor] Auto-learned my nick='{nick}'")
+                        logger.info(f"[ChatMonitor] Learned my accountId={acct} nick='{nck}'")
+                    if nck and not _my_nick:
+                        _my_nick = nck
                     break
-            # Seed seen set — don't forward old messages on startup
+            # Seed seen IDs — do not forward existing messages on startup
             seen_chat_msg_ids[order_id] = {str(m.get("id", "")) for m in messages}
             return
 
         already_seen = seen_chat_msg_ids[order_id]
-        my_uid = str(user_settings.get("bybit_uid", ""))
 
-        # Reverse: messages are newest-first, forward in chronological order
+        # Reverse: messages are newest-first — forward in chronological order
         for msg in reversed(messages):
-            msg_id          = str(msg.get("id", ""))
-            msg_type        = int(msg.get("msgType", 0))
-            content         = str(msg.get("message", "")).strip()
-            nick            = str(msg.get("nickName", "Unknown"))
-            user_id         = str(msg.get("userId", ""))
-            account_id      = str(msg.get("accountId", ""))
-            role            = str(msg.get("roleType", ""))
-            only_customer   = int(msg.get("onlyForCustomer", 0))
+            msg_id       = str(msg.get("id",              ""))
+            msg_type     = int(msg.get("msgType",         0))
+            content      = str(msg.get("message",        "")).strip()
+            nick         = str(msg.get("nickName",   "Unknown"))
+            user_id      = str(msg.get("userId",          ""))
+            account_id   = str(msg.get("accountId",       ""))
+            role         = str(msg.get("roleType",        ""))
+            only_cust    = int(msg.get("onlyForCustomer", 0))
 
-            # ── Always skip if already seen ──
             if msg_id in already_seen:
                 continue
-
-            # Mark seen immediately so we never double-process
             already_seen.add(msg_id)
 
-            # ── Layer 1: Skip system / admin message types ──
-            # msgType 0=system, 5=text(admin), 6=image(admin)
+            # ── Skip system/admin types ──
             if msg_type in (0, 5, 6):
                 continue
-
-            # ── Layer 2: Skip system role ──
             if role == "sys":
                 continue
-
-            # ── Layer 3: Skip internal-only notes ──
-            if only_customer == 1:
+            if only_cust == 1:
                 continue
-
-            # ── Layer 4: Skip empty content ──
             if not content:
                 continue
 
-            # ── Layer 5: Skip my own messages (accountId — most reliable) ──
-            if _my_account_id and account_id == _my_account_id:
-                if nick and not _my_nick:
-                    _my_nick = nick
-                logger.info(f"[ChatMonitor] ⏭ Skipping OWN msg {msg_id} (accountId={account_id})")
-                continue
-
-            # ── Layer 6: Skip my own messages (userId fallback) ──
-            if my_uid and user_id == my_uid:
+            # ── Primary filter: bybit_uid matches userId OR accountId ──
+            # This is the most reliable check — uses the UID you explicitly set
+            if my_uid and (user_id == my_uid or account_id == my_uid):
+                # Also learn accountId for future faster matching
                 if account_id and not _my_account_id:
                     _my_account_id = account_id
-                    logger.info(f"[ChatMonitor] Auto-learned my accountId={account_id} from userId match")
                 if nick and not _my_nick:
                     _my_nick = nick
-                logger.info(f"[ChatMonitor] ⏭ Skipping OWN msg {msg_id} (userId={user_id})")
+                logger.info(f"[ChatMonitor] ⏭ Own msg {msg_id} (uid match: userId={user_id} acctId={account_id})")
                 continue
 
-            # ── Layer 7: Skip my own messages (nick fallback) ──
+            # ── Secondary filter: learned accountId ──
+            if _my_account_id and account_id == _my_account_id:
+                logger.info(f"[ChatMonitor] ⏭ Own msg {msg_id} (accountId match={account_id})")
+                continue
+
+            # ── Tertiary filter: learned nick ──
             if _my_nick and nick == _my_nick:
-                logger.info(f"[ChatMonitor] ⏭ Skipping OWN msg {msg_id} (nick='{nick}')")
-                continue
-
-            # ── Layer 8: Also skip if accountId matches bybit_uid numerically ──
-            # Some Bybit accounts have userId == accountId
-            if my_uid and account_id == my_uid:
-                if not _my_account_id:
-                    _my_account_id = account_id
-                    logger.info(f"[ChatMonitor] Auto-learned accountId={account_id} (matches bybit_uid)")
-                logger.info(f"[ChatMonitor] ⏭ Skipping OWN msg {msg_id} (accountId==bybit_uid)")
+                logger.info(f"[ChatMonitor] ⏭ Own msg {msg_id} (nick match='{nick}')")
                 continue
 
             # ── This is a counterparty message — forward it ──
-            type_label = {
-                1: "💬", 2: "🖼 Image", 7: "📄 PDF", 8: "🎥 Video"
-            }.get(msg_type, "💬")
-
+            logger.info(f"[ChatMonitor] ✅ Forwarding msg {msg_id} from '{nick}' (userId={user_id} acctId={account_id})")
+            type_label = {1: "💬", 2: "🖼 Image", 7: "📄 PDF", 8: "🎥 Video"}.get(msg_type, "💬")
             display_content = content if len(content) <= 300 else content[:297] + "..."
 
             text = (
@@ -2354,7 +2326,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_state["action"]       = "chat_reply"
         user_state["prev_section"] = "section_orders"
         try:
-            await query.edit_message_reply_markup(reply_markup=None)
+            await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([]))
         except Exception:
             pass
         await context.bot.send_message(
@@ -2637,46 +2609,42 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await edit_menu(query, f"❌ `{rc}` — `{rm}`", InlineKeyboardMarkup(back_section("section_ads")))
 
     # ── 📢 Post/Remove Ad Manager — independent from auto-update ──
+    # ── 📢 Post / Remove Ad Manager ──
     elif data == "post_ad_prompt":
-        manage_id   = user_settings.get("manage_ad_id", "")
-        mdata       = user_settings.get("manage_ad_data", {})
+        manage_id = user_settings.get("manage_ad_id", "")
+        mdata     = user_settings.get("manage_ad_data", {})
         cur_id_line = f"Manage Ad ID: `{manage_id}`" if manage_id else "⚠️ No Manage Ad ID set yet."
         if mdata:
-            stat    = {10:"🟢 Online", 20:"🔴 Offline", 30:"✅ Done"}.get(mdata.get("status"), "?")
-            loaded  = (
-                f"\n📋 *Loaded:* `{mdata.get('tokenId','—')}/{mdata.get('currencyId','—')}` "
-                f"| {stat} | 💲`{mdata.get('price','—')}`"
-            )
+            stat   = {10:"🟢 Online", 20:"🔴 Offline", 30:"✅ Done"}.get(mdata.get("status"), "?")
+            loaded = f"\nStatus: {stat} | 💲`{mdata.get('price','—')}`"
         else:
-            loaded = "\n_No ad fetched yet — tap Fetch Manage Ad._"
+            loaded = "\n_No ad fetched yet._"
         await edit_menu(query,
             f"📢 *Post / Remove Ad Manager*\n\n"
             f"⚠️ Completely separate from Auto-Update.\n"
             f"Setting IDs here will NOT affect your auto-price bot.\n\n"
             f"{cur_id_line}{loaded}\n\n"
-            f"Steps:\n"
-            f"1️⃣ Set Manage Ad ID\n"
-            f"2️⃣ Fetch its details\n"
-            f"3️⃣ Repost (take offline → back online) OR Remove it",
+            f"• *Post Ad* — brings an OFFLINE ad back online (same ID)\n"
+            f"• *Remove Ad* — takes an ONLINE ad offline (same ID)",
             InlineKeyboardMarkup([
-                [InlineKeyboardButton("🆔 Set Manage Ad ID",     callback_data="set_manage_ad_id")],
-                [InlineKeyboardButton("📋 Fetch Manage Ad",      callback_data="fetch_manage_ad")],
-                [InlineKeyboardButton("🔄 Repost Ad (same ID)",  callback_data="repost_ad_confirm")],
-                [InlineKeyboardButton("🗑 Remove This Ad",       callback_data="remove_ad_confirm")],
+                [InlineKeyboardButton("🆔 Set Manage Ad ID",       callback_data="set_manage_ad_id")],
+                [InlineKeyboardButton("📋 Fetch Manage Ad",        callback_data="fetch_manage_ad")],
+                [InlineKeyboardButton("🟢 Post Ad (go online)",    callback_data="post_ad_do")],
+                [InlineKeyboardButton("🔴 Remove Ad (go offline)", callback_data="remove_ad_confirm")],
                 *back_section("section_ads"),
             ])
         )
 
     elif data == "set_manage_ad_id":
         user_state["action"]       = "manage_ad_id"
-        user_state["prev_section"] = "post_ad_prompt"   # back to manager
+        user_state["prev_section"] = "post_ad_prompt"
         cur     = user_settings.get("manage_ad_id", "") or "Not set"
         auto_id = user_settings.get("ad_id", "not set")
         await edit_menu(query,
             f"🆔 *Set Manage Ad ID*\n\n"
             f"Current Manage Ad ID: `{cur}`\n"
-            f"Auto-Update Ad ID: `{auto_id}` (will not change)\n\n"
-            f"Send the Bybit Ad ID you want to repost or remove.\n"
+            f"Auto-Update Ad ID: `{auto_id}` (unchanged)\n\n"
+            f"Send the Bybit Ad ID you want to post or remove.\n"
             f"Example: `2040156088201854976`",
             InlineKeyboardMarkup(back_manager())
         )
@@ -2684,16 +2652,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "fetch_manage_ad":
         manage_id = user_settings.get("manage_ad_id", "")
         if not manage_id:
-            await edit_menu(query,
-                "❌ Set a Manage Ad ID first.",
-                InlineKeyboardMarkup(back_manager())
-            )
+            await edit_menu(query, "❌ Set a Manage Ad ID first.", InlineKeyboardMarkup(back_manager()))
             return
         await edit_menu(query, f"⏳ Fetching ad `{manage_id}`...", InlineKeyboardMarkup(back_manager()))
         result = await asyncio.get_event_loop().run_in_executor(None, get_ad_details, manage_id)
-        rc     = result.get("retCode", result.get("ret_code", -1))
+        rc = result.get("retCode", result.get("ret_code", -1))
         if rc == 0:
-            mdata   = result.get("result", {})
+            mdata = result.get("result", {})
             user_settings["manage_ad_data"] = mdata
             token    = mdata.get("tokenId", "—")
             currency = mdata.get("currencyId", "—")
@@ -2706,10 +2671,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"💲 Price: `{mdata.get('price','—')}` | Qty: `{mdata.get('lastQuantity', mdata.get('quantity','—'))}`\n"
                 f"Min: `{mdata.get('minAmount','—')}` | Max: `{mdata.get('maxAmount','—')}`\n"
                 f"Status: {stat}\n\n"
-                f"_Ready to Repost or Remove._",
+                f"_Tap Post Ad if offline, or Remove Ad if online._",
                 InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 Repost Ad (same ID)", callback_data="repost_ad_confirm")],
-                    [InlineKeyboardButton("🗑 Remove This Ad",      callback_data="remove_ad_confirm")],
+                    [InlineKeyboardButton("🟢 Post Ad (go online)",    callback_data="post_ad_do")],
+                    [InlineKeyboardButton("🔴 Remove Ad (go offline)", callback_data="remove_ad_confirm")],
                     *back_manager(),
                 ])
             )
@@ -2719,132 +2684,88 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardMarkup(back_manager())
             )
 
-    # ── 🔄 Repost Ad — take offline then bring same ID back online ──
-    elif data == "repost_ad_confirm":
+    # ── 🟢 Post Ad = bring offline ad back ONLINE (LISTING, same ID) ──
+    elif data == "post_ad_do":
         mdata     = user_settings.get("manage_ad_data", {})
         manage_id = user_settings.get("manage_ad_id", "")
         if not mdata or not manage_id:
-            await edit_menu(query,
-                "❌ Fetch Manage Ad details first.",
-                InlineKeyboardMarkup(back_manager())
-            )
+            await edit_menu(query, "❌ Fetch Manage Ad details first.", InlineKeyboardMarkup(back_manager()))
             return
-        stat     = {10:"🟢 Online", 20:"🔴 Offline"}.get(mdata.get("status"), "?")
-        auto_id  = user_settings.get("ad_id", "")
-        same_warn = (
-            f"\n\n⚠️ *This is also your Auto-Update Ad ID.*\n"
-            f"Auto-price update will keep running — it will re-update the price on next cycle."
-        ) if manage_id == auto_id else ""
-        await edit_menu(query,
-            f"🔄 *Repost Ad?*\n\n"
-            f"Ad ID: `{manage_id}` (unchanged — same ID)\n"
-            f"Current Status: {stat}\n\n"
-            f"This will:\n"
-            f"  1️⃣ Take the ad offline\n"
-            f"  2️⃣ Immediately bring it back online\n"
-            f"  Same Ad ID — no new ad created{same_warn}",
-            InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Yes, Repost It", callback_data="repost_ad_do")],
-                [InlineKeyboardButton("❌ Cancel",         callback_data="post_ad_prompt")],
-            ])
-        )
-
-    elif data == "repost_ad_do":
-        mdata     = user_settings.get("manage_ad_data", {})
-        manage_id = user_settings.get("manage_ad_id", "")
-        if not mdata or not manage_id:
-            await edit_menu(query, "❌ No manage ad loaded.", InlineKeyboardMarkup(back_manager()))
-            return
-        await edit_menu(query, f"⏳ Taking ad offline...", InlineKeyboardMarkup(back_manager()))
-
-        # Step 1: Take offline
-        r1  = await asyncio.get_event_loop().run_in_executor(None, take_ad_offline, manage_id, mdata)
-        rc1 = r1.get("retCode", r1.get("ret_code", -1))
-        if rc1 != 0:
-            await edit_menu(query,
-                f"❌ *Failed to take ad offline*\n\n"
-                f"Code: `{rc1}` | `{r1.get('retMsg', r1.get('ret_msg',''))}`",
-                InlineKeyboardMarkup(back_manager())
-            )
-            return
-
-        # Step 2: Brief pause then bring back online
-        await asyncio.sleep(2)
-        await edit_menu(query, f"⏳ Bringing ad back online...", InlineKeyboardMarkup(back_manager()))
-        r2  = await asyncio.get_event_loop().run_in_executor(None, put_ad_online, manage_id, mdata)
-        rc2 = r2.get("retCode", r2.get("ret_code", -1))
-        if rc2 == 0:
-            # Refresh manage_ad_data with latest status
+        await edit_menu(query, f"⏳ Posting ad `{manage_id}` back online...", InlineKeyboardMarkup(back_manager()))
+        result = await asyncio.get_event_loop().run_in_executor(None, put_ad_online, manage_id, mdata)
+        rc = result.get("retCode", result.get("ret_code", -1))
+        rm = result.get("retMsg",  result.get("ret_msg", ""))
+        if rc == 0:
             fresh = await asyncio.get_event_loop().run_in_executor(None, get_ad_details, manage_id)
             if fresh.get("retCode", -1) == 0:
                 user_settings["manage_ad_data"] = fresh.get("result", mdata)
             await edit_menu(query,
-                f"✅ *Ad Reposted!*\n\n"
+                f"✅ *Ad is now Online!*\n\n"
                 f"🆔 Ad ID: `{manage_id}` (same — unchanged)\n"
-                f"Ad is now back online on Bybit P2P.\n\n"
+                f"Your ad is live on Bybit P2P.\n\n"
                 f"Auto-Update Ad ID: `{user_settings.get('ad_id','not set')}` — unchanged.",
                 InlineKeyboardMarkup(back_manager())
             )
         else:
             await edit_menu(query,
-                f"⚠️ *Ad taken offline but failed to go back online*\n\n"
-                f"Code: `{rc2}` | `{r2.get('retMsg', r2.get('ret_msg',''))}`\n\n"
-                f"Ad ID: `{manage_id}`\n"
-                f"Go to Bybit P2P to manually relist it.",
+                f"❌ *Failed to post ad online*\n\nCode: `{rc}`\nMessage: `{rm}`",
                 InlineKeyboardMarkup(back_manager())
             )
 
-    # ── 🗑 Remove Ad — uses manage_ad_id, never touches auto-update ──
+    # ── 🔴 Remove Ad = take online ad OFFLINE (CANCEL, same ID) ──
     elif data == "remove_ad_confirm":
         manage_id = user_settings.get("manage_ad_id", "")
         if not manage_id:
             await edit_menu(query,
-                "❌ No Manage Ad ID set.\n\nTap 🆔 Set Manage Ad ID first.",
+                "❌ No Manage Ad ID set. Tap 🆔 Set Manage Ad ID first.",
                 InlineKeyboardMarkup(back_manager())
             )
             return
         auto_id   = user_settings.get("ad_id", "")
         same_warn = (
             f"\n\n⚠️ *This is also your Auto-Update Ad ID.*\n"
-            f"Auto-price update will keep running after removal — stop it manually if needed."
+            f"Stop auto-price update manually if needed."
         ) if manage_id == auto_id else ""
         await edit_menu(query,
-            f"🗑 *Remove Ad?*\n\n"
+            f"🔴 *Remove Ad (go offline)?*\n\n"
             f"Manage Ad ID: `{manage_id}`\n"
             f"Auto-Update Ad ID: `{auto_id or 'not set'}` (unchanged)\n"
             f"{same_warn}\n\n"
-            f"⚠️ This permanently delists this ad from Bybit P2P.\n"
-            f"Are you sure?",
+            f"Ad will go offline. Same ID — not deleted.\n"
+            f"Bring it back anytime with Post Ad.",
             InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Yes, Remove It", callback_data="remove_ad_do")],
-                [InlineKeyboardButton("❌ Cancel",         callback_data="post_ad_prompt")],
+                [InlineKeyboardButton("✅ Yes, Take Offline", callback_data="remove_ad_do")],
+                [InlineKeyboardButton("❌ Cancel",            callback_data="post_ad_prompt")],
             ])
         )
 
     elif data == "remove_ad_do":
+        mdata     = user_settings.get("manage_ad_data", {})
         manage_id = user_settings.get("manage_ad_id", "")
         if not manage_id:
             await edit_menu(query, "❌ No Manage Ad ID set.", InlineKeyboardMarkup(back_manager()))
             return
-        await edit_menu(query, f"⏳ Removing ad `{manage_id}`...", InlineKeyboardMarkup(back_manager()))
-
-        result = await asyncio.get_event_loop().run_in_executor(None, remove_ad, manage_id)
-        rc     = result.get("retCode", result.get("ret_code", -1))
-        rm     = result.get("retMsg",  result.get("ret_msg", ""))
+        await edit_menu(query, f"⏳ Taking ad `{manage_id}` offline...", InlineKeyboardMarkup(back_manager()))
+        result = await asyncio.get_event_loop().run_in_executor(None, take_ad_offline, manage_id, mdata)
+        rc = result.get("retCode", result.get("ret_code", -1))
+        rm = result.get("retMsg",  result.get("ret_msg", ""))
         if rc == 0:
-            user_settings.pop("manage_ad_data", None)
+            fresh = await asyncio.get_event_loop().run_in_executor(None, get_ad_details, manage_id)
+            if fresh.get("retCode", -1) == 0:
+                user_settings["manage_ad_data"] = fresh.get("result", mdata)
             await edit_menu(query,
-                f"✅ *Ad Removed!*\n\n"
-                f"Manage Ad `{manage_id}` has been permanently delisted.\n\n"
-                f"Auto-Update Ad ID `{user_settings.get('ad_id','not set')}` — unchanged.\n"
-                f"Auto-price update continues if it was running.",
+                f"✅ *Ad is now Offline!*\n\n"
+                f"🆔 Ad ID: `{manage_id}` (same — not deleted)\n"
+                f"Bring it back online anytime with Post Ad.\n\n"
+                f"Auto-Update Ad ID: `{user_settings.get('ad_id','not set')}` — unchanged.",
                 InlineKeyboardMarkup(back_manager())
             )
         else:
             await edit_menu(query,
-                f"❌ *Failed to remove ad*\n\nCode: `{rc}`\nMessage: `{rm}`",
+                f"❌ *Failed to take ad offline*\n\nCode: `{rc}`\nMessage: `{rm}`",
                 InlineKeyboardMarkup(back_manager())
             )
+
 
     # ── 🟢/🔴 Toggle Price Update ──
     elif data == "toggle_refresh":
@@ -2902,7 +2823,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             paid_order_ids.add(order_id)
             # Remove the pay buttons from the original message
             try:
-                await query.edit_message_reply_markup(reply_markup=None)
+                await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([]))
             except Exception:
                 pass
             await context.bot.send_message(chat_id=chat_id,
@@ -2945,7 +2866,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                    else f"⚠️ Warning failed: `{mr.get('retMsg','')}`"
             # Remove the pay buttons from the original message
             try:
-                await query.edit_message_reply_markup(reply_markup=None)
+                await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([]))
             except Exception:
                 pass
             await context.bot.send_message(chat_id=chat_id,
@@ -2966,7 +2887,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             released_order_ids.add(order_id)
             # Remove the release button from the original message
             try:
-                await query.edit_message_reply_markup(reply_markup=None)
+                await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([]))
             except Exception:
                 pass
             await context.bot.send_message(chat_id=chat_id,
