@@ -327,3 +327,43 @@ def modify_ad(ad_id: str, new_price: str, ad_data: dict) -> dict:
     result = _post("/v5/p2p/item/update", body)
     logger.info(f"[Bybit] MODIFY result: {result}")
     return result
+
+
+# ─────────────────────────────────────────
+# 📢 Post New Ad
+# POST /v5/p2p/item/create
+# Clones settings from an existing ad by itemId
+# ─────────────────────────────────────────
+def post_new_ad(
+    token_id: str, currency_id: str, side: str, price_type: str,
+    premium: str, price: str, min_amount: str, max_amount: str,
+    quantity: str, payment_ids: list, payment_period: str,
+    remark: str, trading_pref: dict, item_type: str = "ORIGIN"
+) -> dict:
+    body = {
+        "tokenId":      token_id,
+        "currencyId":   currency_id,
+        "side":         side,
+        "priceType":    price_type,
+        "premium":      premium,
+        "price":        price,
+        "minAmount":    min_amount,
+        "maxAmount":    max_amount,
+        "quantity":     quantity,
+        "paymentIds":   payment_ids,
+        "paymentPeriod": payment_period,
+        "remark":       remark,
+        "tradingPreferenceSet": trading_pref,
+        "itemType":     item_type,
+    }
+    logger.info(f"[Bybit] POST new ad: {token_id}/{currency_id} side={side} price={price}")
+    return _post("/v5/p2p/item/create", body)
+
+
+# ─────────────────────────────────────────
+# 🗑 Remove Ad (cancel/delist)
+# POST /v5/p2p/item/cancel
+# ─────────────────────────────────────────
+def remove_ad(ad_id: str) -> dict:
+    logger.info(f"[Bybit] Remove ad: {ad_id}")
+    return _post("/v5/p2p/item/cancel", {"itemId": ad_id})
