@@ -103,6 +103,9 @@ chat_monitor_task      = None
 seen_chat_msg_ids: dict = {}     # { order_id: set(msg_id, ...) }
 reply_state: dict       = {}     # { admin_chat_id: {"order_id": ..., "order_nick": ...} }
 
+# Stores { order_id: message_id } — lets auto-pay remove buttons from notification message
+order_msg_ids: dict = {}
+
 SELLER_WARN_MSG = (
     "Dear seller, your average release time is too long, I can't proceed with the payment. "
     "Kindly check your order page at the top right corner to request cancel. Thank you"
@@ -832,6 +835,7 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
                 pr       = await asyncio.get_event_loop().run_in_executor(None, mark_order_paid, order_id, pay_type, payment_id)
                 bybit_ok = pr.get("retCode", -1) == 0
             paid_order_ids.add(order_id)
+            await _remove_order_buttons(bot, chat_id, order_id)
             await bot.send_message(chat_id=chat_id,
                 text=(
                     f"✅ *FLW Payment SUCCESS*\n\nOrder: `{order_id}`\n"
@@ -960,6 +964,25 @@ def _enqueue_paga_order(bot, chat_id, order_id, order_detail):
     return pos
 
 
+async def _remove_order_buttons(bot, chat_id: int, order_id: str):
+    """
+    Remove the pay buttons from the BUY order notification message.
+    Called by auto-pay after success — no query object available.
+    """
+    msg_id = order_msg_ids.get(order_id)
+    if not msg_id:
+        return
+    try:
+        await bot.edit_message_reply_markup(
+            chat_id=chat_id,
+            message_id=msg_id,
+            reply_markup=InlineKeyboardMarkup([])
+        )
+        logger.info(f"[AutoPay] Removed buttons from order notification {order_id}")
+    except Exception as e:
+        logger.debug(f"[AutoPay] Could not remove buttons for {order_id}: {e}")
+
+
 # ─────────────────────────────────────────
 # 🟡 PAGA SUCCESS / FAILURE HELPERS
 # ─────────────────────────────────────────
@@ -976,6 +999,7 @@ async def _paga_handle_success(bot, chat_id, order_id, pay_term, amount, holder_
         bybit_ok = pr.get("retCode", -1) == 0
     paid_order_ids.add(order_id)
     logger.info(f"[Paga] ✅ SUCCESS: txnId={txn_id} | Bybit={bybit_ok}")
+    await _remove_order_buttons(bot, chat_id, order_id)
     await bot.send_message(chat_id=chat_id,
         text=(
             f"✅ *Paga Payment SUCCESS*\n\n"
@@ -1524,12 +1548,14 @@ async def _handle_buy_order(bot, chat_id, order_id):
                 seller_info = si.get("result", {})
 
         msg = format_order_message(order_detail, seller_info)
-        await bot.send_message(
+        sent_msg = await bot.send_message(
             chat_id=chat_id,
             text=f"🛒 *BUY Order — Pay Seller*\n{msg}",
             reply_markup=order_buttons(order_id),
             parse_mode="Markdown"
         )
+        # Store message_id so auto-pay can remove buttons without a query object
+        order_msg_ids[order_id] = sent_msg.message_id
 
         # ── Name Match check (Bybit auto-pay path) ──
         if name_match_enabled and (auto_pay_enabled or flw_pay_enabled or paga_pay_enabled):
@@ -1546,6 +1572,7 @@ async def _handle_buy_order(bot, chat_id, order_id):
                         None, mark_order_paid, order_id, pt, pid
                     )
                     paid_order_ids.add(order_id)
+                    await _remove_order_buttons(bot, chat_id, order_id)
                 await asyncio.get_event_loop().run_in_executor(
                     None, send_chat_message, order_id, NO_ACCOUNT_WARN_MSG
                 )
@@ -1607,6 +1634,7 @@ async def _handle_buy_order(bot, chat_id, order_id):
                 )
                 if pr.get("retCode", -1) == 0:
                     paid_order_ids.add(order_id)
+                    await _remove_order_buttons(bot, chat_id, order_id)
                     note = ""
                     if buyer_protection_enabled and release_mins >= buyer_protection_threshold:
                         await asyncio.get_event_loop().run_in_executor(
@@ -1823,14 +1851,25 @@ async def send_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def edit_menu(query, text: str, keyboard: InlineKeyboardMarkup):
-    """Edit the existing menu message (photo caption or plain text)."""
+    """Edit the existing menu message (photo caption or plain text).
+    Tries caption first (photo messages), falls back to text, then sends new message."""
+    # Try caption edit (for photo/banner messages)
     try:
         await query.edit_message_caption(caption=text, reply_markup=keyboard, parse_mode="Markdown")
+        return
     except Exception:
-        try:
-            await query.edit_message_text(text=text, reply_markup=keyboard, parse_mode="Markdown")
-        except Exception as e:
-            logger.warning(f"[edit_menu] {e}")
+        pass
+    # Try text edit (for plain text messages)
+    try:
+        await query.edit_message_text(text=text, reply_markup=keyboard, parse_mode="Markdown")
+        return
+    except Exception as e:
+        logger.warning(f"[edit_menu] edit failed: {e}")
+    # Last resort — send as new message
+    try:
+        await query.message.reply_text(text=text, reply_markup=keyboard, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"[edit_menu] send fallback also failed: {e}")
 
 
 # ─────────────────────────────────────────
@@ -1979,6 +2018,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global buyer_protection_enabled, buyer_protection_threshold
     global name_match_enabled
     global chat_monitor_enabled, chat_monitor_task, seen_chat_msg_ids, reply_state
+    global order_msg_ids
 
     query   = update.callback_query
     await query.answer()
@@ -2088,6 +2128,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chat_monitor_task = None
         seen_chat_msg_ids.clear()
         reply_state.clear()
+        order_msg_ids.clear()
         global _my_account_id, _my_nick
         _my_account_id = ""
         _my_nick       = ""
@@ -2624,8 +2665,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⚠️ Completely separate from Auto-Update.\n"
             f"Setting IDs here will NOT affect your auto-price bot.\n\n"
             f"{cur_id_line}{loaded}\n\n"
-            f"• *Post Ad* — brings an OFFLINE ad back online (same ID)\n"
-            f"• *Remove Ad* — takes an ONLINE ad offline (same ID)",
+            f"• *Post Ad* — brings a paused/offline ad back online (same ID)\n"
+            f"• *Remove Ad* — pauses/takes an online ad offline (same ID)",
             InlineKeyboardMarkup([
                 [InlineKeyboardButton("🆔 Set Manage Ad ID",       callback_data="set_manage_ad_id")],
                 [InlineKeyboardButton("📋 Fetch Manage Ad",        callback_data="fetch_manage_ad")],
@@ -2731,8 +2772,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Manage Ad ID: `{manage_id}`\n"
             f"Auto-Update Ad ID: `{auto_id or 'not set'}` (unchanged)\n"
             f"{same_warn}\n\n"
-            f"Ad will go offline. Same ID — not deleted.\n"
-            f"Bring it back anytime with Post Ad.",
+            f"Ad will be paused/taken offline. Same ID — not permanently deleted.\n"
+            f"Bring it back online anytime with Post Ad.",
             InlineKeyboardMarkup([
                 [InlineKeyboardButton("✅ Yes, Take Offline", callback_data="remove_ad_do")],
                 [InlineKeyboardButton("❌ Cancel",            callback_data="post_ad_prompt")],
@@ -2754,9 +2795,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if fresh.get("retCode", -1) == 0:
                 user_settings["manage_ad_data"] = fresh.get("result", mdata)
             await edit_menu(query,
-                f"✅ *Ad is now Offline!*\n\n"
+                f"✅ *Ad is now Offline (Paused)!*\n\n"
                 f"🆔 Ad ID: `{manage_id}` (same — not deleted)\n"
-                f"Bring it back online anytime with Post Ad.\n\n"
+                f"Bring it back online anytime using Post Ad.\n\n"
                 f"Auto-Update Ad ID: `{user_settings.get('ad_id','not set')}` — unchanged.",
                 InlineKeyboardMarkup(back_manager())
             )
