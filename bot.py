@@ -17,6 +17,7 @@ from bybit import (
     send_chat_message, get_payment_name, release_assets,
     set_active_account, get_active_account, get_all_accounts,
     get_chat_messages, post_new_ad, remove_ad,
+    take_ad_offline, put_ad_online,
 )
 
 logger = logging.getLogger(__name__)
@@ -219,6 +220,11 @@ def back_section(section: str):
     return [[InlineKeyboardButton(f"⬅️ Back — {labels.get(section,'Back')}", callback_data=section)]]
 
 
+def back_manager():
+    """Back button that returns to the Post/Remove Ad Manager."""
+    return [[InlineKeyboardButton("⬅️ Back — 📢 Post/Remove Manager", callback_data="post_ad_prompt")]]
+
+
 def back_prev(prev: str):
     """Back to previous section button — used after text input success."""
     labels = {
@@ -226,6 +232,7 @@ def back_prev(prev: str):
         "section_orders":  "📦 Order Monitor",
         "section_autopay": "💳 Auto-Pay",
         "main_menu":       "🏠 Main Menu",
+        "post_ad_prompt":  "📢 Post/Remove Manager",
     }
     label = labels.get(prev, "⬅️ Back")
     return InlineKeyboardMarkup([[InlineKeyboardButton(f"⬅️ Back to {label}", callback_data=prev)]])
@@ -2629,54 +2636,60 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             await edit_menu(query, f"❌ `{rc}` — `{rm}`", InlineKeyboardMarkup(back_section("section_ads")))
 
-    # ── 📢 Post Ad — independent from auto-update ──
-    # Uses its own manage_ad_id and manage_ad_data, never touches user_settings["ad_id"] or ad_data
+    # ── 📢 Post/Remove Ad Manager — independent from auto-update ──
     elif data == "post_ad_prompt":
         manage_id   = user_settings.get("manage_ad_id", "")
-        manage_info = user_settings.get("manage_ad_data", {})
-        cur_id_line = f"Current Manage Ad ID: `{manage_id}`" if manage_id else "No Manage Ad ID set yet."
+        mdata       = user_settings.get("manage_ad_data", {})
+        cur_id_line = f"Manage Ad ID: `{manage_id}`" if manage_id else "⚠️ No Manage Ad ID set yet."
+        if mdata:
+            stat    = {10:"🟢 Online", 20:"🔴 Offline", 30:"✅ Done"}.get(mdata.get("status"), "?")
+            loaded  = (
+                f"\n📋 *Loaded:* `{mdata.get('tokenId','—')}/{mdata.get('currencyId','—')}` "
+                f"| {stat} | 💲`{mdata.get('price','—')}`"
+            )
+        else:
+            loaded = "\n_No ad fetched yet — tap Fetch Manage Ad._"
         await edit_menu(query,
             f"📢 *Post / Remove Ad Manager*\n\n"
-            f"This section is *completely separate* from the Auto Price Update.\n"
-            f"It uses its own Ad ID — setting it here will NOT affect your auto-update.\n\n"
-            f"{cur_id_line}\n\n"
+            f"⚠️ Completely separate from Auto-Update.\n"
+            f"Setting IDs here will NOT affect your auto-price bot.\n\n"
+            f"{cur_id_line}{loaded}\n\n"
             f"Steps:\n"
-            f"1️⃣ Set a Manage Ad ID (the ad you want to clone or remove)\n"
+            f"1️⃣ Set Manage Ad ID\n"
             f"2️⃣ Fetch its details\n"
-            f"3️⃣ Post (clone it as a new ad) or Remove it\n",
+            f"3️⃣ Repost (take offline → back online) OR Remove it",
             InlineKeyboardMarkup([
-                [InlineKeyboardButton("🆔 Set Manage Ad ID",    callback_data="set_manage_ad_id")],
-                [InlineKeyboardButton("📋 Fetch Manage Ad",     callback_data="fetch_manage_ad")],
-                [InlineKeyboardButton("✅ Post (Clone) Ad",     callback_data="post_ad_do")],
-                [InlineKeyboardButton("✏️ Custom Quantity",     callback_data="post_ad_qty")],
-                [InlineKeyboardButton("🗑 Remove This Ad",      callback_data="remove_ad_confirm")],
+                [InlineKeyboardButton("🆔 Set Manage Ad ID",     callback_data="set_manage_ad_id")],
+                [InlineKeyboardButton("📋 Fetch Manage Ad",      callback_data="fetch_manage_ad")],
+                [InlineKeyboardButton("🔄 Repost Ad (same ID)",  callback_data="repost_ad_confirm")],
+                [InlineKeyboardButton("🗑 Remove This Ad",       callback_data="remove_ad_confirm")],
                 *back_section("section_ads"),
             ])
         )
 
     elif data == "set_manage_ad_id":
         user_state["action"]       = "manage_ad_id"
-        user_state["prev_section"] = "section_ads"
-        cur = user_settings.get("manage_ad_id", "") or "Not set"
+        user_state["prev_section"] = "post_ad_prompt"   # back to manager
+        cur     = user_settings.get("manage_ad_id", "") or "Not set"
+        auto_id = user_settings.get("ad_id", "not set")
         await edit_menu(query,
             f"🆔 *Set Manage Ad ID*\n\n"
-            f"Current: `{cur}`\n\n"
-            f"This is the Ad ID used for *Post* and *Remove* only.\n"
-            f"⚠️ This is separate from the Auto-Update Ad ID (`{user_settings.get('ad_id','not set')}`).\n\n"
-            f"Send the Bybit Ad ID you want to manage.\n"
+            f"Current Manage Ad ID: `{cur}`\n"
+            f"Auto-Update Ad ID: `{auto_id}` (will not change)\n\n"
+            f"Send the Bybit Ad ID you want to repost or remove.\n"
             f"Example: `2040156088201854976`",
-            InlineKeyboardMarkup(back_section("section_ads"))
+            InlineKeyboardMarkup(back_manager())
         )
 
     elif data == "fetch_manage_ad":
         manage_id = user_settings.get("manage_ad_id", "")
         if not manage_id:
             await edit_menu(query,
-                "❌ Set a Manage Ad ID first (tap 🆔 Set Manage Ad ID).",
-                InlineKeyboardMarkup(back_section("section_ads"))
+                "❌ Set a Manage Ad ID first.",
+                InlineKeyboardMarkup(back_manager())
             )
             return
-        await edit_menu(query, f"⏳ Fetching ad `{manage_id}`...", InlineKeyboardMarkup(back_section("section_ads")))
+        await edit_menu(query, f"⏳ Fetching ad `{manage_id}`...", InlineKeyboardMarkup(back_manager()))
         result = await asyncio.get_event_loop().run_in_executor(None, get_ad_details, manage_id)
         rc     = result.get("retCode", result.get("ret_code", -1))
         if rc == 0:
@@ -2693,110 +2706,114 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"💲 Price: `{mdata.get('price','—')}` | Qty: `{mdata.get('lastQuantity', mdata.get('quantity','—'))}`\n"
                 f"Min: `{mdata.get('minAmount','—')}` | Max: `{mdata.get('maxAmount','—')}`\n"
                 f"Status: {stat}\n\n"
-                f"_Ready to Post (clone) or Remove._",
+                f"_Ready to Repost or Remove._",
                 InlineKeyboardMarkup([
-                    [InlineKeyboardButton("✅ Post (Clone) Ad",  callback_data="post_ad_do")],
-                    [InlineKeyboardButton("🗑 Remove This Ad",   callback_data="remove_ad_confirm")],
-                    *back_section("section_ads"),
+                    [InlineKeyboardButton("🔄 Repost Ad (same ID)", callback_data="repost_ad_confirm")],
+                    [InlineKeyboardButton("🗑 Remove This Ad",      callback_data="remove_ad_confirm")],
+                    *back_manager(),
                 ])
             )
         else:
             await edit_menu(query,
                 f"❌ `{result.get('retMsg', result.get('ret_msg',''))}`",
-                InlineKeyboardMarkup(back_section("section_ads"))
+                InlineKeyboardMarkup(back_manager())
             )
 
-    elif data == "post_ad_do":
-        mdata = user_settings.get("manage_ad_data", {})
-        if not mdata:
+    # ── 🔄 Repost Ad — take offline then bring same ID back online ──
+    elif data == "repost_ad_confirm":
+        mdata     = user_settings.get("manage_ad_data", {})
+        manage_id = user_settings.get("manage_ad_id", "")
+        if not mdata or not manage_id:
             await edit_menu(query,
-                "❌ *No manage ad loaded.*\n\nTap 📋 Fetch Manage Ad first.",
-                InlineKeyboardMarkup(back_section("section_ads"))
+                "❌ Fetch Manage Ad details first.",
+                InlineKeyboardMarkup(back_manager())
             )
             return
-        await edit_menu(query, "⏳ Posting new ad...", InlineKeyboardMarkup(back_section("section_ads")))
-
-        tps          = mdata.get("tradingPreferenceSet", {})
-        trading_pref = {k: str(tps.get(k, "0")) for k in [
-            "hasUnPostAd","isKyc","isEmail","isMobile","hasRegisterTime",
-            "registerTimeThreshold","orderFinishNumberDay30","completeRateDay30",
-            "hasOrderFinishNumberDay30","hasCompleteRateDay30","hasNationalLimit"
-        ]}
-        trading_pref["nationalLimit"] = str(tps.get("nationalLimit", ""))
-
-        pay_terms   = mdata.get("paymentTerms", [])
-        payment_ids = [str(pt["id"]) for pt in pay_terms if pt.get("id")]
-        qty = user_settings.get("post_ad_qty", "") or \
-              str(mdata.get("lastQuantity", mdata.get("quantity", "")))
-
-        result = await asyncio.get_event_loop().run_in_executor(
-            None, post_new_ad,
-            mdata.get("tokenId", ""),
-            mdata.get("currencyId", ""),
-            str(mdata.get("side", "1")),
-            str(mdata.get("priceType", "0")),
-            str(mdata.get("premium", "0")),
-            str(mdata.get("price", "")),
-            str(mdata.get("minAmount", "")),
-            str(mdata.get("maxAmount", "")),
-            qty,
-            payment_ids,
-            str(mdata.get("paymentPeriod", "15")),
-            str(mdata.get("remark", "")),
-            trading_pref,
-            str(mdata.get("itemType", "ORIGIN")),
+        stat     = {10:"🟢 Online", 20:"🔴 Offline"}.get(mdata.get("status"), "?")
+        auto_id  = user_settings.get("ad_id", "")
+        same_warn = (
+            f"\n\n⚠️ *This is also your Auto-Update Ad ID.*\n"
+            f"Auto-price update will keep running — it will re-update the price on next cycle."
+        ) if manage_id == auto_id else ""
+        await edit_menu(query,
+            f"🔄 *Repost Ad?*\n\n"
+            f"Ad ID: `{manage_id}` (unchanged — same ID)\n"
+            f"Current Status: {stat}\n\n"
+            f"This will:\n"
+            f"  1️⃣ Take the ad offline\n"
+            f"  2️⃣ Immediately bring it back online\n"
+            f"  Same Ad ID — no new ad created{same_warn}",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Yes, Repost It", callback_data="repost_ad_do")],
+                [InlineKeyboardButton("❌ Cancel",         callback_data="post_ad_prompt")],
+            ])
         )
-        rc      = result.get("retCode", result.get("ret_code", -1))
-        rm      = result.get("retMsg",  result.get("ret_msg", ""))
-        item_id = result.get("result", {}).get("itemId", "")
-        if rc == 0:
+
+    elif data == "repost_ad_do":
+        mdata     = user_settings.get("manage_ad_data", {})
+        manage_id = user_settings.get("manage_ad_id", "")
+        if not mdata or not manage_id:
+            await edit_menu(query, "❌ No manage ad loaded.", InlineKeyboardMarkup(back_manager()))
+            return
+        await edit_menu(query, f"⏳ Taking ad offline...", InlineKeyboardMarkup(back_manager()))
+
+        # Step 1: Take offline
+        r1  = await asyncio.get_event_loop().run_in_executor(None, take_ad_offline, manage_id, mdata)
+        rc1 = r1.get("retCode", r1.get("ret_code", -1))
+        if rc1 != 0:
             await edit_menu(query,
-                f"✅ *New Ad Posted!*\n\n"
-                f"🆔 New Item ID: `{item_id}`\n\n"
-                f"Your new ad is now live on Bybit P2P.\n"
-                f"Auto-Update Ad ID is unchanged: `{user_settings.get('ad_id','not set')}`",
-                InlineKeyboardMarkup(back_section("section_ads"))
+                f"❌ *Failed to take ad offline*\n\n"
+                f"Code: `{rc1}` | `{r1.get('retMsg', r1.get('ret_msg',''))}`",
+                InlineKeyboardMarkup(back_manager())
+            )
+            return
+
+        # Step 2: Brief pause then bring back online
+        await asyncio.sleep(2)
+        await edit_menu(query, f"⏳ Bringing ad back online...", InlineKeyboardMarkup(back_manager()))
+        r2  = await asyncio.get_event_loop().run_in_executor(None, put_ad_online, manage_id, mdata)
+        rc2 = r2.get("retCode", r2.get("ret_code", -1))
+        if rc2 == 0:
+            # Refresh manage_ad_data with latest status
+            fresh = await asyncio.get_event_loop().run_in_executor(None, get_ad_details, manage_id)
+            if fresh.get("retCode", -1) == 0:
+                user_settings["manage_ad_data"] = fresh.get("result", mdata)
+            await edit_menu(query,
+                f"✅ *Ad Reposted!*\n\n"
+                f"🆔 Ad ID: `{manage_id}` (same — unchanged)\n"
+                f"Ad is now back online on Bybit P2P.\n\n"
+                f"Auto-Update Ad ID: `{user_settings.get('ad_id','not set')}` — unchanged.",
+                InlineKeyboardMarkup(back_manager())
             )
         else:
             await edit_menu(query,
-                f"❌ *Failed to post ad*\n\nCode: `{rc}`\nMessage: `{rm}`",
-                InlineKeyboardMarkup(back_section("section_ads"))
+                f"⚠️ *Ad taken offline but failed to go back online*\n\n"
+                f"Code: `{rc2}` | `{r2.get('retMsg', r2.get('ret_msg',''))}`\n\n"
+                f"Ad ID: `{manage_id}`\n"
+                f"Go to Bybit P2P to manually relist it.",
+                InlineKeyboardMarkup(back_manager())
             )
-        user_settings.pop("post_ad_qty", None)
 
-    elif data == "post_ad_qty":
-        user_state["action"]       = "post_ad_qty"
-        user_state["prev_section"] = "section_ads"
-        mdata   = user_settings.get("manage_ad_data", {})
-        cur_qty = mdata.get("lastQuantity", mdata.get("quantity", "—")) if mdata else "—"
-        await edit_menu(query,
-            f"✏️ *Custom Quantity for New Ad*\n\n"
-            f"Manage ad current quantity: `{cur_qty}`\n\n"
-            "Send the token quantity for the new ad.\n"
-            "Example: `5000`",
-            InlineKeyboardMarkup(back_section("section_ads"))
-        )
-
-    # ── 🗑 Remove Ad — uses manage_ad_id, NOT auto-update ad_id ──
+    # ── 🗑 Remove Ad — uses manage_ad_id, never touches auto-update ──
     elif data == "remove_ad_confirm":
         manage_id = user_settings.get("manage_ad_id", "")
         if not manage_id:
             await edit_menu(query,
-                "❌ No Manage Ad ID set.\n\nTap 📢 Post/Remove Ad → Set Manage Ad ID first.",
-                InlineKeyboardMarkup(back_section("section_ads"))
+                "❌ No Manage Ad ID set.\n\nTap 🆔 Set Manage Ad ID first.",
+                InlineKeyboardMarkup(back_manager())
             )
             return
-        auto_id = user_settings.get("ad_id", "")
+        auto_id   = user_settings.get("ad_id", "")
         same_warn = (
-            f"\n\n⚠️ *This is the same as your Auto-Update Ad ID!*\n"
-            f"The auto-update will keep running — stop it manually if needed."
+            f"\n\n⚠️ *This is also your Auto-Update Ad ID.*\n"
+            f"Auto-price update will keep running after removal — stop it manually if needed."
         ) if manage_id == auto_id else ""
         await edit_menu(query,
             f"🗑 *Remove Ad?*\n\n"
             f"Manage Ad ID: `{manage_id}`\n"
             f"Auto-Update Ad ID: `{auto_id or 'not set'}` (unchanged)\n"
             f"{same_warn}\n\n"
-            f"⚠️ This permanently delists the manage ad from Bybit P2P.\n"
+            f"⚠️ This permanently delists this ad from Bybit P2P.\n"
             f"Are you sure?",
             InlineKeyboardMarkup([
                 [InlineKeyboardButton("✅ Yes, Remove It", callback_data="remove_ad_do")],
@@ -2807,28 +2824,26 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "remove_ad_do":
         manage_id = user_settings.get("manage_ad_id", "")
         if not manage_id:
-            await edit_menu(query, "❌ No Manage Ad ID set.", InlineKeyboardMarkup(back_section("section_ads")))
+            await edit_menu(query, "❌ No Manage Ad ID set.", InlineKeyboardMarkup(back_manager()))
             return
-        await edit_menu(query, f"⏳ Removing ad `{manage_id}`...", InlineKeyboardMarkup(back_section("section_ads")))
+        await edit_menu(query, f"⏳ Removing ad `{manage_id}`...", InlineKeyboardMarkup(back_manager()))
 
-        # ── Never touch auto-update state here ──
         result = await asyncio.get_event_loop().run_in_executor(None, remove_ad, manage_id)
         rc     = result.get("retCode", result.get("ret_code", -1))
         rm     = result.get("retMsg",  result.get("ret_msg", ""))
         if rc == 0:
-            # Clear manage ad data but leave auto-update untouched
             user_settings.pop("manage_ad_data", None)
             await edit_menu(query,
                 f"✅ *Ad Removed!*\n\n"
-                f"Manage Ad `{manage_id}` has been delisted from Bybit P2P.\n\n"
-                f"Auto-Update Ad ID `{user_settings.get('ad_id','not set')}` is unchanged.\n"
-                f"Auto-price update continues running if it was active.",
-                InlineKeyboardMarkup(back_section("section_ads"))
+                f"Manage Ad `{manage_id}` has been permanently delisted.\n\n"
+                f"Auto-Update Ad ID `{user_settings.get('ad_id','not set')}` — unchanged.\n"
+                f"Auto-price update continues if it was running.",
+                InlineKeyboardMarkup(back_manager())
             )
         else:
             await edit_menu(query,
                 f"❌ *Failed to remove ad*\n\nCode: `{rc}`\nMessage: `{rm}`",
-                InlineKeyboardMarkup(back_section("section_ads"))
+                InlineKeyboardMarkup(back_manager())
             )
 
     # ── 🟢/🔴 Toggle Price Update ──
