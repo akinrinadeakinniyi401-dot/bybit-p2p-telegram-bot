@@ -360,84 +360,65 @@ def post_new_ad(
     return _post("/v5/p2p/item/create", body)
 
 
+
 # ─────────────────────────────────────────
-# 🗑 Permanently Delete Ad
+# 📢 Post Ad
+# POST /v5/p2p/item/create
+# Creates a new ad using the settings from an existing fetched ad
+# ─────────────────────────────────────────
+def post_ad_from_data(ad_data: dict) -> dict:
+    """Post a new ad using settings fetched from an existing ad."""
+    tps          = ad_data.get("tradingPreferenceSet", {}) or {}
+    trading_pref = {k: str(tps.get(k, "0")) for k in [
+        "hasUnPostAd","isKyc","isEmail","isMobile","hasRegisterTime",
+        "registerTimeThreshold","orderFinishNumberDay30","completeRateDay30",
+        "hasOrderFinishNumberDay30","hasCompleteRateDay30","hasNationalLimit"
+    ]}
+    trading_pref["nationalLimit"] = str(tps.get("nationalLimit", ""))
+
+    pay_terms   = ad_data.get("paymentTerms", [])
+    payment_ids = [str(pt["id"]) for pt in pay_terms if pt.get("id")]
+
+    body = {
+        "tokenId":       ad_data.get("tokenId", ""),
+        "currencyId":    ad_data.get("currencyId", ""),
+        "side":          str(ad_data.get("side", "1")),
+        "priceType":     str(ad_data.get("priceType", "0")),
+        "premium":       str(ad_data.get("premium", "0")),
+        "price":         str(ad_data.get("price", "")),
+        "minAmount":     str(ad_data.get("minAmount", "")),
+        "maxAmount":     str(ad_data.get("maxAmount", "")),
+        "remark":        str(ad_data.get("remark", "")),
+        "tradingPreferenceSet": trading_pref,
+        "paymentIds":    payment_ids,
+        "quantity":      str(ad_data.get("lastQuantity", ad_data.get("quantity", ""))),
+        "paymentPeriod": str(ad_data.get("paymentPeriod", "15")),
+        "itemType":      str(ad_data.get("itemType", "ORIGIN")),
+    }
+    logger.info(
+        f"[Bybit] POST new ad: {body['tokenId']}/{body['currencyId']} "
+        f"side={body['side']} price={body['price']} qty={body['quantity']}"
+    )
+    return _post("/v5/p2p/item/create", body)
+
+
+# ─────────────────────────────────────────
+# 🗑 Remove Ad
 # POST /v5/p2p/item/cancel
-# Completely removes the ad — cannot be brought back
 # ─────────────────────────────────────────
 def remove_ad(ad_id: str) -> dict:
-    logger.info(f"[Bybit] Permanently delete ad: {ad_id}")
+    logger.info(f"[Bybit] Remove ad: {ad_id}")
     return _post("/v5/p2p/item/cancel", {"itemId": ad_id})
 
 
-# ─────────────────────────────────────────
-# 🔴 Take Ad Offline (pause/delist temporarily)
-# POST /v5/p2p/item/update with actionType=CANCEL
-# Ad stays in system — can be brought back with actionType=LISTING
-# ─────────────────────────────────────────
+# ── Aliases used by bot.py manager ──
 def take_ad_offline(ad_id: str, ad_data: dict = None) -> dict:
-    """Pause ad (take offline). Same Ad ID. Can be re-listed with put_ad_online."""
-    logger.info(f"[Bybit] Take ad offline (pause): {ad_id}")
-    ad_data = ad_data or {}
-    payment_terms = ad_data.get("paymentTerms", [])
-    payment_ids   = [str(pt["id"]) for pt in payment_terms if pt.get("id")]
-    tps           = ad_data.get("tradingPreferenceSet", {})
-    trading_pref  = {k: str(tps.get(k, "0")) for k in [
-        "hasUnPostAd","isKyc","isEmail","isMobile","hasRegisterTime",
-        "registerTimeThreshold","orderFinishNumberDay30","completeRateDay30",
-        "hasOrderFinishNumberDay30","hasCompleteRateDay30","hasNationalLimit"
-    ]}
-    trading_pref["nationalLimit"] = str(tps.get("nationalLimit", ""))
-    body = {
-        "id":            ad_id,
-        "actionType":    "CANCEL",
-        "priceType":     str(ad_data.get("priceType", "0")),
-        "price":         str(ad_data.get("price", "")),
-        "premium":       str(ad_data.get("premium", "")),
-        "minAmount":     str(ad_data.get("minAmount", "")),
-        "maxAmount":     str(ad_data.get("maxAmount", "")),
-        "quantity":      str(ad_data.get("lastQuantity", ad_data.get("quantity", ""))),
-        "paymentIds":    payment_ids,
-        "paymentPeriod": str(ad_data.get("paymentPeriod", "15")),
-        "remark":        str(ad_data.get("remark", "")),
-        "tradingPreferenceSet": trading_pref,
-    }
-    result = _post("/v5/p2p/item/update", body)
-    logger.info(f"[Bybit] Take offline result: {result}")
-    return result
+    """Remove/cancel the ad using POST /v5/p2p/item/cancel."""
+    return remove_ad(ad_id)
 
 
-# ─────────────────────────────────────────
-# 🟢 Put Ad Online (LISTING / repost)
-# POST /v5/p2p/item/update with actionType=LISTING
-# Same Ad ID — brings existing offline ad back online
-# ─────────────────────────────────────────
-def put_ad_online(ad_id: str, ad_data: dict) -> dict:
-    """Bring ad back online (status 10). Same Ad ID."""
-    logger.info(f"[Bybit] Put online: {ad_id}")
-    payment_terms = ad_data.get("paymentTerms", [])
-    payment_ids   = [str(pt["id"]) for pt in payment_terms if pt.get("id")]
-    tps           = ad_data.get("tradingPreferenceSet", {})
-    trading_pref  = {k: str(tps.get(k, "0")) for k in [
-        "hasUnPostAd","isKyc","isEmail","isMobile","hasRegisterTime",
-        "registerTimeThreshold","orderFinishNumberDay30","completeRateDay30",
-        "hasOrderFinishNumberDay30","hasCompleteRateDay30","hasNationalLimit"
-    ]}
-    trading_pref["nationalLimit"] = str(tps.get("nationalLimit", ""))
-    body = {
-        "id":            ad_id,
-        "actionType":    "LISTING",
-        "priceType":     str(ad_data.get("priceType", "0")),
-        "price":         str(ad_data.get("price", "")),
-        "premium":       str(ad_data.get("premium", "")),
-        "minAmount":     str(ad_data.get("minAmount", "")),
-        "maxAmount":     str(ad_data.get("maxAmount", "")),
-        "quantity":      str(ad_data.get("lastQuantity", ad_data.get("quantity", ""))),
-        "paymentIds":    payment_ids,
-        "paymentPeriod": str(ad_data.get("paymentPeriod", "15")),
-        "remark":        str(ad_data.get("remark", "")),
-        "tradingPreferenceSet": trading_pref,
-    }
-    result = _post("/v5/p2p/item/update", body)
-    logger.info(f"[Bybit] Put online result: {result}")
-    return result
+def put_ad_online(ad_id: str, ad_data: dict = None) -> dict:
+    """Post a new ad using POST /v5/p2p/item/create with same settings."""
+    if not ad_data:
+        return {"retCode": -1, "retMsg": "No ad data provided — fetch the ad first"}
+    return post_ad_from_data(ad_data)
