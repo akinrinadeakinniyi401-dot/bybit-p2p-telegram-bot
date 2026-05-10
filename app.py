@@ -4,16 +4,37 @@ import hmac
 import hashlib
 import base64
 import logging
+import logging.handlers
 import threading
 import requests as http_requests
 from flask import Flask, request, jsonify
 from telegram import Update, BotCommand
 
+# ── Logging setup with rotation ──
+# Console: INFO level (normal operation)
+# File: DEBUG level, auto-rotates at 5MB, keeps 2 backups only
+# This prevents log files from growing indefinitely during long sessions
+_console_handler = logging.StreamHandler()
+_console_handler.setLevel(logging.INFO)
+_console_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+
+_file_handler = logging.handlers.RotatingFileHandler(
+    "bot.log", maxBytes=5 * 1024 * 1024, backupCount=2, encoding="utf-8"
+)
+_file_handler.setLevel(logging.DEBUG)
+_file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s — %(message)s"))
+
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
+    level=logging.DEBUG,
+    handlers=[_console_handler, _file_handler]
 )
 logger = logging.getLogger(__name__)
+
+# Suppress noisy third-party loggers
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 app      = Flask(__name__)
 bot_app  = None
