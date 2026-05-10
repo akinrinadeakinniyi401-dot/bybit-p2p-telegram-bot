@@ -2614,12 +2614,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         currency = ad_data.get("currencyId","NGN").upper()
         max_pct  = get_max_float_pct(currency, token)
         min_pct  = get_min_float_pct(currency, token)
+        needs_ref = currency_needs_ref(currency) or currency == "NGN"
         user_state["action"]       = "float_pct"
         user_state["prev_section"] = "section_ads"
         cur = user_settings.get("float_pct","") or "Not set"
+        formula = (
+            f"`{token}/USDT × {currency}/USDT ref × your% ÷ 100`"
+            if needs_ref else
+            f"`{token}/USDT × your% ÷ 100`"
+        )
         await edit_menu(query,
-            f"📊 *Set Float %*\n\nPair: `{token}/{currency}` | Max: *{max_pct}%*\nCurrent: `{cur}`\n\n"
-            f"Formula: `{token}/USDT × {_rcur}/USDT ref × your% ÷ 100`\n\n"
+            f"📊 *Set Float %*\n\nPair: `{token}/{currency}` | Range: `{min_pct}%–{max_pct}%`\nCurrent: `{cur}`\n\n"
+            f"Formula: {formula}\n\n"
             f"Send a value between `{min_pct}` and `{max_pct}`. Example: `105`",
             InlineKeyboardMarkup(back_section("section_ads"))
         )
@@ -3060,15 +3066,27 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             token    = ad_data.get("tokenId","USDT").upper()
             currency = ad_data.get("currencyId","NGN").upper()
             max_pct  = get_max_float_pct(currency, token)
+            min_pct  = get_min_float_pct(currency, token)
             if val > max_pct:
                 await update.message.reply_text(
-                    f"❌ `{val}%` exceeds max for {token}/{currency}\nMax: *{max_pct}%*",
+                    f"❌ `{val}%` exceeds max for {token}/{currency}\n"
+                    f"Range: `{min_pct}%` – `{max_pct}%`",
+                    parse_mode="Markdown"
+                )
+                return
+            if min_pct > 0 and val < min_pct:
+                await update.message.reply_text(
+                    f"❌ `{val}%` is below min for {token}/{currency}\n"
+                    f"Range: `{min_pct}%` – `{max_pct}%`",
                     parse_mode="Markdown"
                 )
                 return
             user_settings["float_pct"] = text
             user_state["action"] = None
-            await reply_with_back(f"✅ *Float % saved!*\n\n`{text}%`\n\n_{next_setup_hint()}_")
+            await reply_with_back(
+                f"✅ *Float % saved!*\n\n`{text}%` for `{token}/{currency}`\n\n"
+                f"_{next_setup_hint()}_"
+            )
         except Exception:
             await update.message.reply_text("❌ Send a number like `105`", parse_mode="Markdown")
 
