@@ -11,7 +11,8 @@ from config import TELEGRAM_TOKEN, ADMIN_IDS
 import bybit
 from bybit import (
     get_ad_details, get_my_ads, modify_ad,
-    get_btc_usdt_price, get_max_float_pct,
+    get_btc_usdt_price, get_eth_usdt_price, get_token_usdt_price,
+    get_max_float_pct, get_min_float_pct, currency_needs_ref,
     get_pending_orders, get_sell_orders, get_incoming_sell_orders, get_order_detail,
     get_counterparty_info, mark_order_paid,
     send_chat_message, get_payment_name, release_assets,
@@ -47,7 +48,7 @@ user_settings = {
     "mode":         "fixed",
     "increment":    "0.05",
     "float_pct":    "",
-    "ngn_usdt_ref": "",
+    "local_usdt_ref": "",
     "interval":     2,
     "sender_name":  "Akinrinade Akinniyi",
 }
@@ -153,8 +154,10 @@ def next_setup_hint() -> str:
         return "👉 Next: tap *➕ Set Increment* to set your price step"
     if mode == "floating" and not user_settings.get("float_pct"):
         return "👉 Next: tap *📊 Set Float %* to set your market percentage"
-    if mode == "floating" and ad_data.get("currencyId","").upper() == "NGN" and not user_settings.get("ngn_usdt_ref"):
-        return "👉 Next: tap *💱 Set NGN/USDT Ref* to set the reference rate"
+    currency_upper = ad_data.get("currencyId","").upper()
+    needs_ref_cur  = currency_needs_ref(currency_upper) or currency_upper == "NGN"
+    if mode == "floating" and needs_ref_cur and not user_settings.get("local_usdt_ref"):
+        return f"👉 Next: tap *💱 Set {currency_upper}/USDT Ref* to set the reference rate"
     return "✅ *All set!* Tap *🟢 Start Auto-Update* to begin"
 
 
@@ -270,8 +273,9 @@ def ads_section_keyboard():
         rows.append([InlineKeyboardButton("➕ Set Increment", callback_data="set_increment")])
     else:
         rows.append([InlineKeyboardButton("📊 Set Float %",   callback_data="set_float_pct")])
-        if ad_data.get("currencyId","").upper() == "NGN":
-            rows.append([InlineKeyboardButton("💱 Set NGN/USDT Ref", callback_data="set_ngn_ref")])
+        _cur = ad_data.get("currencyId","").upper()
+        if currency_needs_ref(_cur) or _cur == "NGN":
+            rows.append([InlineKeyboardButton(f"💱 Set {_cur}/USDT Ref", callback_data="set_ngn_ref")])
 
     if ad_loaded:
         rows.append([InlineKeyboardButton("🔄 Update Once Now", callback_data="update_now")])
@@ -291,7 +295,8 @@ def ads_section_text():
     interval  = user_settings.get("interval",    2)
     increment = user_settings.get("increment",   "0.05")
     float_pct = user_settings.get("float_pct",  "") or "❗ Not set"
-    ngn_ref   = user_settings.get("ngn_usdt_ref","") or "❗ Not set"
+    local_ref = user_settings.get("local_usdt_ref","") or "❗ Not set"
+    cur_label = ad_data.get("currencyId","NGN").upper() if ad_data else "NGN"
     cur       = str(current_price) if current_price else "—"
     status    = "🟢 Running" if refresh_running else "🔴 Stopped"
 
@@ -318,7 +323,7 @@ def ads_section_text():
     else:
         mode_info = f"  📊 Float: `{float_pct}%`"
         if ad_data.get("currencyId","").upper() == "NGN":
-            mode_info += f" | 💱 NGN/USDT: `{ngn_ref}`"
+            mode_info += f" | 💱 {cur_label}/USDT: `{local_ref}`"
 
     hint = next_setup_hint()
 
@@ -362,7 +367,7 @@ def orders_section_text():
     ap_status = "💳 ON — auto marking orders paid" if auto_pay_enabled else "💳 OFF — manual only"
     sm_status = f"✅ ON — sending {sell_msg_count}x per order" if sell_msg_enabled else "❌ OFF"
     msg_preview = sell_custom_msg[:60] + "..." if len(sell_custom_msg) > 60 else sell_custom_msg
-    chat_status = "💬 ON — forwarding messages every 12s" if chat_monitor_enabled else "💬 OFF"
+    chat_status = "💬 ON — forwarding messages every 8s" if chat_monitor_enabled else "💬 OFF"
     return (
         "📦 *ORDER MONITOR*\n\n"
         f"Status: {status}\n"
@@ -1421,7 +1426,7 @@ async def _poll_order_chat(bot, chat_id: int, order_id: str):
                 continue
 
             # ── This is a counterparty message — forward it ──
-            logger.info(f"[ChatMonitor] ✅ Forwarding msg {msg_id} from '{nick}' (userId={user_id} acctId={account_id})")
+            logger.debug(f"[ChatMonitor] ✅ Forwarding msg {msg_id} from '{nick}' (userId={user_id} acctId={account_id})")
             type_label = {1: "💬", 2: "🖼 Image", 7: "📄 PDF", 8: "🎥 Video"}.get(msg_type, "💬")
             display_content = content if len(content) <= 300 else content[:297] + "..."
 
@@ -1475,7 +1480,7 @@ async def chat_monitor_loop(bot, chat_id: int):
         except Exception as e:
             logger.error(f"[ChatMonitor] Loop error: {e}")
 
-        await asyncio.sleep(12)
+        await asyncio.sleep(8)
 
     logger.info("💬 CHAT MONITOR STOPPED")
 
@@ -1641,6 +1646,14 @@ async def _handle_buy_order(bot, chat_id, order_id):
                             None, send_chat_message, order_id, SELLER_WARN_MSG
                         )
                         note = f"\n🛡 *Buyer Protection:* release `{release_mins:.0f} min` ≥ `{buyer_protection_threshold} min` — warning sent to seller"
+                        unpaid_orders_log.append({
+                            "order_id":   order_id,
+                            "account_no": str(pay_term.get("accountNo","—")),
+                            "bank":       get_payment_name(str(pay_term.get("paymentType",""))),
+                            "amount":     float(order_detail.get("amount","0")),
+                            "reason":     f"Buyer Protection: seller release {release_mins:.0f} min ≥ {buyer_protection_threshold} min (marked paid + warned)",
+                            "timestamp":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        })
                     await bot.send_message(
                         chat_id=chat_id,
                         text=f"💳 *Auto-Pay ✅* Order `{order_id}` marked paid{note}",
@@ -1728,17 +1741,38 @@ def _extract_bybit_max(error_msg: str) -> str | None:
     return None
 
 
-def calc_floating_price(ad_data, float_pct, ngn_usdt_ref):
-    btc = get_btc_usdt_price()
-    if btc <= 0:
-        return None, "Failed to fetch BTC/USDT from Bybit"
-    currency = ad_data.get("currencyId","").upper()
-    if currency == "NGN":
-        if ngn_usdt_ref <= 0:
-            return None, "NGN/USDT reference price not set"
-        raw = btc * ngn_usdt_ref * float_pct / 100
+def calc_floating_price(ad_data, float_pct, local_usdt_ref):
+    """
+    Calculate floating price for any supported currency/token pair.
+
+    Formula:
+      NGN/USD:  token_usdt_price × local_usdt_ref × float_pct / 100
+      GHS/GBP/EUR/RUB/KES:  token_usdt_price × local_usdt_ref × float_pct / 100
+      (same formula — local_usdt_ref is the local currency per 1 USDT rate)
+
+    For USDT/USDC pairs the ref is not needed (token IS the dollar).
+    """
+    currency = ad_data.get("currencyId", "").upper()
+    token    = ad_data.get("tokenId",   "").upper()
+
+    token_price = get_token_usdt_price(token)
+    if token_price <= 0:
+        return None, f"Failed to fetch {token}/USDT price from Bybit"
+
+    # Currencies that need a local/USDT reference rate
+    needs_ref = currency_needs_ref(currency) or currency == "NGN"
+
+    if needs_ref:
+        if local_usdt_ref <= 0:
+            return None, f"{currency}/USDT reference price not set — tap 💱 Set {currency}/USDT Ref"
+        raw = token_price * local_usdt_ref * float_pct / 100
+    elif currency == "USD":
+        # USD: token_price already in USD
+        raw = token_price * float_pct / 100
     else:
-        raw = btc * float_pct / 100
+        # Unknown currency — treat as direct
+        raw = token_price * float_pct / 100
+
     return str(Decimal(str(raw)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)), None
 
 
@@ -1764,8 +1798,8 @@ async def auto_update_loop(bot, chat_id):
             new_p_str = str(new_p.quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP))
         else:
             float_pct    = float(user_settings.get("float_pct",0))
-            ngn_usdt_ref = float(user_settings.get("ngn_usdt_ref") or 0)
-            new_p_str, err = calc_floating_price(ad_data, float_pct, ngn_usdt_ref)
+            local_usdt_ref = float(user_settings.get("local_usdt_ref") or 0)
+            new_p_str, err = calc_floating_price(ad_data, float_pct, local_usdt_ref)
             if err:
                 await bot.send_message(chat_id=chat_id,
                     text=f"⚠️ *Cycle {cycle} float error*\n`{err}`", parse_mode="Markdown")
@@ -1814,8 +1848,9 @@ async def auto_update_loop(bot, chat_id):
                 text=f"✅ *Cycle {cycle}* `{now}`\n💲 `{new_p_str}` ({mode.upper()})",
                 parse_mode="Markdown")
         else:
-            extra = "\n💱 Update NGN/USDT ref if rate changed" \
-                    if ad_data.get("currencyId","").upper() == "NGN" else ""
+            _ecur = ad_data.get("currencyId","").upper()
+            extra = f"\n💱 Update {_ecur}/USDT ref if rate changed" \
+                    if (currency_needs_ref(_ecur) or _ecur == "NGN") else ""
             await bot.send_message(chat_id=chat_id,
                 text=f"❌ *Cycle {cycle} failed*\n`{ret_code}` — `{ret_msg}`{extra}",
                 parse_mode="Markdown")
@@ -2065,7 +2100,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         seen_order_ids.clear(); paid_order_ids.clear()
         seen_sell_order_ids.clear(); released_order_ids.clear()
         for k, v in [("ad_id",""),("bybit_uid",""),("mode","fixed"),
-                     ("increment","0.05"),("float_pct",""),("ngn_usdt_ref",""),("interval",2)]:
+                     ("increment","0.05"),("float_pct",""),("local_usdt_ref",""),("interval",2)]:
             user_settings[k] = v
         acct = accounts[idx]
         await edit_menu(query,
@@ -2140,7 +2175,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sell_msg_enabled = False; sell_msg_count = 1
         set_active_account(0)
         for k, v in [("ad_id",""),("bybit_uid",""),("mode","fixed"),
-                     ("increment","0.05"),("float_pct",""),("ngn_usdt_ref",""),("interval",2)]:
+                     ("increment","0.05"),("float_pct",""),("local_usdt_ref",""),("interval",2)]:
             user_settings[k] = v
         user_settings.pop("manage_ad_id",   None)
         user_settings.pop("manage_ad_data", None)
@@ -2352,7 +2387,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 chat_monitor_loop(context.bot, chat_id)
             )
             await edit_menu(query,
-                "💬 *Chat Monitor started!*\nPolling Bybit order chats every 12 seconds.\n\n"
+                "💬 *Chat Monitor started!*\nPolling Bybit order chats every 8 seconds.\n\n"
                 + orders_section_text(),
                 orders_section_keyboard()
             )
@@ -2578,13 +2613,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         token    = ad_data.get("tokenId","USDT").upper()
         currency = ad_data.get("currencyId","NGN").upper()
         max_pct  = get_max_float_pct(currency, token)
+        min_pct  = get_min_float_pct(currency, token)
         user_state["action"]       = "float_pct"
         user_state["prev_section"] = "section_ads"
         cur = user_settings.get("float_pct","") or "Not set"
         await edit_menu(query,
             f"📊 *Set Float %*\n\nPair: `{token}/{currency}` | Max: *{max_pct}%*\nCurrent: `{cur}`\n\n"
-            f"Formula: `BTC/USDT {'× NGN/USDT ref ' if currency=='NGN' else ''}× your% ÷ 100`\n\n"
-            f"Send a value ≤ {max_pct}. Example: `105`",
+            f"Formula: `{token}/USDT × {_rcur}/USDT ref × your% ÷ 100`\n\n"
+            f"Send a value between `{min_pct}` and `{max_pct}`. Example: `105`",
             InlineKeyboardMarkup(back_section("section_ads"))
         )
 
@@ -2592,10 +2628,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "set_ngn_ref":
         user_state["action"]       = "ngn_usdt_ref"
         user_state["prev_section"] = "section_ads"
-        cur = user_settings.get("ngn_usdt_ref","") or "Not set"
+        _rcur = ad_data.get("currencyId","NGN").upper() if ad_data else "NGN"
+        cur   = user_settings.get("local_usdt_ref","") or "Not set"
         await edit_menu(query,
-            f"💱 *NGN/USDT Reference Price*\n\nCurrent: `{cur}`\n\n"
-            "Check Bybit P2P market for current NGN/USDT rate.\nExample: `1580`",
+            f"💱 *{_rcur}/USDT Reference Price*\n\nCurrent: `{cur}`\n\n"
+            f"Check Bybit P2P market for current {_rcur}/USDT rate.\n"
+            f"Example: `{'1580' if _rcur == 'NGN' else '1.25' if _rcur == 'EUR' else '100'}` ({_rcur} per 1 USDT)",
             InlineKeyboardMarkup(back_section("section_ads"))
         )
 
@@ -2620,9 +2658,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             price = str(current_price) if current_price else ad_data.get("price","0")
         else:
             float_pct    = float(user_settings.get("float_pct",0))
-            ngn_usdt_ref = float(user_settings.get("ngn_usdt_ref") or 0)
+            local_usdt_ref = float(user_settings.get("local_usdt_ref") or 0)
             price, err   = await asyncio.get_event_loop().run_in_executor(
-                None, calc_floating_price, ad_data, float_pct, ngn_usdt_ref
+                None, calc_floating_price, ad_data, float_pct, local_usdt_ref
             )
             if err:
                 await edit_menu(query, f"❌ `{err}`", InlineKeyboardMarkup(back_section("section_ads")))
@@ -3038,9 +3076,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             val = float(text)
             if val <= 0: raise ValueError
-            user_settings["ngn_usdt_ref"] = text
+            user_settings["local_usdt_ref"] = text
+            _scur = ad_data.get("currencyId","NGN").upper() if ad_data else "NGN"
             user_state["action"] = None
-            await reply_with_back(f"✅ *NGN/USDT ref saved!*\n\n`{text}`\n\n_{next_setup_hint()}_")
+            await reply_with_back(f"✅ *{_scur}/USDT ref saved!*\n\n`{text}`\n\n_{next_setup_hint()}_")
         except Exception:
             await update.message.reply_text("❌ Send a number like `1580`", parse_mode="Markdown")
 
