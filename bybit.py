@@ -41,10 +41,38 @@ def get_all_accounts() -> list:
 MAX_FLOAT_PCT = {
     "NGN": {"BTC": 110, "ETH": 110, "USDT": 110, "USDC": 110},
     "USD": {"BTC": 130, "ETH": 130, "USDT": 120, "USDC": 120},
+    # ── New currencies (BTC & ETH only, floating mode) ──
+    "GHS": {"BTC": 130, "ETH": 130},   # Ghana Cedi       70–130%
+    "GBP": {"BTC": 130, "ETH": 130},   # British Pound     70–130%
+    "EUR": {"BTC": 125, "ETH": 125},   # Euro              75–125%
+    "RUB": {"BTC": 120, "ETH": 120},   # Russian Ruble     80–120%
+    "KES": {"BTC": 130, "ETH": 130},   # Kenyan Shilling   70–130%
 }
+
+MIN_FLOAT_PCT = {
+    "NGN": {"BTC": 0,   "ETH": 0,   "USDT": 0,   "USDC": 0  },
+    "USD": {"BTC": 0,   "ETH": 0,   "USDT": 0,   "USDC": 0  },
+    "GHS": {"BTC": 70,  "ETH": 70},
+    "GBP": {"BTC": 70,  "ETH": 70},
+    "EUR": {"BTC": 75,  "ETH": 75},
+    "RUB": {"BTC": 80,  "ETH": 80},
+    "KES": {"BTC": 70,  "ETH": 70},
+}
+
+# Currencies that need a local/USDT reference rate for floating price calc
+NEEDS_LOCAL_REF = {"GHS", "GBP", "EUR", "RUB", "KES"}
 
 def get_max_float_pct(currency_id: str, token_id: str) -> int:
     return MAX_FLOAT_PCT.get(currency_id.upper(), {}).get(token_id.upper(), 110)
+
+
+def get_min_float_pct(currency_id: str, token_id: str) -> int:
+    return MIN_FLOAT_PCT.get(currency_id.upper(), {}).get(token_id.upper(), 0)
+
+
+def currency_needs_ref(currency_id: str) -> bool:
+    """Returns True if this currency needs a local/USDT reference rate."""
+    return currency_id.upper() in NEEDS_LOCAL_REF
 
 
 # ─────────────────────────────────────────
@@ -161,6 +189,43 @@ def get_btc_usdt_price() -> float:
             return price
     except Exception as e:
         logger.error(f"[Bybit] BTC/USDT error: {e}")
+    return 0.0
+
+
+def get_eth_usdt_price() -> float:
+    try:
+        r     = requests.get(f"{BASE_URL}/v5/market/tickers",
+                             params={"category": "spot", "symbol": "ETHUSDT"}, timeout=10)
+        items = r.json().get("result", {}).get("list", [])
+        if items:
+            price = float(items[0].get("lastPrice", 0))
+            logger.info(f"[Bybit] ETH/USDT = {price}")
+            return price
+    except Exception as e:
+        logger.error(f"[Bybit] ETH/USDT error: {e}")
+    return 0.0
+
+
+def get_token_usdt_price(token_id: str) -> float:
+    """Get USDT price for any supported token (BTC, ETH, etc.)."""
+    token = token_id.upper()
+    if token == "BTC":
+        return get_btc_usdt_price()
+    if token == "ETH":
+        return get_eth_usdt_price()
+    if token in ("USDT", "USDC"):
+        return 1.0
+    # Generic fallback for other tokens
+    try:
+        r     = requests.get(f"{BASE_URL}/v5/market/tickers",
+                             params={"category": "spot", "symbol": f"{token}USDT"}, timeout=10)
+        items = r.json().get("result", {}).get("list", [])
+        if items:
+            price = float(items[0].get("lastPrice", 0))
+            logger.info(f"[Bybit] {token}/USDT = {price}")
+            return price
+    except Exception as e:
+        logger.error(f"[Bybit] {token}/USDT error: {e}")
     return 0.0
 
 
