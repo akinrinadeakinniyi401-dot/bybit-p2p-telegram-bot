@@ -224,6 +224,8 @@ async def run_bot_setup(render_url):
         BotCommand("pingbybit",        "🔌 Test Bybit API connection"),
         BotCommand("pingflutterwave",  "🔌 Test Flutterwave connection"),
         BotCommand("pingpaga",         "🔌 Test Paga connection"),
+        BotCommand("refreshscammers",  "🚨 Refresh scammer list from GitHub"),
+        BotCommand("checkname",        "🔍 Check a name against scammer list"),
     ])
     bot_app = bot
     logger.info("✅ Bot ready")
