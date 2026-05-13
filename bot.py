@@ -20,6 +20,7 @@ from bybit import (
     get_chat_messages, post_new_ad, remove_ad,
     take_ad_offline, put_ad_online,
 )
+from fraud_check import check_buyer_name, load_scammers, get_scammer_count, get_last_updated
 
 logger = logging.getLogger(__name__)
 
@@ -1692,6 +1693,42 @@ async def _handle_sell_incoming(bot, chat_id, order_id):
             parse_mode="Markdown"
         )
 
+        # ── 🚨 Fraud Check (SELL orders only) ──
+        buyer_name = (
+            order_detail.get("buyerRealName", "").strip()
+            or buyer_info.get("realName", "").strip()
+            or ""
+        )
+        if buyer_name:
+            fraud = await asyncio.get_event_loop().run_in_executor(
+                None, check_buyer_name, buyer_name
+            )
+            if fraud["flagged"]:
+                match_label = {
+                    "exact":   "🔴 Exact match",
+                    "partial": "🟠 Partial match",
+                    "fuzzy":   "🟡 Similar name",
+                }.get(fraud["match_type"], "⚠️ Match")
+                warning_text = (
+                    f"🚨 *FRAUD WARNING — Order `{order_id}`*\n\n"
+                    f"👤 Buyer: *{buyer_name}*\n"
+                    f"{match_label} with known scammer: `{fraud['matched_name']}`\n"
+                    f"Similarity: `{fraud['similarity']:.0%}`\n\n"
+                    f"⛔ *Do NOT accept payment from this buyer.*\n"
+                    f"Fraudulent money / chargeback records found.\n\n"
+                    f"👉 Request order cancellation immediately."
+                )
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=warning_text,
+                    parse_mode="Markdown"
+                )
+                logger.warning(
+                    f"[FraudCheck] 🚨 FLAGGED {order_id} | buyer='{buyer_name}' "
+                    f"matched='{fraud['matched_name']}' type={fraud['match_type']}"
+                )
+
+        # ── Custom sell message ──
         if sell_msg_enabled and sell_custom_msg:
             for i in range(sell_msg_count):
                 await asyncio.get_event_loop().run_in_executor(
@@ -1915,6 +1952,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Unauthorized")
         return
     _admin_chat_ids.add(update.message.chat_id)
+    # Load scammer list on first start if not already loaded
+    if get_scammer_count() == 0:
+        asyncio.get_event_loop().run_in_executor(None, load_scammers)
     await send_menu(update, context)
 
 
@@ -3166,9 +3206,61 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Send a whole number like `25`", parse_mode="Markdown")
 
 
-# ─────────────────────────────────────────
-# 🔧 BUILD BOT
-# ─────────────────────────────────────────
+async def refresh_scammers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    await update.message.reply_text("⏳ Refreshing scammer list from GitHub...")
+    count = await asyncio.get_event_loop().run_in_executor(None, load_scammers)
+    updated = get_last_updated()
+    if count > 0:
+        await update.message.reply_text(
+            f"✅ *Scammer list refreshed!*\n\n"
+            f"📋 `{count}` names loaded\n"
+            f"🕐 Updated: `{updated}`",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text(
+            "❌ *Failed to load scammer list.*\n\n"
+            "Check that `scammers.txt` exists in your GitHub repo\n"
+            "and `SCAMMERS_FILE_URL` is set correctly.",
+            parse_mode="Markdown"
+        )
+
+
+async def check_name_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manually check a name against the scammer list. Usage: /checkname John Doe"""
+    if not is_admin(update.effective_user.id):
+        return
+    name = " ".join(context.args).strip() if context.args else ""
+    if not name:
+        await update.message.reply_text(
+            "Usage: `/checkname John Doe`\n\nChecks a name against your scammer list.",
+            parse_mode="Markdown"
+        )
+        return
+    fraud = await asyncio.get_event_loop().run_in_executor(None, check_buyer_name, name)
+    count = get_scammer_count()
+    if fraud["flagged"]:
+        match_label = {
+            "exact":   "🔴 Exact match",
+            "partial": "🟠 Partial match",
+            "fuzzy":   "🟡 Similar name",
+        }.get(fraud["match_type"], "⚠️ Match")
+        await update.message.reply_text(
+            f"🚨 *FLAGGED!*\n\n"
+            f"Name: `{name}`\n"
+            f"{match_label}: `{fraud['matched_name']}`\n"
+            f"Similarity: `{fraud['similarity']:.0%}`\n\n"
+            f"_(Checked against {count} names)_",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text(
+            f"✅ *Not found* — `{name}` is not in your scammer list.\n\n"
+            f"_(Checked against {count} names)_",
+            parse_mode="Markdown"
+        )
 def start_bot():
     global _paga_queue, _paga_worker_task
 
@@ -3178,20 +3270,24 @@ def start_bot():
         .updater(None)
         .build()
     )
-    application.add_handler(CommandHandler("start",           start))
-    application.add_handler(CommandHandler("menu",            menu_command))
-    application.add_handler(CommandHandler("pingbybit",       ping_bybit_command))
-    application.add_handler(CommandHandler("pingflutterwave", ping_flutterwave_command))
-    application.add_handler(CommandHandler("pingpaga",        ping_paga_command))
+    application.add_handler(CommandHandler("start",            start))
+    application.add_handler(CommandHandler("menu",             menu_command))
+    application.add_handler(CommandHandler("pingbybit",        ping_bybit_command))
+    application.add_handler(CommandHandler("pingflutterwave",  ping_flutterwave_command))
+    application.add_handler(CommandHandler("pingpaga",         ping_paga_command))
+    application.add_handler(CommandHandler("refreshscammers",  refresh_scammers_command))
+    application.add_handler(CommandHandler("checkname",        check_name_command))
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
-    # ── Initialise Paga payment queue + start worker ──
-    # Must run inside the event loop context — use post_init hook
     async def _post_init(app):
         global _paga_queue, _paga_worker_task
         _paga_queue       = asyncio.Queue()
         _paga_worker_task = asyncio.create_task(_paga_queue_worker())
+        # Pre-load scammer list at startup
+        asyncio.create_task(
+            asyncio.get_event_loop().run_in_executor(None, load_scammers)
+        )
         logger.info("🟡 Paga payment queue worker started")
 
     application.post_init = _post_init
