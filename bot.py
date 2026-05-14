@@ -1694,12 +1694,34 @@ async def _handle_sell_incoming(bot, chat_id, order_id):
         )
 
         # ── 🚨 Fraud Check (SELL orders only) ──
+        # Try every possible field Bybit may use for buyer name
         buyer_name = (
             order_detail.get("buyerRealName", "").strip()
+            or order_detail.get("targetRealName", "").strip()
             or buyer_info.get("realName", "").strip()
+            or buyer_info.get("nickName", "").strip()
             or ""
         )
-        if buyer_name:
+
+        # Always show verification status so you know it ran
+        scammer_count = get_scammer_count()
+        if not buyer_name:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"🔍 *Fraud Check — Order `{order_id}`*\n\n"
+                    f"⚠️ Buyer name not available yet at this stage.\n"
+                    f"Name will be checked again when buyer pays (status 20).\n"
+                    f"_(Database: {scammer_count} names loaded)_"
+                ),
+                parse_mode="Markdown"
+            )
+        else:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"🔍 *Verifying buyer name...*\n👤 `{buyer_name}`",
+                parse_mode="Markdown"
+            )
             fraud = await asyncio.get_event_loop().run_in_executor(
                 None, check_buyer_name, buyer_name
             )
@@ -1709,24 +1731,34 @@ async def _handle_sell_incoming(bot, chat_id, order_id):
                     "partial": "🟠 Partial match",
                     "fuzzy":   "🟡 Similar name",
                 }.get(fraud["match_type"], "⚠️ Match")
-                warning_text = (
-                    f"🚨 *FRAUD WARNING — Order `{order_id}`*\n\n"
-                    f"👤 Buyer: *{buyer_name}*\n"
-                    f"{match_label} with known scammer: `{fraud['matched_name']}`\n"
-                    f"Similarity: `{fraud['similarity']:.0%}`\n\n"
-                    f"⛔ *Do NOT accept payment from this buyer.*\n"
-                    f"Fraudulent money / chargeback records found.\n\n"
-                    f"👉 Request order cancellation immediately."
-                )
                 await bot.send_message(
                     chat_id=chat_id,
-                    text=warning_text,
+                    text=(
+                        f"🚨 *FRAUD WARNING — Order `{order_id}`*\n\n"
+                        f"👤 Buyer: *{buyer_name}*\n"
+                        f"{match_label}: `{fraud['matched_name']}`\n"
+                        f"Similarity: `{fraud['similarity']:.0%}`\n\n"
+                        f"⛔ *Do NOT accept payment from this buyer.*\n"
+                        f"Fraudulent / chargeback records found.\n\n"
+                        f"👉 Request order cancellation immediately."
+                    ),
                     parse_mode="Markdown"
                 )
                 logger.warning(
                     f"[FraudCheck] 🚨 FLAGGED {order_id} | buyer='{buyer_name}' "
                     f"matched='{fraud['matched_name']}' type={fraud['match_type']}"
                 )
+            else:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"✅ *Buyer Verified — Not in fraud list*\n\n"
+                        f"👤 `{buyer_name}`\n"
+                        f"_(Checked against {scammer_count} names)_"
+                    ),
+                    parse_mode="Markdown"
+                )
+                logger.info(f"[FraudCheck] ✅ Clean: '{buyer_name}' on order {order_id}")
 
         # ── Custom sell message ──
         if sell_msg_enabled and sell_custom_msg:
@@ -1763,6 +1795,60 @@ async def _handle_sell_paid(bot, chat_id, order_id):
             reply_markup=sell_order_buttons(order_id),
             parse_mode="Markdown"
         )
+
+        # ── 🚨 Fraud Check at paid stage (buyer name most reliable here) ──
+        buyer_name = (
+            order_detail.get("buyerRealName", "").strip()
+            or order_detail.get("targetRealName", "").strip()
+            or buyer_info.get("realName", "").strip()
+            or ""
+        )
+        if buyer_name:
+            scammer_count = get_scammer_count()
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"🔍 *Verifying buyer name before release...*\n👤 `{buyer_name}`",
+                parse_mode="Markdown"
+            )
+            fraud = await asyncio.get_event_loop().run_in_executor(
+                None, check_buyer_name, buyer_name
+            )
+            if fraud["flagged"]:
+                match_label = {
+                    "exact":   "🔴 Exact match",
+                    "partial": "🟠 Partial match",
+                    "fuzzy":   "🟡 Similar name",
+                }.get(fraud["match_type"], "⚠️ Match")
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"🚨 *FRAUD WARNING — DO NOT RELEASE*\n\n"
+                        f"Order: `{order_id}`\n"
+                        f"👤 Buyer: *{buyer_name}*\n"
+                        f"{match_label}: `{fraud['matched_name']}`\n"
+                        f"Similarity: `{fraud['similarity']:.0%}`\n\n"
+                        f"⛔ *Do NOT release coins to this buyer.*\n"
+                        f"Fraudulent / chargeback records found.\n\n"
+                        f"👉 Open a dispute or request cancellation."
+                    ),
+                    parse_mode="Markdown"
+                )
+                logger.warning(
+                    f"[FraudCheck] 🚨 PAID-STAGE FLAGGED {order_id} | "
+                    f"buyer='{buyer_name}' matched='{fraud['matched_name']}'"
+                )
+            else:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"✅ *Buyer Verified — Not in fraud list*\n\n"
+                        f"👤 `{buyer_name}`\n"
+                        f"_(Checked against {scammer_count} names)_\n\n"
+                        f"Safe to release coins."
+                    ),
+                    parse_mode="Markdown"
+                )
+
     except Exception as e:
         logger.error(f"[SELL paid] {order_id} error: {e}")
 
