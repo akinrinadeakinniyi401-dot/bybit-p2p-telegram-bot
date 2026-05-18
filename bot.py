@@ -21,6 +21,9 @@ from bybit import (
     take_ad_offline, put_ad_online,
 )
 from fraud_check import check_buyer_name, load_scammers, get_scammer_count, get_last_updated
+import db
+import subscription as sub
+from admin_commands import cmd_upgrade, cmd_downgrade, cmd_requests, cmd_listusers, cmd_userdata
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +100,10 @@ buyer_protection_threshold = 30   # minutes — configurable
 # ── Name Match settings ──
 name_match_enabled = False
 
+# ── Current user context (set per request) ──
+_current_user_id   = 0
+_current_plan_badge = "⚪ Free" 
+
 # ── Chat Monitor settings ──
 # Tracks the last seen message ID per order to avoid duplicate notifications
 # Format: { order_id: set_of_seen_message_ids }
@@ -119,6 +126,13 @@ NO_ACCOUNT_WARN_MSG = (
 )
 
 def is_admin(uid): return uid in ADMIN_IDS
+
+def _get_or_register_user(telegram_user):
+    """Register user in DB on first access. Returns (user_dict, is_new)."""
+    uid   = telegram_user.id
+    uname = telegram_user.username or ""
+    dname = telegram_user.full_name or ""
+    return db.get_or_create_user(uid, uname, dname)
 
 _admin_chat_ids: set = set()
 
@@ -185,6 +199,8 @@ def main_menu_keyboard():
         [InlineKeyboardButton(f"{r_icon} AD PRICE BOT",  callback_data="section_ads")],
         [InlineKeyboardButton(f"{o_icon} ORDER MONITOR", callback_data="section_orders")],
         [InlineKeyboardButton(f"{p_icon} AUTO-PAY",      callback_data="section_autopay")],
+        [InlineKeyboardButton("🔑 Set APIs",             callback_data="section_apis")],
+        [InlineKeyboardButton("⬆️ Upgrade Plan",         callback_data="upgrade_plan")],
         [InlineKeyboardButton("📡 Bot Status",           callback_data="bot_status")],
         [InlineKeyboardButton("🌍 Get My IP",            callback_data="get_my_ip")],
         [InlineKeyboardButton("🔁 Reset Session",        callback_data="reset_confirm")],
@@ -203,6 +219,7 @@ def main_menu_text():
 
     return (
         "🤖 *P2P Auto Bot — Control Panel*\n\n"
+        f"🆔 Your ID: `{_current_user_id}` | {_current_plan_badge}\n"
         f"🔑 Active Account: *{acct['label']}*\n"
         f"📋 Setup: {bar} `{done}/{total}`\n\n"
         f"┌ 📊 Price Bot: {r_status}\n"
@@ -2034,13 +2051,17 @@ async def edit_menu(query, text: str, keyboard: InlineKeyboardMarkup):
 # /start   /menu
 # ─────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("❌ Unauthorized")
-        return
+    tuser = update.effective_user
+    user, is_new = _get_or_register_user(tuser)
     _admin_chat_ids.add(update.message.chat_id)
-    # Load scammer list on first start if not already loaded
+
+    # Auto-downgrade expired pro users
+    db.check_and_auto_downgrade(tuser.id)
+
+    # Load scammer list if empty
     if get_scammer_count() == 0:
         asyncio.get_event_loop().run_in_executor(None, load_scammers)
+
     await send_menu(update, context)
 
 
@@ -2185,6 +2206,22 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data    = query.data
     chat_id = query.message.chat_id
+
+    # ── Register/update user on every interaction ──
+    global _current_user_id, _current_plan_badge
+    tuser = query.from_user
+    user_rec, _ = _get_or_register_user(tuser)
+    db.check_and_auto_downgrade(tuser.id)
+    _current_user_id    = tuser.id
+    _current_plan_badge = sub.plan_badge(tuser.id)
+
+    # ── Pro feature guard ──
+    if sub.requires_pro(data) and not sub.is_pro(tuser.id) and not is_admin(tuser.id):
+        await query.answer(
+            "🔒 Pro plan required. Tap Upgrade Plan in the menu.",
+            show_alert=True
+        )
+        return
 
     # ── 🏠 Main menu ──
     if data == "main_menu":
@@ -2978,6 +3015,148 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
 
+    # ── 🔑 API Setup Section ──
+    elif data == "section_apis":
+        uid     = query.from_user.id
+        bk      = "✅" if db.get_api(uid, "bybit_key")      else "❌"
+        fk      = "✅" if db.get_api(uid, "flw_key")        else "❌"
+        pk      = "✅" if db.get_api(uid, "paga_principal") else "❌"
+        await edit_menu(query,
+            f"🔑 *API Setup*\n\n"
+            f"Your API keys are stored securely on the server.\n\n"
+            f"Bybit API: {bk}\n"
+            f"Flutterwave API: {fk}\n"
+            f"Paga API: {pk}\n\n"
+            f"⚠️ Keys are encrypted per account and never shared.",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton(f"🔑 {bk} Set Bybit API",       callback_data="set_api_bybit")],
+                [InlineKeyboardButton(f"🟢 {fk} Set Flutterwave API", callback_data="set_api_flw")],
+                [InlineKeyboardButton(f"🟡 {pk} Set Paga API",        callback_data="set_api_paga")],
+                [InlineKeyboardButton("🗑 Delete All APIs",            callback_data="delete_apis")],
+                *back_main()
+            ])
+        )
+
+    elif data == "set_api_bybit":
+        user_state["action"]       = "api_bybit_key"
+        user_state["prev_section"] = "section_apis"
+        uid = query.from_user.id
+        has = bool(db.get_api(uid, "bybit_key"))
+        await edit_menu(query,
+            f"🔑 *Set Bybit API Key*\n\n"
+            f"Status: {'✅ Key already saved — sending new one will replace it' if has else '❌ Not set'}\n\n"
+            "Send your Bybit API Key.",
+            InlineKeyboardMarkup(back_section("section_apis"))
+        )
+
+    elif data == "set_api_flw":
+        user_state["action"]       = "api_flw_key"
+        user_state["prev_section"] = "section_apis"
+        uid = query.from_user.id
+        has = bool(db.get_api(uid, "flw_key"))
+        await edit_menu(query,
+            f"🟢 *Set Flutterwave API*\n\n"
+            f"Status: {'✅ Already configured' if has else '❌ Not set'}\n\n"
+            "Step 1 of 3: Send your FLW Secret Key\n(starts with `FLWSECK_`)",
+            InlineKeyboardMarkup(back_section("section_apis"))
+        )
+
+    elif data == "set_api_paga":
+        user_state["action"]       = "api_paga_principal"
+        user_state["prev_section"] = "section_apis"
+        uid = query.from_user.id
+        has = bool(db.get_api(uid, "paga_principal"))
+        await edit_menu(query,
+            f"🟡 *Set Paga API*\n\n"
+            f"Status: {'✅ Already configured' if has else '❌ Not set'}\n\n"
+            "Step 1 of 3: Send your Paga Principal (Public Key).",
+            InlineKeyboardMarkup(back_section("section_apis"))
+        )
+
+    elif data == "delete_apis":
+        await edit_menu(query,
+            "🗑 *Delete All APIs?*\n\n"
+            "This removes all your stored API keys from the server.\n"
+            "You will need to re-enter them to use the bot again.\n\nAre you sure?",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Yes, Delete All", callback_data="delete_apis_confirm")],
+                [InlineKeyboardButton("❌ Cancel",          callback_data="section_apis")],
+            ])
+        )
+
+    elif data == "delete_apis_confirm":
+        db.delete_all_apis(query.from_user.id)
+        await edit_menu(query,
+            "✅ *All API keys deleted.*\n\n"
+            "Your account is still active but API credentials have been removed.\n"
+            "Re-enter them anytime via 🔑 Set APIs.",
+            InlineKeyboardMarkup(back_main())
+        )
+
+    # ── ⬆️ Upgrade Plan ──
+    elif data == "upgrade_plan":
+        uid   = query.from_user.id
+        badge = sub.plan_badge(uid)
+        exp   = db.get_plan_expiry_str(uid)
+        user_rec = db.get_user(uid)
+        pend  = user_rec.get("upgrade_pending", False) if user_rec else False
+        if db.is_pro(uid):
+            await edit_menu(query,
+                f"💎 *You are already on Pro!*\n\n{exp}\n\nAll features are unlocked.",
+                InlineKeyboardMarkup(back_main())
+            )
+            return
+        if pend:
+            await edit_menu(query,
+                "⏳ *Upgrade request already pending.*\n\n"
+                "The admin will review and approve shortly.\n"
+                "You will receive a notification when approved.",
+                InlineKeyboardMarkup(back_main())
+            )
+            return
+        await edit_menu(query,
+            f"⬆️ *Upgrade to Pro Plan*\n\n"
+            f"Current: {badge}\n\n"
+            f"Pro unlocks:\n"
+            f"  ✅ Auto Price Update bot\n"
+            f"  ✅ Order Monitor + Chat Monitor\n"
+            f"  ✅ Auto-Pay (Bybit, FLW, Paga)\n"
+            f"  ✅ Buyer Protection & Name Match\n"
+            f"  ✅ All ad management features\n\n"
+            f"Tap *Request Upgrade* to send a request to the admin.",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Request Upgrade", callback_data="upgrade_request_yes")],
+                [InlineKeyboardButton("❌ Cancel",          callback_data="main_menu")],
+            ])
+        )
+
+    elif data == "upgrade_request_yes":
+        uid   = query.from_user.id
+        uname = query.from_user.username or ""
+        dname = query.from_user.full_name or ""
+        db.request_upgrade(uid, uname, dname)
+        for admin_id in _admin_chat_ids:
+            try:
+                await context.bot.send_message(
+                    chat_id=admin_id,
+                    text=(
+                        f"🔔 *New Upgrade Request!*\n\n"
+                        f"👤 User ID: `{uid}`\n"
+                        f"Username: @{uname}\n"
+                        f"Name: {dname}\n\n"
+                        f"Approve: `/upgrade {uid} 30`"
+                    ),
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
+        await edit_menu(query,
+            "⏳ *Upgrade Request Sent!*\n\n"
+            "The admin has been notified and will review shortly.\n"
+            "You will receive a message once approved.",
+            InlineKeyboardMarkup(back_main())
+        )
+
     # ── 🟢/🔴 Toggle Price Update ──
     elif data == "toggle_refresh":
         if refresh_running:
@@ -3125,6 +3304,93 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async def reply_with_back(msg: str):
         """Reply with success message + back-to-previous button."""
         await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=back_prev(prev))
+
+    if action == "api_bybit_key":
+        val = text.strip()
+        user_state["action"]       = "api_bybit_secret"
+        user_state["prev_section"] = "section_apis"
+        user_state["_api_bybit_key_temp"] = val
+        await update.message.reply_text(
+            f"✅ API Key received.\n\nStep 2 of 2: Send your Bybit *API Secret*.",
+            parse_mode="Markdown"
+        )
+        return
+
+    elif action == "api_bybit_secret":
+        uid = update.effective_user.id
+        key_temp = user_state.pop("_api_bybit_key_temp", "")
+        db.save_api(uid, "bybit_key",    key_temp)
+        db.save_api(uid, "bybit_secret", text.strip())
+        user_state["action"] = None
+        await update.message.reply_text(
+            "✅ *Bybit API saved!*\n\nKey and Secret stored securely.\n"
+            "The bot will use your API for all Bybit requests.",
+            parse_mode="Markdown",
+            reply_markup=back_prev("section_apis")
+        )
+        return
+
+    elif action == "api_flw_key":
+        user_state["action"]               = "api_flw_secret"
+        user_state["_api_flw_key_temp"]    = text.strip()
+        await update.message.reply_text(
+            "✅ FLW Secret Key received.\n\nStep 2 of 3: Send your FLW *Secret Hash*.",
+            parse_mode="Markdown"
+        )
+        return
+
+    elif action == "api_flw_secret":
+        user_state["action"]               = "api_flw_hash"
+        user_state["_api_flw_secret_temp"] = text.strip()
+        await update.message.reply_text(
+            "✅ FLW Secret received.\n\nStep 3 of 3: Send your FLW *Secret Hash*.",
+            parse_mode="Markdown"
+        )
+        return
+
+    elif action == "api_flw_hash":
+        uid = update.effective_user.id
+        db.save_api(uid, "flw_key",    user_state.pop("_api_flw_key_temp", ""))
+        db.save_api(uid, "flw_secret", user_state.pop("_api_flw_secret_temp", ""))
+        db.save_api(uid, "flw_hash",   text.strip())
+        user_state["action"] = None
+        await update.message.reply_text(
+            "✅ *Flutterwave API saved!*\n\nKey, Secret and Hash stored securely.",
+            parse_mode="Markdown",
+            reply_markup=back_prev("section_apis")
+        )
+        return
+
+    elif action == "api_paga_principal":
+        user_state["action"]                    = "api_paga_credential"
+        user_state["_api_paga_principal_temp"]  = text.strip()
+        await update.message.reply_text(
+            "✅ Paga Principal received.\n\nStep 2 of 3: Send your Paga *Credential* (password).",
+            parse_mode="Markdown"
+        )
+        return
+
+    elif action == "api_paga_credential":
+        user_state["action"]                     = "api_paga_api_key"
+        user_state["_api_paga_credential_temp"]  = text.strip()
+        await update.message.reply_text(
+            "✅ Paga Credential received.\n\nStep 3 of 3: Send your Paga *API Key* (HMAC hash key).",
+            parse_mode="Markdown"
+        )
+        return
+
+    elif action == "api_paga_api_key":
+        uid = update.effective_user.id
+        db.save_api(uid, "paga_principal",  user_state.pop("_api_paga_principal_temp", ""))
+        db.save_api(uid, "paga_credential", user_state.pop("_api_paga_credential_temp", ""))
+        db.save_api(uid, "paga_api_key",    text.strip())
+        user_state["action"] = None
+        await update.message.reply_text(
+            "✅ *Paga API saved!*\n\nPrincipal, Credential and API Key stored securely.",
+            parse_mode="Markdown",
+            reply_markup=back_prev("section_apis")
+        )
+        return
 
     if action == "manage_ad_id":
         user_settings["manage_ad_id"] = text.strip()
@@ -3292,6 +3558,57 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Send a whole number like `25`", parse_mode="Markdown")
 
 
+async def _session_auto_reset_loop():
+    """Reset stale in-memory sessions every hour to prevent slowdown."""
+    while True:
+        await asyncio.sleep(3600)
+        try:
+            from datetime import datetime
+            now = datetime.now()
+            stale_count = 0
+            # Reset P2P volatile data for any session older than 12h
+            for k in list(user_state.keys()):
+                pass   # user_state is per-interaction, nothing to clean
+            # Clear unpaid_orders_log if too large
+            global unpaid_orders_log
+            if len(unpaid_orders_log) > 500:
+                unpaid_orders_log = unpaid_orders_log[-100:]
+                logger.info("[AutoReset] Trimmed unpaid_orders_log to 100 entries")
+            # Clear old seen message IDs to free memory
+            global seen_chat_msg_ids
+            if len(seen_chat_msg_ids) > 200:
+                # Keep only the 50 most recent orders
+                keys = list(seen_chat_msg_ids.keys())
+                for k in keys[:-50]:
+                    del seen_chat_msg_ids[k]
+                logger.info(f"[AutoReset] Trimmed seen_chat_msg_ids")
+            # Trim order tracking sets
+            global seen_order_ids, paid_order_ids, seen_sell_order_ids, released_order_ids
+            MAX_IDS = 1000
+            if len(seen_order_ids) > MAX_IDS:
+                seen_order_ids = set(list(seen_order_ids)[-MAX_IDS:])
+            if len(paid_order_ids) > MAX_IDS:
+                paid_order_ids = set(list(paid_order_ids)[-MAX_IDS:])
+            if len(seen_sell_order_ids) > MAX_IDS:
+                seen_sell_order_ids = set(list(seen_sell_order_ids)[-MAX_IDS:])
+            if len(released_order_ids) > MAX_IDS:
+                released_order_ids = set(list(released_order_ids)[-MAX_IDS:])
+            logger.info("[AutoReset] Hourly memory cleanup done")
+        except Exception as e:
+            logger.error(f"[AutoReset] Error: {e}")
+
+
+async def _db_session_cleanup_loop():
+    """Clear old disk session files every 12 hours."""
+    while True:
+        await asyncio.sleep(12 * 3600)
+        try:
+            count = db.clear_all_old_sessions()
+            logger.info(f"[DBCleanup] Cleared {count} stale disk sessions")
+        except Exception as e:
+            logger.error(f"[DBCleanup] Error: {e}")
+
+
 async def refresh_scammers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
@@ -3356,6 +3673,7 @@ def start_bot():
         .updater(None)
         .build()
     )
+    # ── User commands ──
     application.add_handler(CommandHandler("start",            start))
     application.add_handler(CommandHandler("menu",             menu_command))
     application.add_handler(CommandHandler("pingbybit",        ping_bybit_command))
@@ -3363,6 +3681,14 @@ def start_bot():
     application.add_handler(CommandHandler("pingpaga",         ping_paga_command))
     application.add_handler(CommandHandler("refreshscammers",  refresh_scammers_command))
     application.add_handler(CommandHandler("checkname",        check_name_command))
+
+    # ── Admin-only commands ──
+    application.add_handler(CommandHandler("upgrade",    cmd_upgrade))
+    application.add_handler(CommandHandler("downgrade",  cmd_downgrade))
+    application.add_handler(CommandHandler("requests",   cmd_requests))
+    application.add_handler(CommandHandler("listusers",  cmd_listusers))
+    application.add_handler(CommandHandler("userdata",   cmd_userdata))
+
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
@@ -3370,11 +3696,19 @@ def start_bot():
         global _paga_queue, _paga_worker_task
         _paga_queue       = asyncio.Queue()
         _paga_worker_task = asyncio.create_task(_paga_queue_worker())
-        # Pre-load scammer list at startup
+
+        # Pre-load scammer list
         asyncio.create_task(
             asyncio.get_event_loop().run_in_executor(None, load_scammers)
         )
-        logger.info("🟡 Paga payment queue worker started")
+
+        # Auto-reset stale sessions every hour
+        asyncio.create_task(_session_auto_reset_loop())
+
+        # Auto-clear old DB sessions every 12h
+        asyncio.create_task(_db_session_cleanup_loop())
+
+        logger.info("🟡 Paga queue + session manager started")
 
     application.post_init = _post_init
     logger.info("🤖 Bot handlers registered")
