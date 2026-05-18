@@ -219,13 +219,18 @@ async def run_bot_setup(render_url):
         logger.info("🟡 Paga payment queue worker started from app.py")
     await bot.bot.set_webhook(url=webhook_url)
     await bot.bot.set_my_commands([
-        BotCommand("start",            "🤖 Start the bot"),
-        BotCommand("menu",             "📋 Open control panel"),
-        BotCommand("pingbybit",        "🔌 Test Bybit API connection"),
-        BotCommand("pingflutterwave",  "🔌 Test Flutterwave connection"),
-        BotCommand("pingpaga",         "🔌 Test Paga connection"),
-        BotCommand("refreshscammers",  "🚨 Refresh scammer list from GitHub"),
-        BotCommand("checkname",        "🔍 Check a name against scammer list"),
+        BotCommand("start",           "🤖 Start the bot"),
+        BotCommand("menu",            "📋 Open control panel"),
+        BotCommand("pingbybit",       "🔌 Test Bybit API connection"),
+        BotCommand("pingflutterwave", "🔌 Test Flutterwave connection"),
+        BotCommand("pingpaga",        "🔌 Test Paga connection"),
+        BotCommand("refreshscammers", "🚨 Refresh scammer list from GitHub"),
+        BotCommand("checkname",       "🔍 Check a name against scammer list"),
+        BotCommand("upgrade",         "⬆️ Admin: upgrade user (admin only)"),
+        BotCommand("downgrade",       "⬇️ Admin: downgrade user (admin only)"),
+        BotCommand("requests",        "📋 Admin: view upgrade requests (admin only)"),
+        BotCommand("listusers",       "👥 Admin: list all users (admin only)"),
+        BotCommand("userdata",        "📊 Admin: download user Excel (admin only)"),
     ])
     bot_app = bot
     logger.info("✅ Bot ready")
@@ -255,6 +260,14 @@ if __name__ == "__main__":
     if not render_url:
         logger.error("❌ RENDER_EXTERNAL_URL not set")
         raise SystemExit(1)
+
+    # Initialise persistent disk database
+    try:
+        import db
+        db._init_dirs()
+        logger.info(f"✅ Disk DB initialised at {os.getenv('DISK_PATH', '/data')}")
+    except Exception as e:
+        logger.warning(f"⚠️ Disk DB init warning: {e} — will retry on first use")
 
     logger.info(f"  📡 Flutterwave webhook URL : {render_url}/flw-webhook")
     logger.info(f"  📡 Paga webhook URL        : {render_url}/paga-webhook")
