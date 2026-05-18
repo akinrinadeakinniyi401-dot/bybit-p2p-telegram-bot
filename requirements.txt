@@ -4,3 +4,4 @@ requests
 flask
 python-dotenv
 paga-business-client
+openpyxl
