@@ -4,7 +4,11 @@ load_dotenv()
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 
-# ── Multiple Bybit accounts ──
+# ── Render persistent disk mount path ──
+# Set DISK_PATH in Render environment to match your disk mount point (default /data)
+DISK_PATH = os.getenv("DISK_PATH", "/data")
+
+# ── Multiple Bybit accounts (admin/env fallback) ──
 # Set BYBIT_API_KEY_1, BYBIT_API_SECRET_1, BYBIT_ACCOUNT_LABEL_1 etc. in Render
 BYBIT_ACCOUNTS = []
 for i in range(1, 10):
