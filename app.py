@@ -56,10 +56,13 @@ def webhook():
     try:
         data   = request.get_json(force=True)
         update = Update.de_json(data, bot_app.bot)
-        future = asyncio.run_coroutine_threadsafe(
+        # Fire-and-forget — do NOT block on future.result().
+        # Blocking here causes a deadlock/timeout when the handler itself
+        # needs to send messages (e.g. upgrade_request_yes notifying admins),
+        # which freezes the entire bot for all users until redeploy.
+        asyncio.run_coroutine_threadsafe(
             bot_app.process_update(update), bot_loop
         )
-        future.result(timeout=30)
         return jsonify({"status": "ok"}), 200
     except Exception as e:
         logger.exception(f"Telegram webhook error: {e}")
@@ -218,6 +221,7 @@ async def run_bot_setup(render_url):
         bot_module._paga_worker_task = asyncio.create_task(bot_module._paga_queue_worker())
         logger.info("🟡 Paga payment queue worker started from app.py")
     await bot.bot.set_webhook(url=webhook_url)
+    # Set commands visible to regular users (no admin commands)
     await bot.bot.set_my_commands([
         BotCommand("start",           "🤖 Start the bot"),
         BotCommand("menu",            "📋 Open control panel"),
@@ -226,12 +230,28 @@ async def run_bot_setup(render_url):
         BotCommand("pingpaga",        "🔌 Test Paga connection"),
         BotCommand("refreshscammers", "🚨 Refresh scammer list from GitHub"),
         BotCommand("checkname",       "🔍 Check a name against scammer list"),
-        BotCommand("upgrade",         "⬆️ Admin: upgrade user (admin only)"),
-        BotCommand("downgrade",       "⬇️ Admin: downgrade user (admin only)"),
-        BotCommand("requests",        "📋 Admin: view upgrade requests (admin only)"),
-        BotCommand("listusers",       "👥 Admin: list all users (admin only)"),
-        BotCommand("userdata",        "📊 Admin: download user Excel (admin only)"),
     ])
+    # Set extra admin-only commands visible only in admin chats
+    from telegram import BotCommandScopeChat
+    from config import ADMIN_IDS
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.bot.set_my_commands([
+                BotCommand("start",           "🤖 Start the bot"),
+                BotCommand("menu",            "📋 Open control panel"),
+                BotCommand("pingbybit",       "🔌 Test Bybit API connection"),
+                BotCommand("pingflutterwave", "🔌 Test Flutterwave connection"),
+                BotCommand("pingpaga",        "🔌 Test Paga connection"),
+                BotCommand("refreshscammers", "🚨 Refresh scammer list from GitHub"),
+                BotCommand("checkname",       "🔍 Check a name against scammer list"),
+                BotCommand("upgrade",         "⬆️ Upgrade user"),
+                BotCommand("downgrade",       "⬇️ Downgrade user"),
+                BotCommand("requests",        "📋 View upgrade requests"),
+                BotCommand("listusers",       "👥 List all users"),
+                BotCommand("userdata",        "📊 Download user Excel"),
+            ], scope=BotCommandScopeChat(chat_id=admin_id))
+        except Exception as e:
+            logger.warning(f"Could not set admin commands for {admin_id}: {e}")
     bot_app = bot
     logger.info("✅ Bot ready")
 
