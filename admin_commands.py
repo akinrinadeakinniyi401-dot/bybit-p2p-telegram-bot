@@ -58,14 +58,15 @@ async def cmd_upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Notify the user
     try:
+        exp_str = updated.get("plan_expires", "")
         await context.bot.send_message(
             chat_id=target_id,
             text=(
                 f"🎉 *Your upgrade has been approved!*\n\n"
                 f"💎 Plan: *Pro*\n"
-                f"⏰ Expires: `{updated.get('plan_expires','')}`\n\n"
+                f"⏰ Expires: `{exp_str}`\n\n"
                 f"You now have full access to all bot features.\n"
-                f"Tap /menu to get started!"
+                f"Tap /menu to see your updated profile!"
             ),
             parse_mode="Markdown"
         )
