@@ -2061,6 +2061,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Auto-downgrade expired pro users
     db.check_and_auto_downgrade(tuser.id)
 
+    # ── Always refresh plan badge from DB so Pro shows instantly after upgrade ──
+    # Without this, _current_plan_badge stays stale from the last interaction
+    # and the menu still shows "⚪ Free" even after admin approves the upgrade.
+    global _current_user_id, _current_plan_badge
+    _current_user_id    = tuser.id
+    _current_plan_badge = sub.plan_badge(tuser.id)
+
     # Load scammer list if empty
     if get_scammer_count() == 0:
         asyncio.get_event_loop().run_in_executor(None, load_scammers)
@@ -2228,13 +2235,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if "state" not in context.user_data:
             context.user_data["state"] = {}
         _btn_state = context.user_data["state"]
-        # Load this user's saved Bybit API credentials (if any) into bybit module
-        _u_key    = db.get_api(tuser.id, "bybit_key")
-        _u_secret = db.get_api(tuser.id, "bybit_secret")
+        # Load this user's saved Bybit credentials for the CURRENTLY ACTIVE account slot.
+        # Account 1 (index 0) → bybit_key_1 / bybit_secret_1
+        # Account 2 (index 1) → bybit_key_2 / bybit_secret_2
+        _slot     = str(bybit._active_index + 1)
+        _u_key    = db.get_api(tuser.id, f"bybit_key_{_slot}")
+        _u_secret = db.get_api(tuser.id, f"bybit_secret_{_slot}")
         if _u_key and _u_secret:
             set_user_credentials(_u_key, _u_secret)
         else:
-            restore_env_account()  # fall back to env keys if user has none saved
+            restore_env_account()  # fall back to env keys if user has none saved for this slot
 
     # ── Pro feature guard ──
     # Block non-admin free users from ALL functional sections.
@@ -3067,35 +3077,67 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── 🔑 API Setup Section ──
     elif data == "section_apis":
-        uid     = query.from_user.id
-        bk      = "✅" if db.get_api(uid, "bybit_key")      else "❌"
-        fk      = "✅" if db.get_api(uid, "flw_key")        else "❌"
-        pk      = "✅" if db.get_api(uid, "paga_principal") else "❌"
+        uid  = query.from_user.id
+        bk1  = "✅" if db.get_api(uid, "bybit_key_1")    else "❌"
+        bk2  = "✅" if db.get_api(uid, "bybit_key_2")    else "❌"
+        fk   = "✅" if db.get_api(uid, "flw_key")        else "❌"
+        pk   = "✅" if db.get_api(uid, "paga_principal") else "❌"
         await edit_menu(query,
             f"🔑 *API Setup*\n\n"
             f"Your API keys are stored securely on the server.\n\n"
-            f"Bybit API: {bk}\n"
+            f"Bybit Account 1 API: {bk1}\n"
+            f"Bybit Account 2 API: {bk2}\n"
             f"Flutterwave API: {fk}\n"
             f"Paga API: {pk}\n\n"
-            f"⚠️ Keys are encrypted per account and never shared.",
+            f"⚠️ Keys are encrypted per user and never shared.\n"
+            f"⚠️ Both FLW and Paga are shared across both Bybit accounts.",
             InlineKeyboardMarkup([
-                [InlineKeyboardButton(f"🔑 {bk} Set Bybit API",       callback_data="set_api_bybit")],
-                [InlineKeyboardButton(f"🟢 {fk} Set Flutterwave API", callback_data="set_api_flw")],
-                [InlineKeyboardButton(f"🟡 {pk} Set Paga API",        callback_data="set_api_paga")],
-                [InlineKeyboardButton("🗑 Delete All APIs",            callback_data="delete_apis")],
+                [InlineKeyboardButton(f"🔑 {bk1} Set Bybit Account 1 API", callback_data="set_api_bybit_1")],
+                [InlineKeyboardButton(f"🔑 {bk2} Set Bybit Account 2 API", callback_data="set_api_bybit_2")],
+                [InlineKeyboardButton(f"🟢 {fk} Set Flutterwave API",      callback_data="set_api_flw")],
+                [InlineKeyboardButton(f"🟡 {pk} Set Paga API",             callback_data="set_api_paga")],
+                [InlineKeyboardButton("🗑 Delete All APIs",                 callback_data="delete_apis")],
                 *back_main()
             ])
         )
 
     elif data == "set_api_bybit":
-        _btn_state["action"]       = "api_bybit_key"
+        # Legacy callback — redirect to account 1
+        _btn_state["action"]       = "api_bybit_key_1"
         _btn_state["prev_section"] = "section_apis"
+        _btn_state["_api_bybit_slot"] = "1"
         uid = query.from_user.id
-        has = bool(db.get_api(uid, "bybit_key"))
+        has = bool(db.get_api(uid, "bybit_key_1"))
         await edit_menu(query,
-            f"🔑 *Set Bybit API Key*\n\n"
-            f"Status: {'✅ Key already saved — sending new one will replace it' if has else '❌ Not set'}\n\n"
-            "Send your Bybit API Key.",
+            f"🔑 *Set Bybit Account 1 API Key*\n\n"
+            f"Status: {'✅ Key saved — new key will replace it' if has else '❌ Not set'}\n\n"
+            "Send your Bybit API Key for Account 1.",
+            InlineKeyboardMarkup(back_section("section_apis"))
+        )
+
+    elif data == "set_api_bybit_1":
+        _btn_state["action"]          = "api_bybit_key_1"
+        _btn_state["prev_section"]    = "section_apis"
+        _btn_state["_api_bybit_slot"] = "1"
+        uid = query.from_user.id
+        has = bool(db.get_api(uid, "bybit_key_1"))
+        await edit_menu(query,
+            f"🔑 *Set Bybit Account 1 API Key*\n\n"
+            f"Status: {'✅ Key saved — new key will replace it' if has else '❌ Not set'}\n\n"
+            "Send your Bybit API Key for Account 1.",
+            InlineKeyboardMarkup(back_section("section_apis"))
+        )
+
+    elif data == "set_api_bybit_2":
+        _btn_state["action"]          = "api_bybit_key_2"
+        _btn_state["prev_section"]    = "section_apis"
+        _btn_state["_api_bybit_slot"] = "2"
+        uid = query.from_user.id
+        has = bool(db.get_api(uid, "bybit_key_2"))
+        await edit_menu(query,
+            f"🔑 *Set Bybit Account 2 API Key*\n\n"
+            f"Status: {'✅ Key saved — new key will replace it' if has else '❌ Not set'}\n\n"
+            "Send your Bybit API Key for Account 2.",
             InlineKeyboardMarkup(back_section("section_apis"))
         )
 
@@ -3135,7 +3177,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "delete_apis_confirm":
-        db.delete_all_apis(query.from_user.id)
+        uid_del = query.from_user.id
+        db.delete_all_apis(uid_del)
         await edit_menu(query,
             "✅ *All API keys deleted.*\n\n"
             "Your account is still active but API credentials have been removed.\n"
@@ -3185,21 +3228,31 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uname = query.from_user.username or ""
         dname = query.from_user.full_name or ""
         db.request_upgrade(uid, uname, dname)
-        for admin_id in _admin_chat_ids:
-            try:
-                await context.bot.send_message(
-                    chat_id=admin_id,
-                    text=(
-                        f"🔔 *New Upgrade Request!*\n\n"
-                        f"👤 User ID: `{uid}`\n"
-                        f"Username: @{uname}\n"
-                        f"Name: {dname}\n\n"
-                        f"Approve: `/upgrade {uid} 30`"
-                    ),
-                    parse_mode="Markdown"
-                )
-            except Exception:
-                pass
+
+        # ── Notify admin in a fire-and-forget background task ──
+        # We MUST NOT await this inside the button_handler because sending
+        # a Telegram message to the admin while the webhook is waiting for
+        # this coroutine to finish causes a deadlock that freezes the bot
+        # for every user. The fix: schedule it as a separate asyncio task.
+        async def _notify_admins():
+            msg = (
+                f"🔔 *New Upgrade Request!*\n\n"
+                f"👤 User ID: `{uid}`\n"
+                f"Username: @{uname}\n"
+                f"Name: {dname}\n\n"
+                f"Approve: `/upgrade {uid} 30`"
+            )
+            for admin_id in list(_admin_chat_ids):
+                try:
+                    await context.bot.send_message(
+                        chat_id=admin_id, text=msg, parse_mode="Markdown"
+                    )
+                except Exception as _e:
+                    logger.warning(f"[Upgrade] Could not notify admin {admin_id}: {_e}")
+
+        asyncio.create_task(_notify_admins())
+
+        # Immediately update the user's screen — no waiting for admin notify
         await edit_menu(query,
             "⏳ *Upgrade Request Sent!*\n\n"
             "The admin has been notified and will review shortly.\n"
@@ -3369,30 +3422,37 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Reply with success message + back-to-previous button."""
         await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=back_prev(prev))
 
-    if action == "api_bybit_key":
-        val = text.strip()
-        _state["action"]       = "api_bybit_secret"
-        _state["prev_section"] = "section_apis"
+    # ── Bybit API — slot-aware (Account 1 or Account 2) ──
+    if action in ("api_bybit_key", "api_bybit_key_1", "api_bybit_key_2"):
+        slot = "2" if action == "api_bybit_key_2" else "1"
+        val  = text.strip()
+        next_action = f"api_bybit_secret_{slot}"
+        _state["action"]              = next_action
+        _state["prev_section"]        = "section_apis"
         _state["_api_bybit_key_temp"] = val
+        _state["_api_bybit_slot"]     = slot
         await update.message.reply_text(
-            f"✅ API Key received.\n\nStep 2 of 2: Send your Bybit *API Secret*.",
+            f"✅ Account {slot} API Key received.\n\n"
+            f"Step 2 of 2: Send your Bybit Account {slot} *API Secret*.",
             parse_mode="Markdown"
         )
         return
 
-    elif action == "api_bybit_secret":
-        uid = update.effective_user.id
+    elif action in ("api_bybit_secret", "api_bybit_secret_1", "api_bybit_secret_2"):
+        uid      = update.effective_user.id
+        slot     = _state.pop("_api_bybit_slot", "1")
         key_temp = _state.pop("_api_bybit_key_temp", "")
-        db.save_api(uid, "bybit_key",    key_temp)
-        db.save_api(uid, "bybit_secret", text.strip())
-        # Load the new credentials into bybit module immediately so this session
-        # uses them right away without requiring a restart.
-        if not is_admin(uid):
+        db.save_api(uid, f"bybit_key_{slot}",    key_temp)
+        db.save_api(uid, f"bybit_secret_{slot}", text.strip())
+        # Determine which account slot is currently active and load if it matches
+        active_idx   = str(bybit._active_index + 1)   # 0→"1", 1→"2"
+        if not is_admin(uid) and active_idx == slot:
             set_user_credentials(key_temp, text.strip())
         _state["action"] = None
         await update.message.reply_text(
-            "✅ *Bybit API saved!*\n\nKey and Secret stored securely.\n"
-            "The bot will use your API for all Bybit requests.",
+            f"✅ *Bybit Account {slot} API saved!*\n\n"
+            f"Key and Secret stored securely.\n"
+            f"The bot uses Account {slot} keys when Account {slot} is active.",
             parse_mode="Markdown",
             reply_markup=back_prev("section_apis")
         )
@@ -3678,8 +3738,8 @@ async def _db_session_cleanup_loop():
 
 
 async def refresh_scammers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        return
+    # Available to all registered users (not admin-only)
+    _get_or_register_user(update.effective_user)
     await update.message.reply_text("⏳ Refreshing scammer list from GitHub...")
     count = await asyncio.get_event_loop().run_in_executor(None, load_scammers)
     updated = get_last_updated()
@@ -3701,8 +3761,8 @@ async def refresh_scammers_command(update: Update, context: ContextTypes.DEFAULT
 
 async def check_name_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Manually check a name against the scammer list. Usage: /checkname John Doe"""
-    if not is_admin(update.effective_user.id):
-        return
+    # Available to all registered users (not admin-only)
+    _get_or_register_user(update.effective_user)
     name = " ".join(context.args).strip() if context.args else ""
     if not name:
         await update.message.reply_text(
