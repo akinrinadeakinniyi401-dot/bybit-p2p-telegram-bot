@@ -14,6 +14,7 @@ from bybit import (
     get_btc_usdt_price, get_eth_usdt_price, get_token_usdt_price,
     get_max_float_pct, get_min_float_pct, currency_needs_ref,
     get_pending_orders, get_sell_orders, get_incoming_sell_orders, get_order_detail,
+    set_user_credentials, restore_env_account,
     get_counterparty_info, mark_order_paid,
     send_chat_message, get_payment_name, release_assets,
     set_active_account, get_active_account, get_all_accounts,
@@ -32,43 +33,6 @@ logger = logging.getLogger(__name__)
 # ─────────────────────────────────────────
 BANNER_URL = "https://raw.githubusercontent.com/akinrinadeakinniyi401-dot/bybit-p2p-telegram-bot/main/photo_6017280178934975538_x.jpg"
 
-
-
-
-def _get_user_bybit_api(user_id: int) -> tuple[str, str]:
-    """
-    Return (api_key, api_secret) for this user.
-    1. Try user's own keys from disk (db)
-    2. Fall back to env-var keys (admin default / single-tenant mode)
-    """
-    key    = db.get_api(user_id, "bybit_key")
-    secret = db.get_api(user_id, "bybit_secret")
-    if key and secret:
-        return key.strip(), secret.strip()
-    # Fall back to environment / config (admin keys or single-tenant setup)
-    from config import BYBIT_ACCOUNTS
-    if BYBIT_ACCOUNTS:
-        acct = BYBIT_ACCOUNTS[bybit._active_index]
-        return acct.get("key", ""), acct.get("secret", "")
-    return "", ""
-
-
-def _get_user_flw_key(user_id: int) -> str:
-    k = db.get_api(user_id, "flw_key")
-    if k: return k
-    from config import FLW_SECRET_KEY
-    return FLW_SECRET_KEY
-
-
-def _get_user_paga_creds(user_id: int) -> tuple[str, str, str]:
-    """Returns (principal, credential, api_key)."""
-    p = db.get_api(user_id, "paga_principal")
-    c = db.get_api(user_id, "paga_credential")
-    k = db.get_api(user_id, "paga_api_key")
-    if p and c and k:
-        return p, c, k
-    from config import PAGA_PRINCIPAL, PAGA_CREDENTIAL, PAGA_API_KEY
-    return PAGA_PRINCIPAL, PAGA_CREDENTIAL, PAGA_API_KEY
 
 async def _get_current_ip() -> str:
     import requests as _r
@@ -100,16 +64,8 @@ user_settings = {
 _my_account_id: str = ""    # auto-learned from outgoing messages
 _my_nick:       str = ""    # auto-learned from outgoing messages
 
-
-
-def _us(uid: int) -> dict:
-    """Return the state dict for this user, creating it if needed."""
-    if uid not in user_state:
-        user_state[uid] = {}
-    return user_state[uid]
-
 ad_data               = {}
-user_state            = {}   # { user_id: {"action":..., "prev_section":..., ...} }
+user_state            = {}   # keys: "action", "prev_section"
 refresh_task          = None
 refresh_running       = False
 current_price         = Decimal("0")
@@ -179,7 +135,9 @@ def _get_or_register_user(telegram_user):
     dname = telegram_user.full_name or ""
     return db.get_or_create_user(uid, uname, dname)
 
-_admin_chat_ids: set = set()
+# Pre-populate admin chat IDs from environment config so upgrade notifications
+# work even before the admin has sent /start in this deploy session.
+_admin_chat_ids: set = set(ADMIN_IDS)  # seeded from config; updated on /start
 
 def _get_admin_chat_ids() -> set:
     return _admin_chat_ids
@@ -475,10 +433,10 @@ def autopay_section_text():
     bybit_status = "✅ ENABLED" if auto_pay_enabled  else "❌ DISABLED"
     flw_status   = "✅ ENABLED" if flw_pay_enabled   else "❌ DISABLED"
     paga_status  = "✅ ENABLED" if paga_pay_enabled  else "❌ DISABLED"
-    _uid_ap         = _current_user_id or 0
-    flw_configured  = "✅ Configured" if _get_user_flw_key(_uid_ap) else "❌ Not set — tap 🔑 Set APIs"
-    _pp, _pc, _pk   = _get_user_paga_creds(_uid_ap)
-    paga_configured = "✅ Configured" if (_pp and _pc and _pk) else "❌ Not set — tap 🔑 Set APIs"
+    from config import FLW_SECRET_KEY, PAGA_PRINCIPAL, PAGA_CREDENTIAL, PAGA_API_KEY
+    flw_configured  = "✅ Configured" if FLW_SECRET_KEY else "❌ Not configured — add FLW_SECRET_KEY"
+    paga_configured = "✅ Configured" if (PAGA_PRINCIPAL and PAGA_CREDENTIAL and PAGA_API_KEY) \
+                      else "❌ Not configured — add PAGA_PRINCIPAL / PAGA_CREDENTIAL / PAGA_API_KEY"
     sender_name  = user_settings.get("sender_name", "Not set")
     unpaid_count = len(unpaid_orders_log)
     bp_status    = f"✅ ON — threshold: {buyer_protection_threshold} min" if buyer_protection_enabled else "❌ OFF"
@@ -699,10 +657,8 @@ def sell_order_buttons(order_id: str) -> InlineKeyboardMarkup | None:
 # ─────────────────────────────────────────
 # 📦 ORDER MONITOR LOOP
 # ─────────────────────────────────────────
-async def _flw_autopay(bot, chat_id, order_id, order_detail, acting_user_id: int = 0):
+async def _flw_autopay(bot, chat_id, order_id, order_detail):
     from flutterwave import match_bank_code, verify_account, send_transfer, get_transfer_status
-    # Use per-user FLW key, falling back to env var
-    _flw_key = _get_user_flw_key(acting_user_id)
 
     try:
         # ── Name Match check ──
@@ -994,7 +950,7 @@ async def _paga_queue_worker():
                 )
 
             try:
-                await _paga_autopay(bot, chat_id, order_id, order_detail, acting_user_id=chat_id)
+                await _paga_autopay(bot, chat_id, order_id, order_detail)
             except Exception as e:
                 logger.error(f"[Paga Queue] Error processing {order_id}: {e}")
                 try:
@@ -1116,10 +1072,8 @@ async def _paga_handle_failure(bot, chat_id, order_id, account_no, bank, amount,
 # 🟡 PAGA AUTO-PAY
 # Flow: Name Match → Buyer Protection → validate account → depositToBank → poll → mark paid
 # ─────────────────────────────────────────
-async def _paga_autopay(bot, chat_id, order_id, order_detail, acting_user_id: int = 0):
+async def _paga_autopay(bot, chat_id, order_id, order_detail):
     from paga import match_bank_uuid, validate_account, deposit_to_bank, check_status
-    # Use per-user Paga creds, falling back to env var
-    _paga_p, _paga_c, _paga_k = _get_user_paga_creds(acting_user_id)
     import os
 
     try:
@@ -1683,7 +1637,7 @@ async def _handle_buy_order(bot, chat_id, order_id):
 
         elif flw_pay_enabled and order_id not in paid_order_ids:
             await asyncio.sleep(5)
-            await _flw_autopay(bot, chat_id, order_id, order_detail, acting_user_id=chat_id)
+            await _flw_autopay(bot, chat_id, order_id, order_detail)
 
         elif auto_pay_enabled and order_id not in paid_order_ids:
             try:
@@ -2054,14 +2008,6 @@ async def auto_update_loop(bot, chat_id):
 # ─────────────────────────────────────────
 # 📤 Send / edit menu with banner image
 # ─────────────────────────────────────────
-
-def _build_menu_text_for(user_id: int) -> str:
-    """Build main menu caption for a specific user_id (used when sending refreshed menu)."""
-    global _current_user_id, _current_plan_badge
-    _current_user_id    = user_id
-    _current_plan_badge = sub.plan_badge(user_id)
-    return main_menu_text()
-
 async def send_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Send the main menu with the banner image attached."""
     chat_id = update.effective_chat.id
@@ -2130,16 +2076,7 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # 🏓 Ping commands
 # ─────────────────────────────────────────
 async def ping_bybit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    _get_or_register_user(update.effective_user)
-    # Check user's own Bybit key
-    _bk, _bs = _get_user_bybit_api(uid)
-    if not (_bk and _bs):
-        await update.message.reply_text(
-            "❌ *Bybit API not set*\n\n"
-            "Go to 🔑 Set APIs → Set Bybit API, or add BYBIT_API_KEY_1 to Render env.",
-            parse_mode="Markdown"
-        )
+    if not is_admin(update.effective_user.id):
         return
     await update.message.reply_text("⏳ Testing Bybit API...")
     from bybit import ping_api
@@ -2170,13 +2107,12 @@ async def ping_bybit_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def ping_flutterwave_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    _get_or_register_user(update.effective_user)
-    FLW_SECRET_KEY = _get_user_flw_key(uid)
+    if not is_admin(update.effective_user.id):
+        return
+    from config import FLW_SECRET_KEY
     if not FLW_SECRET_KEY:
         await update.message.reply_text(
-            "❌ *Flutterwave API not set*\n\n"
-            "Go to 🔑 Set APIs → Set Flutterwave API, or add FLW_SECRET_KEY to Render env.",
+            "❌ *FLW_SECRET_KEY not set*\n\nAdd to Render environment:\n`FLW_SECRET_KEY` = your Flutterwave secret key",
             parse_mode="Markdown"
         )
         return
@@ -2209,9 +2145,9 @@ async def ping_flutterwave_command(update: Update, context: ContextTypes.DEFAULT
 
 
 async def ping_paga_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    _get_or_register_user(update.effective_user)
-    PAGA_PRINCIPAL, PAGA_CREDENTIAL, PAGA_API_KEY = _get_user_paga_creds(uid)
+    if not is_admin(update.effective_user.id):
+        return
+    from config import PAGA_PRINCIPAL, PAGA_CREDENTIAL, PAGA_API_KEY
     if not (PAGA_PRINCIPAL and PAGA_CREDENTIAL and PAGA_API_KEY):
         await update.message.reply_text(
             "❌ *Paga credentials not fully set*\n\n"
@@ -2282,33 +2218,63 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _current_user_id    = tuser.id
     _current_plan_badge = sub.plan_badge(tuser.id)
 
+    # ── Per-user isolated state for non-admin users ──
+    # Admin uses the global user_state; non-admins get their own isolated dict
+    # stored in context.user_data so their API key flows don't collide.
+    if is_admin(tuser.id):
+        _btn_state = user_state
+        restore_env_account()   # admin always uses env Bybit keys
+    else:
+        if "state" not in context.user_data:
+            context.user_data["state"] = {}
+        _btn_state = context.user_data["state"]
+        # Load this user's saved Bybit API credentials (if any) into bybit module
+        _u_key    = db.get_api(tuser.id, "bybit_key")
+        _u_secret = db.get_api(tuser.id, "bybit_secret")
+        if _u_key and _u_secret:
+            set_user_credentials(_u_key, _u_secret)
+        else:
+            restore_env_account()  # fall back to env keys if user has none saved
+
     # ── Pro feature guard ──
-    # Free users can only access: main menu, upgrade, bot status, API setup, get IP
-    # Everything else requires Pro or admin
-    FREE_ALLOWED = {
-        "main_menu", "bot_status", "get_my_ip",
-        "upgrade_plan", "upgrade_request_yes",
+    # Block non-admin free users from ALL functional sections.
+    # They can only access: main_menu, upgrade_plan, upgrade_request_yes, bot_status,
+    # get_my_ip, section_apis, set_api_*, delete_apis, delete_apis_confirm, reset_*
+    _FREE_ALLOWED = {
+        "main_menu", "upgrade_plan", "upgrade_request_yes",
+        "bot_status", "get_my_ip", "reset_confirm", "reset_do",
         "section_apis", "set_api_bybit", "set_api_flw", "set_api_paga",
         "delete_apis", "delete_apis_confirm",
-        "reset_confirm", "reset_do",
     }
-    user_is_free = not sub.is_pro(tuser.id) and not is_admin(tuser.id)
-    if user_is_free and data not in FREE_ALLOWED:
-        # Also allow switch_account_ for free (just account view)
-        if not data.startswith("switch_account_"):
-            await edit_menu(query,
-                "🔒 *Pro Plan Required*\n\n"
-                "This feature is only available to Pro users.\n\n"
-                "Tap *⬆️ Upgrade Plan* to request access from the admin.",
-                InlineKeyboardMarkup([
-                    [InlineKeyboardButton("⬆️ Upgrade Plan", callback_data="upgrade_plan")],
-                    [InlineKeyboardButton("🏠 Main Menu",    callback_data="main_menu")],
-                ])
-            )
-            return
+    _is_free_allowed = (
+        data in _FREE_ALLOWED
+        or data.startswith("switch_account_")
+    )
+    if not is_admin(tuser.id) and not sub.is_pro(tuser.id) and not _is_free_allowed:
+        await query.answer(
+            "🔒 Upgrade to Pro to access this feature.",
+            show_alert=True
+        )
+        await edit_menu(query,
+            "🔒 *Pro Plan Required*\n\nYou need a Pro plan to use this bot.\n\nTap *⬆️ Upgrade Plan* to request access from the admin.",
+            main_menu_keyboard()
+        )
+        return
+
+    # Legacy per-feature guard (still applies for admin-visible toggles)
+    if sub.requires_pro(data) and not sub.is_pro(tuser.id) and not is_admin(tuser.id):
+        await query.answer(
+            "🔒 Pro plan required. Tap Upgrade Plan in the menu.",
+            show_alert=True
+        )
+        return
 
     # ── 🏠 Main menu ──
     if data == "main_menu":
+        # Always refresh plan badge when returning to main menu so upgrades
+        # are reflected immediately without needing a redeploy.
+        db.check_and_auto_downgrade(tuser.id)
+        _current_plan_badge = sub.plan_badge(tuser.id)
         await edit_menu(query, main_menu_text(), main_menu_keyboard())
 
     # ── 🌍 Get My IP ──
@@ -2486,8 +2452,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "bp_set_custom":
-        _us(tuser.id)["action"]       = "bp_custom_threshold"
-        _us(tuser.id)["prev_section"] = "buyer_protection_menu"
+        user_state["action"]       = "bp_custom_threshold"
+        _btn_state["prev_section"] = "buyer_protection_menu"
         await edit_menu(query,
             f"✏️ *Custom Buyer Protection Threshold*\n\n"
             f"Current: `{buyer_protection_threshold} min`\n\n"
@@ -2524,12 +2490,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── 🟢 Toggle Flutterwave Pay ──
     elif data == "toggle_flw_pay":
-        _flw_key_check = _get_user_flw_key(tuser.id)
-        if not flw_pay_enabled and not _flw_key_check:
-            await query.answer(
-                "❌ Flutterwave API not set. Go to 🔑 Set APIs → Set Flutterwave API first.",
-                show_alert=True
-            )
+        from config import FLW_SECRET_KEY
+        if not flw_pay_enabled and not FLW_SECRET_KEY:
+            await query.answer("❌ FLW_SECRET_KEY not set. Add your Flutterwave secret key to Render.", show_alert=True)
             return
         flw_pay_enabled = not flw_pay_enabled
         if flw_pay_enabled and auto_pay_enabled:
@@ -2540,10 +2503,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── 🟡 Toggle Paga Pay ──
     elif data == "toggle_paga_pay":
-        _pp, _pc, _pk = _get_user_paga_creds(tuser.id)
-        if not paga_pay_enabled and not (_pp and _pc and _pk):
+        from config import PAGA_PRINCIPAL, PAGA_CREDENTIAL, PAGA_API_KEY
+        if not paga_pay_enabled and not (PAGA_PRINCIPAL and PAGA_CREDENTIAL and PAGA_API_KEY):
             await query.answer(
-                "❌ Paga API not set. Go to 🔑 Set APIs → Set Paga API first.",
+                "❌ Paga credentials not set. Add PAGA_PRINCIPAL, PAGA_CREDENTIAL, PAGA_API_KEY to Render.",
                 show_alert=True
             )
             return
@@ -2575,8 +2538,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── ✏️ Set Sender Name ──
     elif data == "set_sender_name":
-        _us(tuser.id)["action"]       = "sender_name"
-        _us(tuser.id)["prev_section"] = "section_autopay"
+        _btn_state["action"]       = "sender_name"
+        _btn_state["prev_section"] = "section_autopay"
         cur = user_settings.get("sender_name", "Not set")
         await edit_menu(query,
             f"✏️ *Set Your Sender Name*\n\nCurrent: `{cur}`\n\n"
@@ -2649,8 +2612,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         order_id = parts[1] if len(parts) > 1 else ""
         nick     = parts[2] if len(parts) > 2 else "counterparty"
         reply_state[chat_id] = {"order_id": order_id, "nick": nick}
-        _us(tuser.id)["action"]       = "chat_reply"
-        _us(tuser.id)["prev_section"] = "section_orders"
+        _btn_state["action"]       = "chat_reply"
+        _btn_state["prev_section"] = "section_orders"
         try:
             await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([]))
         except Exception:
@@ -2672,7 +2635,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ── ❌ Cancel Chat Reply ──
     elif data == "cancel_chat_reply":
         reply_state.pop(chat_id, None)
-        _us(tuser.id)["action"] = None
+        user_state["action"] = None
         await context.bot.send_message(
             chat_id=chat_id,
             text="❌ Reply cancelled.",
@@ -2729,8 +2692,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── ✏️ Set Sell Message ──
     elif data == "set_sell_msg":
-        _us(tuser.id)["action"]       = "sell_custom_msg"
-        _us(tuser.id)["prev_section"] = "section_orders"
+        _btn_state["action"]       = "sell_custom_msg"
+        _btn_state["prev_section"] = "section_orders"
         cur = sell_custom_msg[:80] + "..." if len(sell_custom_msg) > 80 else sell_custom_msg
         await edit_menu(query,
             f"✏️ *Set Sell Order Message*\n\nCurrent:\n_{cur}_\n\n"
@@ -2740,8 +2703,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── 🔢 Set Message Count ──
     elif data == "set_sell_msg_count":
-        _us(tuser.id)["action"]       = "sell_msg_count"
-        _us(tuser.id)["prev_section"] = "section_orders"
+        _btn_state["action"]       = "sell_msg_count"
+        _btn_state["prev_section"] = "section_orders"
         await edit_menu(query,
             f"🔢 *Set Message Count*\n\nCurrent: `{sell_msg_count}x`\n\n"
             "How many times to send to buyer? (1–5)",
@@ -2750,8 +2713,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── 🆔 Set Ad ID ──
     elif data == "set_ad_id":
-        _us(tuser.id)["action"]       = "ad_id"
-        _us(tuser.id)["prev_section"] = "section_ads"
+        _btn_state["action"]       = "ad_id"
+        _btn_state["prev_section"] = "section_ads"
         cur = user_settings.get("ad_id","") or "Not set"
         await edit_menu(query,
             f"🆔 *Set Ad ID*\n\nCurrent: `{cur}`\n\n"
@@ -2762,8 +2725,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── 👤 Set UID ──
     elif data == "set_uid":
-        _us(tuser.id)["action"]       = "bybit_uid"
-        _us(tuser.id)["prev_section"] = "section_ads"
+        _btn_state["action"]       = "bybit_uid"
+        _btn_state["prev_section"] = "section_ads"
         cur = user_settings.get("bybit_uid","") or "Not set"
         await edit_menu(query,
             f"👤 *Set Bybit UID*\n\nCurrent: `{cur}`\n\n"
@@ -2847,8 +2810,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── ➕ Set Increment ──
     elif data == "set_increment":
-        _us(tuser.id)["action"]       = "increment"
-        _us(tuser.id)["prev_section"] = "section_ads"
+        _btn_state["action"]       = "increment"
+        _btn_state["prev_section"] = "section_ads"
         await edit_menu(query,
             f"➕ *Set Increment*\n\nCurrent: `+{user_settings.get('increment','0.05')}` per cycle\n\n"
             "Send the amount to add each cycle.\nExamples: `0.05` | `1` | `0.5`",
@@ -2865,8 +2828,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         max_pct  = get_max_float_pct(currency, token)
         min_pct  = get_min_float_pct(currency, token)
         needs_ref = currency_needs_ref(currency) or currency == "NGN"
-        _us(tuser.id)["action"]       = "float_pct"
-        _us(tuser.id)["prev_section"] = "section_ads"
+        _btn_state["action"]       = "float_pct"
+        _btn_state["prev_section"] = "section_ads"
         cur = user_settings.get("float_pct","") or "Not set"
         formula = (
             f"`{token}/USDT × {currency}/USDT ref × your% ÷ 100`"
@@ -2882,8 +2845,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── 💱 Set NGN Ref ──
     elif data == "set_ngn_ref":
-        _us(tuser.id)["action"]       = "ngn_usdt_ref"
-        _us(tuser.id)["prev_section"] = "section_ads"
+        _btn_state["action"]       = "ngn_usdt_ref"
+        _btn_state["prev_section"] = "section_ads"
         _rcur = ad_data.get("currencyId","NGN").upper() if ad_data else "NGN"
         cur   = user_settings.get("local_usdt_ref","") or "Not set"
         await edit_menu(query,
@@ -2895,8 +2858,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── ⏱ Set Interval ──
     elif data == "set_interval":
-        _us(tuser.id)["action"]       = "interval"
-        _us(tuser.id)["prev_section"] = "section_ads"
+        _btn_state["action"]       = "interval"
+        _btn_state["prev_section"] = "section_ads"
         await edit_menu(query,
             f"⏱ *Set Interval*\n\nCurrent: every `{user_settings.get('interval',2)}` min\n\n"
             "Send minutes between each price update.\nExamples: `2` | `5` | `10`",
@@ -2971,8 +2934,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "set_manage_ad_id":
-        _us(tuser.id)["action"]       = "manage_ad_id"
-        _us(tuser.id)["prev_section"] = "post_ad_prompt"
+        _btn_state["action"]       = "manage_ad_id"
+        _btn_state["prev_section"] = "post_ad_prompt"
         cur     = user_settings.get("manage_ad_id", "") or "Not set"
         auto_id = user_settings.get("ad_id", "not set")
         await edit_menu(query,
@@ -3104,7 +3067,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ── 🔑 API Setup Section ──
     elif data == "section_apis":
-        uid     = tuser.id
+        uid     = query.from_user.id
         bk      = "✅" if db.get_api(uid, "bybit_key")      else "❌"
         fk      = "✅" if db.get_api(uid, "flw_key")        else "❌"
         pk      = "✅" if db.get_api(uid, "paga_principal") else "❌"
@@ -3125,9 +3088,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "set_api_bybit":
-        _us(tuser.id)["action"]       = "api_bybit_key"
-        _us(tuser.id)["prev_section"] = "section_apis"
-        uid = tuser.id
+        _btn_state["action"]       = "api_bybit_key"
+        _btn_state["prev_section"] = "section_apis"
+        uid = query.from_user.id
         has = bool(db.get_api(uid, "bybit_key"))
         await edit_menu(query,
             f"🔑 *Set Bybit API Key*\n\n"
@@ -3137,9 +3100,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "set_api_flw":
-        _us(tuser.id)["action"]       = "api_flw_key"
-        _us(tuser.id)["prev_section"] = "section_apis"
-        uid = tuser.id
+        _btn_state["action"]       = "api_flw_key"
+        _btn_state["prev_section"] = "section_apis"
+        uid = query.from_user.id
         has = bool(db.get_api(uid, "flw_key"))
         await edit_menu(query,
             f"🟢 *Set Flutterwave API*\n\n"
@@ -3149,9 +3112,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "set_api_paga":
-        _us(tuser.id)["action"]       = "api_paga_principal"
-        _us(tuser.id)["prev_section"] = "section_apis"
-        uid = tuser.id
+        _btn_state["action"]       = "api_paga_principal"
+        _btn_state["prev_section"] = "section_apis"
+        uid = query.from_user.id
         has = bool(db.get_api(uid, "paga_principal"))
         await edit_menu(query,
             f"🟡 *Set Paga API*\n\n"
@@ -3172,7 +3135,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "delete_apis_confirm":
-        db.delete_all_apis(tuser.id)
+        db.delete_all_apis(query.from_user.id)
         await edit_menu(query,
             "✅ *All API keys deleted.*\n\n"
             "Your account is still active but API credentials have been removed.\n"
@@ -3222,10 +3185,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uname = query.from_user.username or ""
         dname = query.from_user.full_name or ""
         db.request_upgrade(uid, uname, dname)
-        # Notify all admin IDs directly — no need for them to have used /menu first
-        all_admin_targets = set(ADMIN_IDS) | _admin_chat_ids
-        notified = 0
-        for admin_id in all_admin_targets:
+        for admin_id in _admin_chat_ids:
             try:
                 await context.bot.send_message(
                     chat_id=admin_id,
@@ -3234,18 +3194,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"👤 User ID: `{uid}`\n"
                         f"Username: @{uname}\n"
                         f"Name: {dname}\n\n"
-                        f"✅ Approve: `/upgrade {uid} 30`\n"
-                        f"Or custom days: `/upgrade {uid} <days>`"
+                        f"Approve: `/upgrade {uid} 30`"
                     ),
                     parse_mode="Markdown"
                 )
-                notified += 1
-            except Exception as e:
-                logger.warning(f"[Upgrade] Could not notify admin {admin_id}: {e}")
+            except Exception:
+                pass
         await edit_menu(query,
             "⏳ *Upgrade Request Sent!*\n\n"
-            f"Admin has been notified ({notified} admin(s) alerted).\n"
-            "You will receive a message once your plan is approved.",
+            "The admin has been notified and will review shortly.\n"
+            "You will receive a message once approved.",
             InlineKeyboardMarkup(back_main())
         )
 
@@ -3385,38 +3343,27 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # 📝 TEXT INPUT HANDLER
 # ─────────────────────────────────────────
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Register user on every message too
-    tuser = update.effective_user
-    _get_or_register_user(tuser)
-    db.check_and_auto_downgrade(tuser.id)
-    # Allow API setup actions for all registered users (free or pro)
-    # Block everything else for free non-admin users
-    api_actions = {
-        "api_bybit_key", "api_bybit_secret",
-        "api_flw_key", "api_flw_secret", "api_flw_hash",
-        "api_paga_principal", "api_paga_credential", "api_paga_api_key",
-    }
-    # user_state is keyed by user_id to prevent multi-user collision
-    uid_key        = update.effective_user.id
-    current_action = _us(uid_key).get("action", "")
-    user_is_free = not sub.is_pro(tuser.id) and not is_admin(tuser.id)
-    if user_is_free and current_action not in api_actions:
-        # Free users can only do API setup via message; block everything else
-        if current_action:
-            await update.message.reply_text(
-                "🔒 *Pro Plan Required*\n\n"
-                "Upgrade your plan to use this feature.",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("⬆️ Upgrade Plan", callback_data="upgrade_plan")
-                ]])
-            )
-        return
     global sell_custom_msg, sell_msg_count, buyer_protection_threshold
 
-    text   = update.message.text.strip()
-    action = _us(uid_key).get("action")
-    prev   = _us(uid_key).get("prev_section", "main_menu")
+    tuser = update.effective_user
+    uid   = tuser.id
+    _get_or_register_user(tuser)  # ensure user exists in DB
+
+    text = update.message.text.strip()
+
+    # ── Per-user isolated state ──
+    # Admin uses the global user_state dict.
+    # Non-admin users get their own state via context.user_data so their
+    # API key inputs are isolated and don't collide with the admin's state.
+    if is_admin(uid):
+        _state = user_state
+    else:
+        if "state" not in context.user_data:
+            context.user_data["state"] = {}
+        _state = context.user_data["state"]
+
+    action = _state.get("action")
+    prev   = _state.get("prev_section", "main_menu")
 
     async def reply_with_back(msg: str):
         """Reply with success message + back-to-previous button."""
@@ -3424,9 +3371,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if action == "api_bybit_key":
         val = text.strip()
-        _us(uid_key)["action"]       = "api_bybit_secret"
-        _us(uid_key)["prev_section"] = "section_apis"
-        _us(uid_key)["_api_bybit_key_temp"] = val
+        _state["action"]       = "api_bybit_secret"
+        _state["prev_section"] = "section_apis"
+        _state["_api_bybit_key_temp"] = val
         await update.message.reply_text(
             f"✅ API Key received.\n\nStep 2 of 2: Send your Bybit *API Secret*.",
             parse_mode="Markdown"
@@ -3434,9 +3381,15 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     elif action == "api_bybit_secret":
-        db.save_api(uid_key, "bybit_key",    _us(uid_key).pop("_api_bybit_key_temp", ""))
-        db.save_api(uid_key, "bybit_secret", text.strip())
-        _us(uid_key)["action"] = None
+        uid = update.effective_user.id
+        key_temp = _state.pop("_api_bybit_key_temp", "")
+        db.save_api(uid, "bybit_key",    key_temp)
+        db.save_api(uid, "bybit_secret", text.strip())
+        # Load the new credentials into bybit module immediately so this session
+        # uses them right away without requiring a restart.
+        if not is_admin(uid):
+            set_user_credentials(key_temp, text.strip())
+        _state["action"] = None
         await update.message.reply_text(
             "✅ *Bybit API saved!*\n\nKey and Secret stored securely.\n"
             "The bot will use your API for all Bybit requests.",
@@ -3446,17 +3399,17 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     elif action == "api_flw_key":
-        _us(uid_key)["action"]               = "api_flw_secret"
-        _us(uid_key)["_api_flw_key_temp"]    = text.strip()
+        _state["action"]               = "api_flw_secret"
+        _state["_api_flw_key_temp"]    = text.strip()
         await update.message.reply_text(
-            "✅ FLW Secret Key received.\n\nStep 2 of 3: Send your FLW *Secret* (password).",
+            "✅ FLW Secret Key received.\n\nStep 2 of 3: Send your FLW *Secret Hash*.",
             parse_mode="Markdown"
         )
         return
 
     elif action == "api_flw_secret":
-        _us(uid_key)["action"]               = "api_flw_hash"
-        _us(uid_key)["_api_flw_secret_temp"] = text.strip()
+        _state["action"]               = "api_flw_hash"
+        _state["_api_flw_secret_temp"] = text.strip()
         await update.message.reply_text(
             "✅ FLW Secret received.\n\nStep 3 of 3: Send your FLW *Secret Hash*.",
             parse_mode="Markdown"
@@ -3464,10 +3417,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     elif action == "api_flw_hash":
-        db.save_api(uid_key, "flw_key",    _us(uid_key).pop("_api_flw_key_temp", ""))
-        db.save_api(uid_key, "flw_secret", _us(uid_key).pop("_api_flw_secret_temp", ""))
-        db.save_api(uid_key, "flw_hash",   text.strip())
-        _us(uid_key)["action"] = None
+        uid = update.effective_user.id
+        db.save_api(uid, "flw_key",    _state.pop("_api_flw_key_temp", ""))
+        db.save_api(uid, "flw_secret", _state.pop("_api_flw_secret_temp", ""))
+        db.save_api(uid, "flw_hash",   text.strip())
+        _state["action"] = None
         await update.message.reply_text(
             "✅ *Flutterwave API saved!*\n\nKey, Secret and Hash stored securely.",
             parse_mode="Markdown",
@@ -3476,8 +3430,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     elif action == "api_paga_principal":
-        _us(uid_key)["action"]                    = "api_paga_credential"
-        _us(uid_key)["_api_paga_principal_temp"]  = text.strip()
+        _state["action"]                    = "api_paga_credential"
+        _state["_api_paga_principal_temp"]  = text.strip()
         await update.message.reply_text(
             "✅ Paga Principal received.\n\nStep 2 of 3: Send your Paga *Credential* (password).",
             parse_mode="Markdown"
@@ -3485,8 +3439,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     elif action == "api_paga_credential":
-        _us(uid_key)["action"]                     = "api_paga_api_key"
-        _us(uid_key)["_api_paga_credential_temp"]  = text.strip()
+        _state["action"]                     = "api_paga_api_key"
+        _state["_api_paga_credential_temp"]  = text.strip()
         await update.message.reply_text(
             "✅ Paga Credential received.\n\nStep 3 of 3: Send your Paga *API Key* (HMAC hash key).",
             parse_mode="Markdown"
@@ -3494,10 +3448,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     elif action == "api_paga_api_key":
-        db.save_api(uid_key, "paga_principal",  _us(uid_key).pop("_api_paga_principal_temp", ""))
-        db.save_api(uid_key, "paga_credential", _us(uid_key).pop("_api_paga_credential_temp", ""))
-        db.save_api(uid_key, "paga_api_key",    text.strip())
-        _us(uid_key)["action"] = None
+        uid = update.effective_user.id
+        db.save_api(uid, "paga_principal",  _state.pop("_api_paga_principal_temp", ""))
+        db.save_api(uid, "paga_credential", _state.pop("_api_paga_credential_temp", ""))
+        db.save_api(uid, "paga_api_key",    text.strip())
+        _state["action"] = None
         await update.message.reply_text(
             "✅ *Paga API saved!*\n\nPrincipal, Credential and API Key stored securely.",
             parse_mode="Markdown",
@@ -3508,7 +3463,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if action == "manage_ad_id":
         user_settings["manage_ad_id"] = text.strip()
         user_settings.pop("manage_ad_data", None)   # clear old manage ad data
-        _us(uid_key)["action"] = None
+        _state["action"] = None
         auto_id = user_settings.get("ad_id", "not set")
         await reply_with_back(
             f"✅ *Manage Ad ID saved!*\n\n"
@@ -3522,7 +3477,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         state    = reply_state.pop(update.message.chat_id, {})
         order_id = state.get("order_id", "")
         nick     = state.get("nick", "counterparty")
-        _us(uid_key)["action"] = None
+        _state["action"] = None
         if not order_id:
             await update.message.reply_text("❌ No active reply state. Tap Reply on a message first.")
             return
@@ -3546,12 +3501,12 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif action == "ad_id":
         user_settings["ad_id"] = text
         ad_data.clear()
-        _us(uid_key)["action"] = None
+        _state["action"] = None
         await reply_with_back(f"✅ *Ad ID saved!*\n\n`{text}`\n\n_{next_setup_hint()}_")
 
     elif action == "bybit_uid":
         user_settings["bybit_uid"] = text
-        _us(uid_key)["action"] = None
+        _state["action"] = None
         await reply_with_back(f"✅ *UID saved!*\n\n`{text}`\n\n_{next_setup_hint()}_")
 
     elif action == "increment":
@@ -3559,7 +3514,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             val = Decimal(text)
             if val <= 0: raise ValueError
             user_settings["increment"] = text
-            _us(uid_key)["action"] = None
+            _state["action"] = None
             await reply_with_back(f"✅ *Increment saved!*\n\n`+{text}` per cycle\n\n_{next_setup_hint()}_")
         except Exception:
             await update.message.reply_text("❌ Send a positive number like `0.05`", parse_mode="Markdown")
@@ -3587,7 +3542,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
             user_settings["float_pct"] = text
-            _us(uid_key)["action"] = None
+            _state["action"] = None
             await reply_with_back(
                 f"✅ *Float % saved!*\n\n`{text}%` for `{token}/{currency}`\n\n"
                 f"_{next_setup_hint()}_"
@@ -3601,7 +3556,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if val <= 0: raise ValueError
             user_settings["local_usdt_ref"] = text
             _scur = ad_data.get("currencyId","NGN").upper() if ad_data else "NGN"
-            _us(uid_key)["action"] = None
+            _state["action"] = None
             await reply_with_back(f"✅ *{_scur}/USDT ref saved!*\n\n`{text}`\n\n_{next_setup_hint()}_")
         except Exception:
             await update.message.reply_text("❌ Send a number like `1580`", parse_mode="Markdown")
@@ -3611,14 +3566,14 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             val = int(text)
             if val < 1: raise ValueError
             user_settings["interval"] = val
-            _us(uid_key)["action"] = None
+            _state["action"] = None
             await reply_with_back(f"✅ *Interval saved!*\n\nEvery `{val}` min\n\n_{next_setup_hint()}_")
         except Exception:
             await update.message.reply_text("❌ Send a whole number like `2`", parse_mode="Markdown")
 
     elif action == "sender_name":
         user_settings["sender_name"] = text.strip()
-        _us(uid_key)["action"] = None
+        _state["action"] = None
         await reply_with_back(
             f"✅ *Sender name saved!*\n\n`{text.strip()}`\n\n"
             f"FLW narration: `{text.strip()} payment to [receiver]`"
@@ -3626,7 +3581,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif action == "sell_custom_msg":
         sell_custom_msg = text
-        _us(uid_key)["action"] = None
+        _state["action"] = None
         preview = text[:80] + "..." if len(text) > 80 else text
         await reply_with_back(
             f"✅ *Sell message saved!*\n\nPreview: _{preview}_\n\n"
@@ -3638,7 +3593,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             val = int(text)
             if val < 1 or val > 5: raise ValueError
             sell_msg_count = val
-            _us(uid_key)["action"] = None
+            _state["action"] = None
             await reply_with_back(f"✅ *Message count saved!*\n\nWill send `{val}x` per sell order.")
         except Exception:
             await update.message.reply_text("❌ Send a number between `1` and `5`", parse_mode="Markdown")
@@ -3648,7 +3603,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             val = Decimal(text)
             if val <= 0: raise ValueError
             user_settings["post_ad_qty"] = text
-            _us(uid_key)["action"] = None
+            _state["action"] = None
             await reply_with_back(
                 f"✅ *Custom quantity set:* `{text}`\n\n"
                 "Now tap *📢 Post Ad (clone)* → *Confirm Post* to post the ad."
@@ -3661,7 +3616,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             val = int(text)
             if val < 1: raise ValueError
             buyer_protection_threshold = val
-            _us(uid_key)["action"] = None
+            _state["action"] = None
             await reply_with_back(
                 f"✅ *Buyer Protection threshold set!*\n\n"
                 f"Threshold: `{val} min`\n\n"
