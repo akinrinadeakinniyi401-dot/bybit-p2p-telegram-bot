@@ -28,6 +28,24 @@ def set_active_account(index: int):
         logger.info(f"[Bybit] Active account → {BYBIT_ACCOUNTS[index]['label']}")
 
 
+def set_user_credentials(api_key: str, api_secret: str):
+    """Override the active API credentials with a user's own DB-stored keys.
+    Called after a non-admin user saves or loads their Bybit API from the DB."""
+    global BYBIT_API_KEY, BYBIT_API_SECRET
+    if api_key and api_secret:
+        BYBIT_API_KEY    = api_key.strip()
+        BYBIT_API_SECRET = api_secret.strip()
+        logger.info("[Bybit] User credentials loaded from DB")
+
+
+def restore_env_account():
+    """Restore credentials to the currently active env account (for admin use)."""
+    global BYBIT_API_KEY, BYBIT_API_SECRET
+    BYBIT_API_KEY    = BYBIT_ACCOUNTS[_active_index]["key"]
+    BYBIT_API_SECRET = BYBIT_ACCOUNTS[_active_index]["secret"]
+    logger.info(f"[Bybit] Restored env account → {BYBIT_ACCOUNTS[_active_index]['label']}")
+
+
 def get_active_account() -> dict:
     return BYBIT_ACCOUNTS[_active_index]
 
