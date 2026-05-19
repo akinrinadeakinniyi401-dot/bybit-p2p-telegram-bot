@@ -180,11 +180,8 @@ def delete_all_apis(user_id: int):
         user = get_user(user_id)
         if not user:
             return
-        user["apis"] = {
-            "bybit_key": "", "bybit_secret": "",
-            "flw_key": "", "flw_secret": "", "flw_hash": "",
-            "paga_principal": "", "paga_credential": "", "paga_api_key": "",
-        }
+        # Clear all API entries — covers both old single-key and new slot-based keys
+        user["apis"] = {}
         _write_json(_user_path(user_id), user)
         logger.info(f"[DB] APIs deleted for user {user_id}")
 
