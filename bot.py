@@ -2332,7 +2332,11 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         )
         await edit_menu(query,
             "🔒 *Pro Plan Required*\n\nYou need a Pro plan to use this bot.\n\nTap *⬆️ Upgrade Plan* to request access from the admin.",
-            main_menu_keyboard(tuser.id) (still applies for admin-visible toggles)
+            main_menu_keyboard(tuser.id)
+        )
+        return
+
+    # Legacy per-feature guard (still applies for admin-visible toggles)
     if sub.requires_pro(data) and not sub.is_pro(tuser.id) and not is_admin(tuser.id):
         await query.answer(
             "🔒 Pro plan required. Tap Upgrade Plan in the menu.",
