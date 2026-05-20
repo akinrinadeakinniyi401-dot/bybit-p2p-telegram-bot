@@ -29,15 +29,22 @@ PRO_FEATURES = {
 }
 
 FREE_FEATURES = {
-    "main_menu", "section_ads", "section_orders", "section_autopay",
-    "section_orders", "bot_status", "get_my_ip", "reset_confirm", "reset_do",
-    "set_ad_id", "set_uid", "fetch_ad", "fetch_my_ads",
-    "set_increment", "set_float_pct", "set_ngn_ref", "set_interval",
-    "switch_mode", "set_manage_ad_id", "fetch_manage_ad",
-    "set_api_bybit", "set_api_flw", "set_api_paga", "delete_apis",
-    "upgrade_plan", "upgrade_request_yes",
-    "buyer_protection_menu", "autopay_info", "flw_info", "paga_info",
-    "check_orders_now", "clear_seen_orders", "view_unpaid_orders",
+    # Core navigation — always accessible
+    "main_menu", "upgrade_plan", "upgrade_request_yes",
+    "bot_status", "reset_confirm", "reset_do",
+    # API management — free users can set/delete their own keys
+    "section_apis",
+    "set_api_bybit", "set_api_bybit_1", "set_api_bybit_2",
+    "set_api_flw", "set_api_paga",
+    "delete_apis", "delete_apis_confirm",
+    "delete_bybit1_apis", "delete_bybit1_confirm",
+    "delete_bybit2_apis", "delete_bybit2_confirm",
+    "delete_flw_apis",    "delete_flw_confirm",
+    "delete_paga_apis",   "delete_paga_confirm",
+    # Info pages (no functional P2P access)
+    "autopay_info", "flw_info", "paga_info",
+    # NOTE: "get_my_ip" removed — Pro feature only
+    # NOTE: section_ads/orders/autopay etc. removed — gated by _FREE_ALLOWED in bot.py
 }
 
 
