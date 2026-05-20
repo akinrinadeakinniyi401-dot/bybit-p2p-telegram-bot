@@ -69,11 +69,32 @@ def _init_dirs():
         _write_json(STATS_FILE, {"total_users": 0})
 
 def _read_json(path: Path, default=None):
+    """
+    Safe JSON read with corruption recovery.
+    - Returns default on missing file, empty file, or corrupted JSON.
+    - On corruption: logs the error and renames the bad file for inspection.
+    """
+    _default = default if default is not None else {}
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return default if default is not None else {}
+        if not path.exists():
+            return _default
+        content = path.read_text(encoding="utf-8").strip()
+        if not content:
+            logger.warning(f"[DB] Empty file: {path} — returning default")
+            return _default
+        return json.loads(content)
+    except json.JSONDecodeError as e:
+        logger.error(f"[DB] JSON corruption in {path}: {e} — backing up and returning default")
+        try:
+            backup = path.with_suffix(".corrupt")
+            path.rename(backup)
+            logger.warning(f"[DB] Corrupt file moved to {backup}")
+        except Exception:
+            pass
+        return _default
+    except Exception as e:
+        logger.error(f"[DB] Read error {path}: {e}")
+        return _default
 
 def _write_json(path: Path, data):
     try:
@@ -286,11 +307,13 @@ def request_upgrade(user_id: int, username: str, display_name: str):
             "requested_at": _now(),
         }
         _write_json(UPGRADE_REQ, reqs)
-        # Also mark on user profile
-        user = get_user(user_id)
+        # Mark on user profile — use _write_json directly (we already hold _lock,
+        # calling save_user() would try to re-acquire it and deadlock)
+        user = _read_json(_user_path(user_id))
         if user:
             user["upgrade_pending"] = True
-            save_user(user)
+            _write_json(_user_path(user_id), user)
+        logger.info(f"[DB] Upgrade request saved for user {user_id}")
 
 def get_pending_requests() -> list:
     reqs = _read_json(UPGRADE_REQ, {})
