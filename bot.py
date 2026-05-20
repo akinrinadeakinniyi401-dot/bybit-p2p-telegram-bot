@@ -190,10 +190,11 @@ def get_user_creds(user_id: int) -> dict | None:
 # ─────────────────────────────────────────
 # 🏠 MAIN MENU
 # ─────────────────────────────────────────
-def main_menu_keyboard():
-    o_icon = "🔔" if order_monitor_running else "🔕"
-    p_icon = "💳✅" if (auto_pay_enabled or flw_pay_enabled) else "💳"
-    r_icon = "🟢" if refresh_running else "📊"
+def main_menu_keyboard(uid: int = 0):
+    sess   = _s(uid) if uid else None
+    o_icon = "🔔" if (sess and sess.order_monitor_running) else "🔕"
+    p_icon = "💳✅" if (sess and (sess.auto_pay_enabled or sess.flw_pay_enabled)) else "💳"
+    r_icon = "🟢" if (sess and sess.refresh_running) else "📊"
     all_ac = get_all_accounts()
 
     kb = []
@@ -279,12 +280,13 @@ def back_prev(prev: str):
 # ─────────────────────────────────────────
 # 📊 AD PRICE BOT SECTION
 # ─────────────────────────────────────────
-def ads_section_keyboard():
-    mode       = user_settings.get("mode", "fixed")
+def ads_section_keyboard(uid: int = 0):
+    sess       = _s(uid) if uid else None
+    mode       = (sess.settings.get("mode", "fixed") if sess else "fixed")
     mode_icon  = "💲" if mode == "fixed" else "📈"
     mode_label = f"{mode_icon} Mode: {mode.upper()}"
-    ad_loaded  = bool(ad_data)
-    status     = "🟢 Stop Auto-Update" if refresh_running else "▶️ Start Auto-Update"
+    ad_loaded  = bool(sess.ad_data if sess else {})
+    status     = "🟢 Stop Auto-Update" if (sess and sess.refresh_running) else "▶️ Start Auto-Update"
 
     rows = [
         [
@@ -305,7 +307,7 @@ def ads_section_keyboard():
         rows.append([InlineKeyboardButton("➕ Set Increment", callback_data="set_increment")])
     else:
         rows.append([InlineKeyboardButton("📊 Set Float %",   callback_data="set_float_pct")])
-        _cur = ad_data.get("currencyId","").upper()
+        _cur = (sess.ad_data if sess else {}).get("currencyId","").upper()
         if currency_needs_ref(_cur) or _cur == "NGN":
             rows.append([InlineKeyboardButton(f"💱 Set {_cur}/USDT Ref", callback_data="set_ngn_ref")])
 
@@ -380,10 +382,11 @@ def ads_section_text(uid: int = 0) -> str:
 # ─────────────────────────────────────────
 # 📦 ORDER MONITOR SECTION
 # ─────────────────────────────────────────
-def orders_section_keyboard():
-    mon      = "🔔 Stop Monitoring" if order_monitor_running else "🔕 Start Monitoring"
-    sell_tog = "✉️ Sell Msg: ON — tap to OFF" if sell_msg_enabled else "✉️ Sell Msg: OFF — tap to ON"
-    chat_tog = "💬 Chat Monitor: ON ✅ — tap to OFF" if chat_monitor_enabled else "💬 Chat Monitor: OFF ❌ — tap to ON"
+def orders_section_keyboard(uid: int = 0):
+    sess     = _s(uid) if uid else None
+    mon      = "🔔 Stop Monitoring" if (sess and sess.order_monitor_running) else "🔕 Start Monitoring"
+    sell_tog = "✉️ Sell Msg: ON — tap to OFF" if (sess and sess.sell_msg_enabled) else "✉️ Sell Msg: OFF — tap to ON"
+    chat_tog = "💬 Chat Monitor: ON ✅ — tap to OFF" if (sess and sess.chat_monitor_enabled) else "💬 Chat Monitor: OFF ❌ — tap to ON"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(mon,                        callback_data="toggle_order_monitor")],
         [InlineKeyboardButton(chat_tog,                   callback_data="toggle_chat_monitor")],
@@ -426,12 +429,13 @@ def orders_section_text(uid: int = 0) -> str:
 # ─────────────────────────────────────────
 # 💳 AUTO-PAY SECTION
 # ─────────────────────────────────────────
-def autopay_section_keyboard():
-    pay     = "💳 Disable Auto-Pay (Bybit)" if auto_pay_enabled  else "💳 Enable Auto-Pay (Bybit)"
-    flw     = "🟢 Disable Flutterwave Pay ✅" if flw_pay_enabled else "🔴 Enable Flutterwave Pay"
-    paga    = "🟡 Disable Paga Pay ✅" if paga_pay_enabled else "🟡 Enable Paga Pay"
-    bp_tog  = f"🛡 Buyer Protection: {'ON ✅' if buyer_protection_enabled else 'OFF ❌'}"
-    nm_tog  = f"🔍 Name Match: {'ON ✅' if name_match_enabled else 'OFF ❌'}"
+def autopay_section_keyboard(uid: int = 0):
+    sess    = _s(uid) if uid else None
+    pay     = "💳 Disable Auto-Pay (Bybit)" if (sess and sess.auto_pay_enabled)  else "💳 Enable Auto-Pay (Bybit)"
+    flw     = "🟢 Disable Flutterwave Pay ✅" if (sess and sess.flw_pay_enabled) else "🔴 Enable Flutterwave Pay"
+    paga    = "🟡 Disable Paga Pay ✅" if (sess and sess.paga_pay_enabled) else "🟡 Enable Paga Pay"
+    bp_tog  = f"🛡 Buyer Protection: {'ON ✅' if (sess and sess.buyer_protection_on) else 'OFF ❌'}"
+    nm_tog  = f"🔍 Name Match: {'ON ✅' if (sess and sess.name_match_enabled) else 'OFF ❌'}"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(pay,  callback_data="toggle_auto_pay")],
         [InlineKeyboardButton(flw,  callback_data="toggle_flw_pay")],
@@ -486,8 +490,9 @@ def autopay_section_text(uid: int = 0) -> str:
 # ─────────────────────────────────────────
 # 🛡 BUYER PROTECTION MENU
 # ─────────────────────────────────────────
-def buyer_protection_menu_keyboard():
-    bp_tog = f"🛡 Buyer Protection: {'ON ✅ — tap to OFF' if buyer_protection_enabled else 'OFF ❌ — tap to ON'}"
+def buyer_protection_menu_keyboard(uid: int = 0):
+    sess   = _s(uid) if uid else None
+    bp_tog = f"🛡 Buyer Protection: {'ON ✅ — tap to OFF' if (sess and sess.buyer_protection_on) else 'OFF ❌ — tap to ON'}"
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("⏱ 10 min", callback_data="bp_set_10"),
          InlineKeyboardButton("⏱ 15 min", callback_data="bp_set_15")],
@@ -499,8 +504,11 @@ def buyer_protection_menu_keyboard():
     ])
 
 
-def buyer_protection_menu_text():
-    status = f"✅ ON — threshold: *{buyer_protection_threshold} min*" if buyer_protection_enabled else "❌ OFF"
+def buyer_protection_menu_text(uid: int = 0):
+    sess   = _s(uid) if uid else None
+    thresh = sess.buyer_protection_mins if sess else 30
+    on     = bool(sess and sess.buyer_protection_on)
+    status = f"✅ ON — threshold: *{thresh} min*" if on else "❌ OFF"
     return (
         "🛡 *Buyer Protection*\n\n"
         f"Current status: {status}\n\n"
@@ -510,7 +518,7 @@ def buyer_protection_menu_text():
         "  2️⃣ Send a warning message to the seller\n"
         "  3️⃣ Skip Flutterwave transfer (if FLW Pay is active)\n\n"
         f"⏱ *Choose your threshold time:*\n"
-        f"  Current: `{buyer_protection_threshold} min`\n\n"
+        f"  Current: `{thresh} min`\n\n"
         "_Tap a time button below or enter a custom value:_"
     )
 
@@ -554,7 +562,7 @@ def _has_account_info(order_detail: dict) -> tuple:
 # ─────────────────────────────────────────
 # 📦 FORMAT ORDER MESSAGES
 # ─────────────────────────────────────────
-def format_order_message(order_detail: dict, seller_info: dict) -> str:
+def format_order_message(order_detail: dict, seller_info: dict, uid: int = 0) -> str:
     order_type = order_detail.get("orderType", "ORIGIN")
     quantity   = order_detail.get("quantity",  "—")
     amount     = order_detail.get("amount",    "—")
@@ -579,8 +587,9 @@ def format_order_message(order_detail: dict, seller_info: dict) -> str:
     try:
         release_mins = float(avg_release)
         release_str  = f"{release_mins:.0f} min"
+        _bp_thresh   = _s(uid).buyer_protection_mins if uid else 30
         slow_warn    = f"\n\n⚠️ *Seller release time too long!* ({release_mins:.0f} min)" \
-                       if release_mins >= buyer_protection_threshold else ""
+                       if release_mins >= _bp_thresh else ""
     except (ValueError, TypeError):
         release_mins = 0
         release_str  = str(avg_release)
@@ -654,13 +663,13 @@ def format_sell_order_message(order_detail: dict, buyer_info: dict) -> str:
     )
 
 
-def order_buttons(order_id: str, autopay_failed: bool = False) -> InlineKeyboardMarkup | None:
+def order_buttons(order_id: str, autopay_failed: bool = False, uid: int = 0) -> InlineKeyboardMarkup | None:
     """
     BUY order buttons.
     - If auto-pay succeeded → return None (no buttons — order is handled)
     - If auto-pay failed or manual → show Mark Paid buttons
     """
-    if not autopay_failed and order_id in paid_order_ids:
+    if not autopay_failed and uid and order_id in _s(uid).paid_order_ids:
         return None   # already paid — remove buttons
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ Mark as Paid",            callback_data=f"pay_{order_id}")],
@@ -668,9 +677,9 @@ def order_buttons(order_id: str, autopay_failed: bool = False) -> InlineKeyboard
     ])
 
 
-def sell_order_buttons(order_id: str) -> InlineKeyboardMarkup | None:
+def sell_order_buttons(order_id: str, uid: int = 0) -> InlineKeyboardMarkup | None:
     """SELL order buttons — disappear once coins are released."""
-    if order_id in released_order_ids:
+    if uid and order_id in _s(uid).released_ids:
         return None
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🪙 RELEASE COIN", callback_data=f"release_{order_id}")],
@@ -1037,7 +1046,6 @@ async def _remove_order_buttons(bot, chat_id: int, order_id: str):
 # ─────────────────────────────────────────
 async def _paga_handle_success(bot, chat_id, order_id, pay_term, amount, holder_name, txn_id, ref):
     """Mark Bybit order paid and notify admin on Paga success."""
-    global paid_order_ids
     pay_type   = str(pay_term.get("paymentType", ""))
     payment_id = str(pay_term.get("id", ""))
     bybit_ok   = False
@@ -1046,7 +1054,7 @@ async def _paga_handle_success(bot, chat_id, order_id, pay_term, amount, holder_
             None, mark_order_paid, order_id, pay_type, payment_id
         )
         bybit_ok = pr.get("retCode", -1) == 0
-    paid_order_ids.add(order_id)
+    _s(chat_id).paid_order_ids.add(order_id)
     logger.info(f"[Paga] ✅ SUCCESS: txnId={txn_id} | Bybit={bybit_ok}")
     await _remove_order_buttons(bot, chat_id, order_id)
     await bot.send_message(chat_id=chat_id,
@@ -1063,9 +1071,8 @@ async def _paga_handle_success(bot, chat_id, order_id, pay_term, amount, holder_
 
 async def _paga_handle_failure(bot, chat_id, order_id, account_no, bank, amount, code, message_txt):
     """Log unpaid order and notify admin on Paga failure."""
-    global unpaid_orders_log
     err_lower = (message_txt or "").lower()
-    unpaid_orders_log.append({
+    _s(chat_id).unpaid_log.append({
         "order_id":   order_id,
         "account_no": account_no,
         "bank":       bank,
@@ -1362,17 +1369,15 @@ async def _paga_autopay(bot, chat_id, order_id, order_detail):
 # Forwards new messages to Telegram with a Reply button.
 # ─────────────────────────────────────────
 
-def _get_active_order_ids() -> set:
+def _get_active_order_ids(chat_id: int) -> set:
     """Return all order IDs currently being tracked (buy + sell, not yet released)."""
+    sess   = _s(chat_id)
     active = set()
-    # All buy orders seen but not yet paid/cancelled
-    active.update(seen_order_ids - paid_order_ids)
-    # All sell orders seen but not yet released
-    for oid in seen_sell_order_ids:
-        if not oid.startswith("paid_") and oid not in released_order_ids:
+    active.update(sess.seen_order_ids - sess.paid_order_ids)
+    for oid in sess.seen_sell_ids:
+        if not oid.startswith("paid_") and oid not in sess.released_ids:
             active.add(oid)
-    # Also include recently paid buy orders (seller may still message)
-    active.update(paid_order_ids)
+    active.update(sess.paid_order_ids)
     return active
 
 
@@ -1385,8 +1390,6 @@ async def _poll_order_chat(bot, chat_id: int, order_id: str):
     primary identifier, checked against both userId and accountId fields in the message.
     Auto-learns accountId and nick from the first matching message for faster future matching.
     """
-    global _my_account_id, _my_nick, seen_chat_msg_ids
-
     try:
         result = await asyncio.get_event_loop().run_in_executor(
             None, get_chat_messages, order_id, "1", "30"
@@ -1401,9 +1404,10 @@ async def _poll_order_chat(bot, chat_id: int, order_id: str):
         if not isinstance(messages, list):
             return
 
-        my_uid = str(user_settings.get("bybit_uid", "")).strip()
+        my_uid     = str(_s(chat_id).settings.get("bybit_uid", "")).strip()
+        _chat_msgs = _s(chat_id).seen_chat_msgs   # per-user dict: {order_id: set(msg_ids)}
 
-        if order_id not in seen_chat_msg_ids:
+        if order_id not in _chat_msgs:
             # First poll — learn my accountId and nick by matching bybit_uid
             for m in messages:
                 uid  = str(m.get("userId",    ""))
@@ -1411,17 +1415,17 @@ async def _poll_order_chat(bot, chat_id: int, order_id: str):
                 nck  = str(m.get("nickName",  ""))
                 # Match on userId OR accountId
                 if my_uid and (uid == my_uid or acct == my_uid):
-                    if acct and not _my_account_id:
-                        _my_account_id = acct
+                    if acct and not _s(chat_id).my_account_id:
+                        _s(chat_id).my_account_id = acct
                         logger.info(f"[ChatMonitor] Learned my accountId={acct} nick='{nck}'")
-                    if nck and not _my_nick:
-                        _my_nick = nck
+                    if nck and not _s(chat_id).my_nick:
+                        _s(chat_id).my_nick = nck
                     break
             # Seed seen IDs — do not forward existing messages on startup
-            seen_chat_msg_ids[order_id] = {str(m.get("id", "")) for m in messages}
+            _chat_msgs[order_id] = {str(m.get("id", "")) for m in messages}
             return
 
-        already_seen = seen_chat_msg_ids[order_id]
+        already_seen = _chat_msgs[order_id]
 
         # Reverse: messages are newest-first — forward in chronological order
         for msg in reversed(messages):
@@ -1452,20 +1456,20 @@ async def _poll_order_chat(bot, chat_id: int, order_id: str):
             # This is the most reliable check — uses the UID you explicitly set
             if my_uid and (user_id == my_uid or account_id == my_uid):
                 # Also learn accountId for future faster matching
-                if account_id and not _my_account_id:
-                    _my_account_id = account_id
-                if nick and not _my_nick:
-                    _my_nick = nick
+                if account_id and not _s(chat_id).my_account_id:
+                    _s(chat_id).my_account_id = account_id
+                if nick and not _s(chat_id).my_nick:
+                    _s(chat_id).my_nick = nick
                 logger.info(f"[ChatMonitor] ⏭ Own msg {msg_id} (uid match: userId={user_id} acctId={account_id})")
                 continue
 
             # ── Secondary filter: learned accountId ──
-            if _my_account_id and account_id == _my_account_id:
+            if _s(chat_id).my_account_id and account_id == _s(chat_id).my_account_id:
                 logger.info(f"[ChatMonitor] ⏭ Own msg {msg_id} (accountId match={account_id})")
                 continue
 
             # ── Tertiary filter: learned nick ──
-            if _my_nick and nick == _my_nick:
+            if _s(chat_id).my_nick and nick == _s(chat_id).my_nick:
                 logger.info(f"[ChatMonitor] ⏭ Own msg {msg_id} (nick match='{nick}')")
                 continue
 
@@ -1509,9 +1513,9 @@ async def chat_monitor_loop(bot, chat_id: int):
     # this task is created, so the UI reflects the change immediately.
     logger.info("💬 CHAT MONITOR STARTED")
 
-    while chat_monitor_enabled:
+    while _s(chat_id).chat_monitor_enabled:
         try:
-            active_ids = _get_active_order_ids()
+            active_ids = _get_active_order_ids(chat_id)
             if active_ids:
                 tasks = [
                     asyncio.create_task(_poll_order_chat(bot, chat_id, oid))
@@ -1609,9 +1613,9 @@ async def _handle_buy_order(bot, chat_id, order_id):
         _s(chat_id).order_msg_ids[order_id] = sent_msg.message_id
 
         # ── Name Match check (Bybit auto-pay path) ──
-        if _s(chat_id).name_match_enabled and (auto_pay_enabled or flw_pay_enabled or paga_pay_enabled):
+        if _s(chat_id).name_match_enabled and (_s(chat_id).auto_pay_enabled or _s(chat_id).flw_pay_enabled or _s(chat_id).paga_pay_enabled):
             has_info, _, _ = _has_account_info(order_detail)
-            if not has_info and order_id not in paid_order_ids:
+            if not has_info and order_id not in _s(chat_id).paid_order_ids:
                 pay_term_nm = order_detail.get("confirmedPayTerm", {}) or {}
                 if not pay_term_nm:
                     terms_nm    = order_detail.get("paymentTermList", [])
@@ -1948,36 +1952,37 @@ def calc_floating_price(ad_data, float_pct, local_usdt_ref):
 # 🔄 PRICE UPDATE LOOP
 # ─────────────────────────────────────────
 async def auto_update_loop(bot, chat_id):
-    global refresh_running, current_price
-    refresh_running = True
-    interval  = user_settings.get("interval", 2)
-    increment = Decimal(str(user_settings.get("increment","0.05")))
-    if user_settings.get("mode") == "fixed":
-        current_price = Decimal(str(ad_data.get("price","0")))
+    sess = _s(chat_id)
+    sess.refresh_running = True
+    s         = sess.settings
+    interval  = s.get("interval", 2)
+    increment = Decimal(str(s.get("increment","0.05")))
+    if s.get("mode") == "fixed":
+        sess.current_price = Decimal(str(sess.ad_data.get("price","0")))
 
     cycle = 0
-    while refresh_running:
+    while sess.refresh_running:
         cycle += 1
         now  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        mode = user_settings.get("mode","fixed")
+        mode = s.get("mode","fixed")
 
         if mode == "fixed":
-            new_p     = current_price + increment
+            new_p     = sess.current_price + increment
             new_p_str = str(new_p.quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP))
         else:
-            float_pct    = float(user_settings.get("float_pct",0))
-            local_usdt_ref = float(user_settings.get("local_usdt_ref") or 0)
-            new_p_str, err = calc_floating_price(ad_data, float_pct, local_usdt_ref)
+            float_pct      = float(s.get("float_pct",0))
+            local_usdt_ref = float(s.get("local_usdt_ref") or 0)
+            new_p_str, err = calc_floating_price(sess.ad_data, float_pct, local_usdt_ref)
             if err:
                 await bot.send_message(chat_id=chat_id,
                     text=f"⚠️ *Cycle {cycle} float error*\n`{err}`", parse_mode="Markdown")
                 for _ in range(interval * 60):
-                    if not refresh_running: break
+                    if not sess.refresh_running: break
                     await asyncio.sleep(1)
                 continue
 
         result   = await asyncio.get_event_loop().run_in_executor(
-            None, modify_ad, user_settings["ad_id"], new_p_str, ad_data
+            None, modify_ad, s["ad_id"], new_p_str, sess.ad_data
         )
         ret_code = result.get("retCode", result.get("ret_code",-1))
         ret_msg  = result.get("retMsg",  result.get("ret_msg","Unknown"))
@@ -1986,13 +1991,13 @@ async def auto_update_loop(bot, chat_id):
             bybit_max = _extract_bybit_max(ret_msg)
             if bybit_max:
                 retry_result = await asyncio.get_event_loop().run_in_executor(
-                    None, modify_ad, user_settings["ad_id"], bybit_max, ad_data
+                    None, modify_ad, s["ad_id"], bybit_max, sess.ad_data
                 )
                 retry_code = retry_result.get("retCode", retry_result.get("ret_code",-1))
                 retry_msg  = retry_result.get("retMsg",  retry_result.get("ret_msg","Unknown"))
                 if retry_code == 0:
                     if mode == "fixed":
-                        current_price = Decimal(bybit_max)
+                        sess.current_price = Decimal(bybit_max)
                     await bot.send_message(chat_id=chat_id,
                         text=(
                             f"✅ *Cycle {cycle}* `{now}`\n"
@@ -2011,12 +2016,12 @@ async def auto_update_loop(bot, chat_id):
 
         elif ret_code == 0:
             if mode == "fixed":
-                current_price = new_p
+                sess.current_price = new_p
             await bot.send_message(chat_id=chat_id,
                 text=f"✅ *Cycle {cycle}* `{now}`\n💲 `{new_p_str}` ({mode.upper()})",
                 parse_mode="Markdown")
         else:
-            _ecur = ad_data.get("currencyId","").upper()
+            _ecur = sess.ad_data.get("currencyId","").upper()
             extra = f"\n💱 Update {_ecur}/USDT ref if rate changed" \
                     if (currency_needs_ref(_ecur) or _ecur == "NGN") else ""
             await bot.send_message(chat_id=chat_id,
@@ -2024,7 +2029,7 @@ async def auto_update_loop(bot, chat_id):
                 parse_mode="Markdown")
 
         for _ in range(interval * 60):
-            if not refresh_running: break
+            if not sess.refresh_running: break
             await asyncio.sleep(1)
 
     logger.info("🛑 PRICE LOOP STOPPED")
@@ -2038,7 +2043,7 @@ async def send_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid     = update.effective_user.id
     chat_id = update.effective_chat.id
     text    = main_menu_text(uid)
-    kb      = main_menu_keyboard()
+    kb      = main_menu_keyboard(uid)
     try:
         await context.bot.send_photo(
             chat_id=chat_id,
@@ -2327,11 +2332,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         )
         await edit_menu(query,
             "🔒 *Pro Plan Required*\n\nYou need a Pro plan to use this bot.\n\nTap *⬆️ Upgrade Plan* to request access from the admin.",
-            main_menu_keyboard()
-        )
-        return
-
-    # Legacy per-feature guard (still applies for admin-visible toggles)
+            main_menu_keyboard(tuser.id) (still applies for admin-visible toggles)
     if sub.requires_pro(data) and not sub.is_pro(tuser.id) and not is_admin(tuser.id):
         await query.answer(
             "🔒 Pro plan required. Tap Upgrade Plan in the menu.",
@@ -2345,7 +2346,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         # are reflected immediately without needing a redeploy.
         db.check_and_auto_downgrade(tuser.id)
         _current_plan_badge = sub.plan_badge(tuser.id)
-        await edit_menu(query, main_menu_text(tuser.id), main_menu_keyboard())
+        await edit_menu(query, main_menu_text(tuser.id), main_menu_keyboard(tuser.id))
 
     # ── 🌍 Get My IP ──
     elif data == "get_my_ip":
@@ -2388,18 +2389,18 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         acct = accounts[idx]
         await edit_menu(query,
             f"✅ *Switched to {acct['label']}*\n\nAll session data cleared.\n\n" + main_menu_text(tuser.id),
-            main_menu_keyboard()
+            main_menu_keyboard(tuser.id)
         )
 
     # ── Section navigations ──
     elif data == "section_ads":
-        await edit_menu(query, ads_section_text(tuser.id), ads_section_keyboard())
+        await edit_menu(query, ads_section_text(tuser.id), ads_section_keyboard(tuser.id))
 
     elif data == "section_orders":
-        await edit_menu(query, orders_section_text(tuser.id), orders_section_keyboard())
+        await edit_menu(query, orders_section_text(tuser.id), orders_section_keyboard(tuser.id))
 
     elif data == "section_autopay":
-        await edit_menu(query, autopay_section_text(tuser.id), autopay_section_keyboard())
+        await edit_menu(query, autopay_section_text(tuser.id), autopay_section_keyboard(tuser.id))
 
     # ── 📡 Bot Status ──
     elif data == "bot_status":
@@ -2501,23 +2502,23 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
     # ── 🛡 Buyer Protection menu ──
     elif data == "buyer_protection_menu":
-        await edit_menu(query, buyer_protection_menu_text(), buyer_protection_menu_keyboard())
+        await edit_menu(query, buyer_protection_menu_text(tuser.id), buyer_protection_menu_keyboard(tuser.id))
 
     elif data == "toggle_buyer_protection":
         _s(tuser.id).buyer_protection_on = not _s(tuser.id).buyer_protection_on
         status = "✅ ON" if _s(tuser.id).buyer_protection_on else "❌ OFF"
         await edit_menu(query,
             f"🛡 *Buyer Protection {status}*\n\nThreshold: `{_s(tuser.id).buyer_protection_mins} min`\n\n"
-            + buyer_protection_menu_text(),
-            buyer_protection_menu_keyboard()
+            + buyer_protection_menu_text(tuser.id),
+            buyer_protection_menu_keyboard(tuser.id)
         )
 
     elif data.startswith("bp_set_") and data != "bp_set_custom":
         mins = int(data.split("_")[-1])
         _s(tuser.id).buyer_protection_mins = mins
         await edit_menu(query,
-            f"✅ *Buyer Protection threshold set to `{mins} min`*\n\n" + buyer_protection_menu_text(),
-            buyer_protection_menu_keyboard()
+            f"✅ *Buyer Protection threshold set to `{mins} min`*\n\n" + buyer_protection_menu_text(tuser.id),
+            buyer_protection_menu_keyboard(tuser.id)
         )
 
     elif data == "bp_set_custom":
@@ -2545,7 +2546,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
                if _s(tuser.id).name_match_enabled else
                "Name Match is now disabled.\n\n")
             + autopay_section_text(tuser.id),
-            autopay_section_keyboard()
+            autopay_section_keyboard(tuser.id)
         )
 
     # ── 💳 Toggle Auto-Pay ──
@@ -2555,7 +2556,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             _s(tuser.id).flw_pay_enabled = False
         if _s(tuser.id).auto_pay_enabled and _s(tuser.id).paga_pay_enabled:
             _s(tuser.id).paga_pay_enabled = False
-        await edit_menu(query, autopay_section_text(tuser.id), autopay_section_keyboard())
+        await edit_menu(query, autopay_section_text(tuser.id), autopay_section_keyboard(tuser.id))
 
     # ── 🟢 Toggle Flutterwave Pay ──
     elif data == "toggle_flw_pay":
@@ -2568,7 +2569,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             _s(tuser.id).auto_pay_enabled = False
         if _s(tuser.id).flw_pay_enabled and _s(tuser.id).paga_pay_enabled:
             _s(tuser.id).paga_pay_enabled = False
-        await edit_menu(query, autopay_section_text(tuser.id), autopay_section_keyboard())
+        await edit_menu(query, autopay_section_text(tuser.id), autopay_section_keyboard(tuser.id))
 
     # ── 🟡 Toggle Paga Pay ──
     elif data == "toggle_paga_pay":
@@ -2584,7 +2585,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             _s(tuser.id).auto_pay_enabled = False
         if _s(tuser.id).paga_pay_enabled and _s(tuser.id).flw_pay_enabled:
             _s(tuser.id).flw_pay_enabled = False
-        await edit_menu(query, autopay_section_text(tuser.id), autopay_section_keyboard())
+        await edit_menu(query, autopay_section_text(tuser.id), autopay_section_keyboard(tuser.id))
 
     # ── ℹ️ Paga info ──
     elif data == "paga_info":
@@ -2660,7 +2661,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 _s(tuser.id).chat_monitor_task = None
             await edit_menu(query,
                 "💬 *Chat Monitor stopped.*\n\n" + orders_section_text(tuser.id),
-                orders_section_keyboard()
+                orders_section_keyboard(tuser.id)
             )
         else:
             # Set flag BEFORE creating task so UI reflects it immediately
@@ -2671,7 +2672,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             await edit_menu(query,
                 "💬 *Chat Monitor started!*\nPolling Bybit order chats every 8 seconds.\n\n"
                 + orders_section_text(tuser.id),
-                orders_section_keyboard()
+                orders_section_keyboard(tuser.id)
             )
 
     # ── ↩️ Chat Reply — set reply state ──
@@ -2719,7 +2720,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 _s(tuser.id).order_monitor_task = None
             await edit_menu(query,
                 "🔕 *Order monitoring stopped.*\n\n" + orders_section_text(tuser.id),
-                orders_section_keyboard()
+                orders_section_keyboard(tuser.id)
             )
         else:
             _s(tuser.id).order_monitor_task = asyncio.create_task(
@@ -2731,12 +2732,12 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             await edit_menu(query,
                 "🔔 *Order monitoring started!*\nChecking every 10 seconds.\n\n"
                 + orders_section_text(tuser.id),
-                orders_section_keyboard()
+                orders_section_keyboard(tuser.id)
             )
 
     # ── 📋 Check Orders Now ──
     elif data == "check_orders_now":
-        await edit_menu(query, "⏳ Checking for orders...", orders_section_keyboard())
+        await edit_menu(query, "⏳ Checking for orders...", orders_section_keyboard(tuser.id))
         result   = await asyncio.get_event_loop().run_in_executor(None, partial(get_pending_orders, creds=get_user_creds(tuser.id)))
         ret_code = result.get("retCode", result.get("ret_code",-1))
         if ret_code == 0:
@@ -2744,20 +2745,20 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             txt   = f"📦 Found `{len(items)}` active order(s)." if items else "📦 No active orders at this time."
         else:
             txt = f"❌ `{result.get('retMsg','')}`"
-        await edit_menu(query, txt + "\n\n" + orders_section_text(tuser.id), orders_section_keyboard())
+        await edit_menu(query, txt + "\n\n" + orders_section_text(tuser.id), orders_section_keyboard(tuser.id))
 
     # ── 🗑 Clear Seen Orders ──
     elif data == "clear_seen_orders":
         _s(tuser.id).seen_order_ids.clear(); _s(tuser.id).seen_sell_ids.clear()
         await edit_menu(query,
             "✅ All seen orders cleared. Bot will re-notify on next check.\n\n" + orders_section_text(tuser.id),
-            orders_section_keyboard()
+            orders_section_keyboard(tuser.id)
         )
 
     # ── ✉️ Toggle Sell Msg ──
     elif data == "toggle_sell_msg":
         _s(tuser.id).sell_msg_enabled = not _s(tuser.id).sell_msg_enabled
-        await edit_menu(query, orders_section_text(tuser.id), orders_section_keyboard())
+        await edit_menu(query, orders_section_text(tuser.id), orders_section_keyboard(tuser.id))
 
     # ── ✏️ Set Sell Message ──
     elif data == "set_sell_msg":
@@ -3872,7 +3873,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await reply_with_back(
                 f"✅ *Buyer Protection threshold set!*\n\n"
                 f"Threshold: `{val} min`\n\n"
-                f"Status: {'✅ ON' if buyer_protection_enabled else '❌ OFF (tap toggle to enable)'}"
+                f"Status: {'✅ ON' if _s(uid).buyer_protection_on else '❌ OFF (tap toggle to enable)'}"
             )
         except Exception:
             await update.message.reply_text("❌ Send a whole number like `25`", parse_mode="Markdown")
@@ -3949,30 +3950,23 @@ async def _session_auto_reset_loop():
             # Reset P2P volatile data for any session older than 12h
             for k in list(user_state.keys()):
                 pass   # user_state is per-interaction, nothing to clean
-            # Clear unpaid_orders_log if too large
-            global unpaid_orders_log
-            if len(unpaid_orders_log) > 500:
-                unpaid_orders_log = unpaid_orders_log[-100:]
-                logger.info("[AutoReset] Trimmed unpaid_orders_log to 100 entries")
-            # Clear old seen message IDs to free memory
-            global seen_chat_msg_ids
-            if len(seen_chat_msg_ids) > 200:
-                # Keep only the 50 most recent orders
-                keys = list(seen_chat_msg_ids.keys())
-                for k in keys[:-50]:
-                    del seen_chat_msg_ids[k]
-                logger.info(f"[AutoReset] Trimmed seen_chat_msg_ids")
-            # Trim order tracking sets
-            global seen_order_ids, paid_order_ids, seen_sell_order_ids, released_order_ids
+            # Trim order tracking sets per user session
             MAX_IDS = 1000
-            if len(seen_order_ids) > MAX_IDS:
-                seen_order_ids = set(list(seen_order_ids)[-MAX_IDS:])
-            if len(paid_order_ids) > MAX_IDS:
-                paid_order_ids = set(list(paid_order_ids)[-MAX_IDS:])
-            if len(seen_sell_order_ids) > MAX_IDS:
-                seen_sell_order_ids = set(list(seen_sell_order_ids)[-MAX_IDS:])
-            if len(released_order_ids) > MAX_IDS:
-                released_order_ids = set(list(released_order_ids)[-MAX_IDS:])
+            for _sess in get_all_sessions().values():
+                if len(_sess.seen_order_ids) > MAX_IDS:
+                    _sess.seen_order_ids = set(list(_sess.seen_order_ids)[-MAX_IDS:])
+                if len(_sess.paid_order_ids) > MAX_IDS:
+                    _sess.paid_order_ids = set(list(_sess.paid_order_ids)[-MAX_IDS:])
+                if len(_sess.seen_sell_ids) > MAX_IDS:
+                    _sess.seen_sell_ids = set(list(_sess.seen_sell_ids)[-MAX_IDS:])
+                if len(_sess.released_ids) > MAX_IDS:
+                    _sess.released_ids = set(list(_sess.released_ids)[-MAX_IDS:])
+                if len(_sess.seen_chat_msgs) > 200:
+                    keys = list(_sess.seen_chat_msgs.keys())
+                    for k in keys[:-50]:
+                        del _sess.seen_chat_msgs[k]
+                if len(_sess.unpaid_log) > 500:
+                    _sess.unpaid_log = _sess.unpaid_log[-100:]
             logger.info("[AutoReset] Hourly memory cleanup done")
         except Exception as e:
             logger.error(f"[AutoReset] Error: {e}")
