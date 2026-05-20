@@ -184,22 +184,28 @@ def next_setup_hint() -> str:
 # ─────────────────────────────────────────
 def get_user_creds(user_id: int) -> dict | None:
     """
-    Load this user's Bybit API credentials for the currently active account slot.
-    - Slot is determined by bybit._active_index (0 = Account 1, 1 = Account 2).
-    - Returns {"key": ..., "secret": ...} if saved, or None to fall back to env keys.
-    - Admins always use env keys (None returned).
-    - NEVER touches global bybit variables — credentials are passed per-call.
+    Load Bybit credentials for a user for the currently active account slot.
+
+    Return values:
+      - Admin        → None  (bybit._resolve_creds(None) uses the active env account)
+      - User w/ key  → {"key": ..., "secret": ...}
+      - User no key  → {"key": "", "secret": ""}   ← SENTINEL: caller must gate on this
+
+    The SENTINEL distinguishes "no key saved" from "admin using env".
+    Callers check:  if not creds or not creds.get("key"): show "No API set" error.
     """
     if is_admin(user_id):
-        return None  # admin uses env account via bybit._resolve_creds(None)
+        return None  # admin always uses env account — no restriction
     slot   = str(bybit._active_index + 1)  # "1" or "2"
     key    = db.get_api(user_id, f"bybit_key_{slot}")
     secret = db.get_api(user_id, f"bybit_secret_{slot}")
     if key and secret:
-        logger.debug(f"[Creds] User {user_id} using DB key for slot {slot}")
+        logger.debug(f"[Creds] User {user_id} slot {slot} — DB key found")
         return {"key": key, "secret": secret}
-    logger.debug(f"[Creds] User {user_id} has no key for slot {slot} — using env fallback")
-    return None  # bybit will use env account
+    # No key saved for this user/slot — return sentinel (empty strings)
+    # so callers can distinguish "no key" from "admin (None)"
+    logger.info(f"[Creds] User {user_id} slot {slot} — NO API KEY SAVED")
+    return {"key": "", "secret": ""}
 
 
 # ─────────────────────────────────────────
@@ -2725,7 +2731,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
     # ── 📋 Check Orders Now ──
     elif data == "check_orders_now":
         await edit_menu(query, "⏳ Checking for orders...", orders_section_keyboard())
-        result   = await asyncio.get_event_loop().run_in_executor(None, partial(get_pending_orders, creds=get_user_creds(uid)))
+        result   = await asyncio.get_event_loop().run_in_executor(None, partial(get_pending_orders, creds=get_user_creds(tuser.id)))
         ret_code = result.get("retCode", result.get("ret_code",-1))
         if ret_code == 0:
             items = result.get("result",{}).get("items",[])
@@ -2794,18 +2800,29 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
     # ── 📃 My Ads ──
     elif data == "fetch_my_ads":
+        uid   = tuser.id
+        creds = get_user_creds(tuser.id)
+        # Guard: non-admin user with no API key saved
+        # Guard: non-admin user with no API key saved
+        if not is_admin(tuser.id) and not creds.get("key"):
+            await edit_menu(query,
+                "\u274c *No Bybit API set.*\n\nGo to \U0001f511 *Set APIs* \u2192 Set Bybit Account 1 API to add your key first.",
+                InlineKeyboardMarkup(back_section("section_ads"))
+            )
+            return
+            return
         await edit_menu(query, "⏳ Fetching your ads...", ads_section_keyboard())
-        result   = await asyncio.get_event_loop().run_in_executor(None, partial(get_my_ads, creds=get_user_creds(uid)))
+        result   = await asyncio.get_event_loop().run_in_executor(None, partial(get_my_ads, creds=creds))
         ret_code = result.get("retCode", result.get("ret_code",-1))
         if ret_code == 0:
             items = result.get("result",{}).get("items",[])
             if not items:
                 await edit_menu(query, "📃 No ads found.", InlineKeyboardMarkup(back_section("section_ads")))
                 return
-            uid   = user_settings.get("bybit_uid","")
+            bybit_uid = user_settings.get("bybit_uid","")
             lines = ["📃 *Your P2P Ads:*\n"]
             for item in items:
-                if uid and str(item.get("userId","")) != str(uid):
+                if bybit_uid and str(item.get("userId","")) != str(bybit_uid):
                     continue
                 side  = "BUY" if str(item.get("side","")) == "0" else "SELL"
                 stat  = {10:"🟢",20:"🔴",30:"✅"}.get(item.get("status",0),"❓")
@@ -2829,9 +2846,17 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         if not user_settings.get("ad_id"):
             await edit_menu(query, "❌ Set your Ad ID first.", InlineKeyboardMarkup(back_section("section_ads")))
             return
+        _creds = get_user_creds(tuser.id)
+        if not is_admin(tuser.id) and not _creds.get("key"):
+            await edit_menu(query,
+                "\u274c *No Bybit API set.*\n\nGo to \U0001f511 *Set APIs* \u2192 Set Bybit Account 1 API first.",
+                InlineKeyboardMarkup(back_section("section_ads"))
+            )
+            return
+            return
         await edit_menu(query, "⏳ Loading ad from Bybit...", ads_section_keyboard())
         result   = await asyncio.get_event_loop().run_in_executor(
-            None, get_ad_details, user_settings["ad_id"]
+            None, partial(get_ad_details, user_settings["ad_id"], creds=_creds)
         )
         ret_code = result.get("retCode", result.get("ret_code",-1))
         if ret_code == 0:
@@ -3010,7 +3035,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             await edit_menu(query, "❌ Set a Manage Ad ID first.", InlineKeyboardMarkup(back_manager()))
             return
         await edit_menu(query, f"⏳ Fetching ad `{manage_id}`...", InlineKeyboardMarkup(back_manager()))
-        result = await asyncio.get_event_loop().run_in_executor(None, partial(get_ad_details, manage_id, creds=get_user_creds(uid)))
+        result = await asyncio.get_event_loop().run_in_executor(None, partial(get_ad_details, manage_id, creds=get_user_creds(tuser.id)))
         rc = result.get("retCode", result.get("ret_code", -1))
         if rc == 0:
             mdata = result.get("result", {})
@@ -3047,11 +3072,11 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             await edit_menu(query, "❌ Fetch Manage Ad details first.", InlineKeyboardMarkup(back_manager()))
             return
         await edit_menu(query, f"⏳ Posting ad `{manage_id}` back online...", InlineKeyboardMarkup(back_manager()))
-        result = await asyncio.get_event_loop().run_in_executor(None, partial(put_ad_online, manage_id, mdata, creds=get_user_creds(uid)))
+        result = await asyncio.get_event_loop().run_in_executor(None, partial(put_ad_online, manage_id, mdata, creds=get_user_creds(tuser.id)))
         rc = result.get("retCode", result.get("ret_code", -1))
         rm = result.get("retMsg",  result.get("ret_msg", ""))
         if rc == 0:
-            fresh = await asyncio.get_event_loop().run_in_executor(None, partial(get_ad_details, manage_id, creds=get_user_creds(uid)))
+            fresh = await asyncio.get_event_loop().run_in_executor(None, partial(get_ad_details, manage_id, creds=get_user_creds(tuser.id)))
             if fresh.get("retCode", -1) == 0:
                 user_settings["manage_ad_data"] = fresh.get("result", mdata)
             await edit_menu(query,
@@ -3101,11 +3126,11 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             await edit_menu(query, "❌ No Manage Ad ID set.", InlineKeyboardMarkup(back_manager()))
             return
         await edit_menu(query, f"⏳ Taking ad `{manage_id}` offline...", InlineKeyboardMarkup(back_manager()))
-        result = await asyncio.get_event_loop().run_in_executor(None, partial(take_ad_offline, manage_id, mdata, creds=get_user_creds(uid)))
+        result = await asyncio.get_event_loop().run_in_executor(None, partial(take_ad_offline, manage_id, mdata, creds=get_user_creds(tuser.id)))
         rc = result.get("retCode", result.get("ret_code", -1))
         rm = result.get("retMsg",  result.get("ret_msg", ""))
         if rc == 0:
-            fresh = await asyncio.get_event_loop().run_in_executor(None, partial(get_ad_details, manage_id, creds=get_user_creds(uid)))
+            fresh = await asyncio.get_event_loop().run_in_executor(None, partial(get_ad_details, manage_id, creds=get_user_creds(tuser.id)))
             if fresh.get("retCode", -1) == 0:
                 user_settings["manage_ad_data"] = fresh.get("result", mdata)
             await edit_menu(query,
@@ -3384,26 +3409,43 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         uname = query.from_user.username or ""
         dname = query.from_user.full_name or ""
 
-        # ── Save request to DB (fast, no network) ──
-        # Admin notification is handled by the background _upgrade_notifier_loop
-        # which polls every 30 s. We NEVER call context.bot.send_message() here
-        # because doing so inside button_handler while the webhook is open causes
-        # CancelledError / TimeoutError that crashes the entire bot event loop.
-        logger.info(f"[Upgrade] Request from uid={uid} uname={uname} dname={dname} — saving to DB")
+        # ── Step 1: Save to DB (fast, no network — cannot fail) ──
+        logger.info(f"[Upgrade] Request from uid={uid} uname=@{uname} — saving to DB")
         try:
             db.request_upgrade(uid, uname, dname)
-            logger.info(f"[Upgrade] DB write successful for uid={uid}")
+            logger.info(f"[Upgrade] DB write OK for uid={uid}")
         except Exception as _db_err:
             logger.error(f"[Upgrade] DB write FAILED for uid={uid}: {_db_err}")
 
-        # Immediately update user screen — zero network calls needed
+        # ── Step 2: Update user screen immediately (before any network call) ──
         await edit_menu(query,
             "⏳ *Upgrade Request Sent!*\n\n"
             "The admin has been notified and will review shortly.\n"
             "You will receive a message once approved.",
             InlineKeyboardMarkup(back_main())
         )
-        logger.info(f"[Upgrade] Menu updated for uid={uid} — handler complete")
+        logger.info(f"[Upgrade] Menu updated for uid={uid}")
+
+        # ── Step 3: Notify admin(s) directly — in try/except so any Telegram
+        # API error is logged but CANNOT propagate and crash the bot. ──
+        _admin_msg = (
+            f"🔔 *New Upgrade Request!*\n\n"
+            f"👤 User ID: `{uid}`\n"
+            f"Username: @{uname if uname else 'None'}\n"
+            f"Name: {dname}\n\n"
+            f"Approve: `/upgrade {uid} 30`"
+        )
+        for _admin_id in list(_admin_chat_ids):
+            try:
+                await context.bot.send_message(
+                    chat_id=_admin_id,
+                    text=_admin_msg,
+                    parse_mode="Markdown"
+                )
+                logger.info(f"[Upgrade] Admin {_admin_id} notified for uid={uid}")
+            except Exception as _notify_err:
+                logger.error(f"[Upgrade] Could not notify admin {_admin_id}: {_notify_err}")
+                # The background _upgrade_notifier_loop will retry in 30 s
 
     # ── 🟢/🔴 Toggle Price Update ──
     elif data == "toggle_refresh":
@@ -3438,7 +3480,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         order_id = data[4:]
         await context.bot.send_message(chat_id=chat_id,
             text=f"⏳ Marking order `{order_id}` as paid...", parse_mode="Markdown")
-        det = await asyncio.get_event_loop().run_in_executor(None, partial(get_order_detail, order_id, creds=get_user_creds(uid)))
+        det = await asyncio.get_event_loop().run_in_executor(None, partial(get_order_detail, order_id, creds=get_user_creds(tuser.id)))
         if det.get("retCode",-1) != 0:
             await context.bot.send_message(chat_id=chat_id,
                 text=f"❌ Could not fetch order\n`{det.get('retMsg','')}`", parse_mode="Markdown")
@@ -3475,7 +3517,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         order_id = data[8:]
         await context.bot.send_message(chat_id=chat_id,
             text=f"⏳ Marking paid + sending warning for `{order_id}`...", parse_mode="Markdown")
-        det = await asyncio.get_event_loop().run_in_executor(None, partial(get_order_detail, order_id, creds=get_user_creds(uid)))
+        det = await asyncio.get_event_loop().run_in_executor(None, partial(get_order_detail, order_id, creds=get_user_creds(tuser.id)))
         if det.get("retCode",-1) != 0:
             await context.bot.send_message(chat_id=chat_id,
                 text=f"❌ `{det.get('retMsg','')}`", parse_mode="Markdown")
@@ -3518,7 +3560,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         order_id = data[8:]
         await context.bot.send_message(chat_id=chat_id,
             text=f"⏳ Releasing coins for order `{order_id}`...", parse_mode="Markdown")
-        result   = await asyncio.get_event_loop().run_in_executor(None, partial(release_assets, order_id, creds=get_user_creds(uid)))
+        result   = await asyncio.get_event_loop().run_in_executor(None, partial(release_assets, order_id, creds=get_user_creds(tuser.id)))
         ret_code = result.get("retCode", result.get("ret_code", -1))
         ret_msg  = result.get("retMsg",  result.get("ret_msg",  ""))
         if ret_code == 0:
