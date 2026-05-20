@@ -179,6 +179,29 @@ def get_all_users() -> list:
 
 
 # ─────────────────────────────────────────
+# P2P Settings persistence
+# Each user's P2P settings (ad_id, mode, interval, UIDs, etc.) are stored
+# inside their user JSON file under the "p2p_settings" key.
+# This lets settings survive bot restarts and be fully isolated per user.
+# ─────────────────────────────────────────
+def save_settings(user_id: int, settings: dict):
+    """Persist a user's P2P settings dict to disk."""
+    with _lock:
+        user = _read_json(_user_path(user_id))
+        if not user:
+            return
+        user["p2p_settings"] = settings
+        _write_json(_user_path(user_id), user)
+
+def load_settings(user_id: int) -> dict:
+    """Load a user's P2P settings from disk. Returns empty dict if none saved."""
+    user = get_user(user_id)
+    if not user:
+        return {}
+    return user.get("p2p_settings", {})
+
+
+# ─────────────────────────────────────────
 # API key management
 # ─────────────────────────────────────────
 def save_api(user_id: int, key: str, value: str):
