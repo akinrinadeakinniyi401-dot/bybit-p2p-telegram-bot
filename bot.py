@@ -2202,6 +2202,30 @@ async def ping_paga_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # 🎛️ BUTTON HANDLER
 # ─────────────────────────────────────────
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Main callback button handler. Wrapped with full exception logging so
+    any crash is visible in Render logs with exact line + traceback.
+    """
+    try:
+        await _button_handler_inner(update, context)
+    except Exception as _bh_err:
+        import traceback
+        logger.error(
+            f"[ButtonHandler] UNHANDLED EXCEPTION\n"
+            f"  data={getattr(getattr(update, 'callback_query', None), 'data', '?')!r}\n"
+            f"  user={getattr(getattr(update, 'callback_query', None), 'from_user', None)}\n"
+            f"  error={_bh_err}\n"
+            f"{traceback.format_exc()}"
+        )
+        try:
+            q = update.callback_query
+            if q:
+                await q.answer("⚠️ An error occurred. Please try again.", show_alert=True)
+        except Exception:
+            pass
+
+
+async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global refresh_task, refresh_running, current_price, ad_data
     global order_monitor_task, order_monitor_running, auto_pay_enabled, flw_pay_enabled, paga_pay_enabled
     global seen_order_ids, paid_order_ids, seen_sell_order_ids, released_order_ids
@@ -2213,9 +2237,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global order_msg_ids
 
     query   = update.callback_query
-    await query.answer()
-    data    = query.data
-    chat_id = query.message.chat_id
+    data    = query.data if update.callback_query else ""
+    chat_id = query.message.chat_id if query and query.message else 0
+    logger.debug(f"[ButtonHandler] Received callback: data={data!r} chat_id={chat_id}")
+    try:
+        await query.answer()
+    except Exception as _ans_err:
+        logger.warning(f"[ButtonHandler] query.answer() failed: {_ans_err}")
 
     # ── Register/update user on every interaction ──
     global _current_user_id, _current_plan_badge
@@ -2252,9 +2280,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # get_my_ip, section_apis, set_api_*, delete_apis, delete_apis_confirm, reset_*
     _FREE_ALLOWED = {
         "main_menu", "upgrade_plan", "upgrade_request_yes",
-        "bot_status", "get_my_ip", "reset_confirm", "reset_do",
+        "bot_status", "reset_confirm", "reset_do",
         "section_apis", "set_api_bybit", "set_api_flw", "set_api_paga",
+        "set_api_bybit_1", "set_api_bybit_2",
         "delete_apis", "delete_apis_confirm",
+        "delete_bybit1_apis", "delete_bybit1_confirm",
+        "delete_bybit2_apis", "delete_bybit2_confirm",
+        "delete_flw_apis",   "delete_flw_confirm",
+        "delete_paga_apis",  "delete_paga_confirm",
     }
     _is_free_allowed = (
         data in _FREE_ALLOWED
@@ -3166,24 +3199,136 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif data == "delete_apis":
+        uid_d = query.from_user.id
+        bk1 = "✅" if db.get_api(uid_d, "bybit_key_1")    else "—"
+        bk2 = "✅" if db.get_api(uid_d, "bybit_key_2")    else "—"
+        fk  = "✅" if db.get_api(uid_d, "flw_key")        else "—"
+        pk  = "✅" if db.get_api(uid_d, "paga_principal") else "—"
         await edit_menu(query,
-            "🗑 *Delete All APIs?*\n\n"
-            "This removes all your stored API keys from the server.\n"
-            "You will need to re-enter them to use the bot again.\n\nAre you sure?",
+            f"🗑 *Delete API Keys*\n\n"
+            f"Choose which keys to delete. This cannot be undone.\n\n"
+            f"Bybit Account 1: {bk1}\n"
+            f"Bybit Account 2: {bk2}\n"
+            f"Flutterwave: {fk}\n"
+            f"Paga: {pk}",
             InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Yes, Delete All", callback_data="delete_apis_confirm")],
-                [InlineKeyboardButton("❌ Cancel",          callback_data="section_apis")],
+                [InlineKeyboardButton(f"🔑 Delete Bybit Acct 1 API {bk1}", callback_data="delete_bybit1_apis")],
+                [InlineKeyboardButton(f"🔑 Delete Bybit Acct 2 API {bk2}", callback_data="delete_bybit2_apis")],
+                [InlineKeyboardButton(f"🟢 Delete Flutterwave API {fk}",   callback_data="delete_flw_apis")],
+                [InlineKeyboardButton(f"🟡 Delete Paga API {pk}",          callback_data="delete_paga_apis")],
+                [InlineKeyboardButton("🗑 Delete ALL APIs",                 callback_data="delete_apis_confirm")],
+                [InlineKeyboardButton("❌ Cancel",                          callback_data="section_apis")],
             ])
         )
 
     elif data == "delete_apis_confirm":
         uid_del = query.from_user.id
         db.delete_all_apis(uid_del)
+        restore_env_account()
         await edit_menu(query,
             "✅ *All API keys deleted.*\n\n"
             "Your account is still active but API credentials have been removed.\n"
             "Re-enter them anytime via 🔑 Set APIs.",
-            InlineKeyboardMarkup(back_main())
+            InlineKeyboardMarkup([*back_section("section_apis")])
+        )
+
+    # ── Granular delete confirmations ──
+    elif data == "delete_bybit1_apis":
+        uid_d = query.from_user.id
+        has   = bool(db.get_api(uid_d, "bybit_key_1"))
+        await edit_menu(query,
+            f"🔑 *Delete Bybit Account 1 API?*\n\n"
+            f"Status: {'✅ Saved' if has else '❌ Already empty'}\n\n"
+            "This permanently removes your Account 1 API key and secret.",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Yes, Delete", callback_data="delete_bybit1_confirm")],
+                [InlineKeyboardButton("❌ Cancel",       callback_data="delete_apis")],
+            ])
+        )
+
+    elif data == "delete_bybit1_confirm":
+        uid_del = query.from_user.id
+        db.save_api(uid_del, "bybit_key_1",    "")
+        db.save_api(uid_del, "bybit_secret_1", "")
+        # If currently on account slot 1, fall back to env key
+        if bybit._active_index == 0:
+            restore_env_account()
+        logger.info(f"[APIs] Bybit Account 1 keys deleted for user {uid_del}")
+        await edit_menu(query,
+            "✅ *Bybit Account 1 API deleted.*\n\nYou can re-add it anytime via 🔑 Set APIs.",
+            InlineKeyboardMarkup([*back_section("section_apis")])
+        )
+
+    elif data == "delete_bybit2_apis":
+        uid_d = query.from_user.id
+        has   = bool(db.get_api(uid_d, "bybit_key_2"))
+        await edit_menu(query,
+            f"🔑 *Delete Bybit Account 2 API?*\n\n"
+            f"Status: {'✅ Saved' if has else '❌ Already empty'}\n\n"
+            "This permanently removes your Account 2 API key and secret.",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Yes, Delete", callback_data="delete_bybit2_confirm")],
+                [InlineKeyboardButton("❌ Cancel",       callback_data="delete_apis")],
+            ])
+        )
+
+    elif data == "delete_bybit2_confirm":
+        uid_del = query.from_user.id
+        db.save_api(uid_del, "bybit_key_2",    "")
+        db.save_api(uid_del, "bybit_secret_2", "")
+        # If currently on account slot 2, fall back to env key
+        if bybit._active_index == 1:
+            restore_env_account()
+        logger.info(f"[APIs] Bybit Account 2 keys deleted for user {uid_del}")
+        await edit_menu(query,
+            "✅ *Bybit Account 2 API deleted.*\n\nYou can re-add it anytime via 🔑 Set APIs.",
+            InlineKeyboardMarkup([*back_section("section_apis")])
+        )
+
+    elif data == "delete_flw_apis":
+        uid_d = query.from_user.id
+        has   = bool(db.get_api(uid_d, "flw_key"))
+        await edit_menu(query,
+            f"🟢 *Delete Flutterwave API?*\n\n"
+            f"Status: {'✅ Saved' if has else '❌ Already empty'}\n\n"
+            "This permanently removes your FLW Secret Key, Secret and Hash.",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Yes, Delete", callback_data="delete_flw_confirm")],
+                [InlineKeyboardButton("❌ Cancel",       callback_data="delete_apis")],
+            ])
+        )
+
+    elif data == "delete_flw_confirm":
+        uid_del = query.from_user.id
+        for k in ("flw_key", "flw_secret", "flw_hash"):
+            db.save_api(uid_del, k, "")
+        logger.info(f"[APIs] FLW keys deleted for user {uid_del}")
+        await edit_menu(query,
+            "✅ *Flutterwave API deleted.*\n\nYou can re-add it anytime via 🔑 Set APIs.",
+            InlineKeyboardMarkup([*back_section("section_apis")])
+        )
+
+    elif data == "delete_paga_apis":
+        uid_d = query.from_user.id
+        has   = bool(db.get_api(uid_d, "paga_principal"))
+        await edit_menu(query,
+            f"🟡 *Delete Paga API?*\n\n"
+            f"Status: {'✅ Saved' if has else '❌ Already empty'}\n\n"
+            "This permanently removes your Paga Principal, Credential and API Key.",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Yes, Delete", callback_data="delete_paga_confirm")],
+                [InlineKeyboardButton("❌ Cancel",       callback_data="delete_apis")],
+            ])
+        )
+
+    elif data == "delete_paga_confirm":
+        uid_del = query.from_user.id
+        for k in ("paga_principal", "paga_credential", "paga_api_key"):
+            db.save_api(uid_del, k, "")
+        logger.info(f"[APIs] Paga keys deleted for user {uid_del}")
+        await edit_menu(query,
+            "✅ *Paga API deleted.*\n\nYou can re-add it anytime via 🔑 Set APIs.",
+            InlineKeyboardMarkup([*back_section("section_apis")])
         )
 
     # ── ⬆️ Upgrade Plan ──
@@ -3227,38 +3372,27 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uid   = query.from_user.id
         uname = query.from_user.username or ""
         dname = query.from_user.full_name or ""
-        db.request_upgrade(uid, uname, dname)
 
-        # ── Notify admin in a fire-and-forget background task ──
-        # We MUST NOT await this inside the button_handler because sending
-        # a Telegram message to the admin while the webhook is waiting for
-        # this coroutine to finish causes a deadlock that freezes the bot
-        # for every user. The fix: schedule it as a separate asyncio task.
-        async def _notify_admins():
-            msg = (
-                f"🔔 *New Upgrade Request!*\n\n"
-                f"👤 User ID: `{uid}`\n"
-                f"Username: @{uname}\n"
-                f"Name: {dname}\n\n"
-                f"Approve: `/upgrade {uid} 30`"
-            )
-            for admin_id in list(_admin_chat_ids):
-                try:
-                    await context.bot.send_message(
-                        chat_id=admin_id, text=msg, parse_mode="Markdown"
-                    )
-                except Exception as _e:
-                    logger.warning(f"[Upgrade] Could not notify admin {admin_id}: {_e}")
+        # ── Save request to DB (fast, no network) ──
+        # Admin notification is handled by the background _upgrade_notifier_loop
+        # which polls every 30 s. We NEVER call context.bot.send_message() here
+        # because doing so inside button_handler while the webhook is open causes
+        # CancelledError / TimeoutError that crashes the entire bot event loop.
+        logger.info(f"[Upgrade] Request from uid={uid} uname={uname} dname={dname} — saving to DB")
+        try:
+            db.request_upgrade(uid, uname, dname)
+            logger.info(f"[Upgrade] DB write successful for uid={uid}")
+        except Exception as _db_err:
+            logger.error(f"[Upgrade] DB write FAILED for uid={uid}: {_db_err}")
 
-        asyncio.create_task(_notify_admins())
-
-        # Immediately update the user's screen — no waiting for admin notify
+        # Immediately update user screen — zero network calls needed
         await edit_menu(query,
             "⏳ *Upgrade Request Sent!*\n\n"
             "The admin has been notified and will review shortly.\n"
             "You will receive a message once approved.",
             InlineKeyboardMarkup(back_main())
         )
+        logger.info(f"[Upgrade] Menu updated for uid={uid} — handler complete")
 
     # ── 🟢/🔴 Toggle Price Update ──
     elif data == "toggle_refresh":
@@ -3686,6 +3820,66 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Send a whole number like `25`", parse_mode="Markdown")
 
 
+# ─────────────────────────────────────────
+# 🔔 UPGRADE NOTIFIER — background polling
+# ─────────────────────────────────────────
+# Sends admin notifications for pending upgrade requests every 30 s.
+# Completely decoupled from the webhook so it can never crash the bot.
+_notified_upgrade_ids: set = set()   # track which requests we already notified about
+
+async def _upgrade_notifier_loop(bot):
+    """Poll DB every 30 s for new upgrade requests and notify admins."""
+    global _notified_upgrade_ids
+    logger.info("[UpgradeNotifier] Background notifier started")
+    while True:
+        try:
+            await asyncio.sleep(30)
+            pending = db.get_pending_requests()
+            for req in pending:
+                uid_r  = req.get("user_id")
+                if uid_r in _notified_upgrade_ids:
+                    continue   # already notified
+                uname_r = req.get("username", "")
+                dname_r = req.get("display_name", "")
+                msg = (
+                    f"🔔 *New Upgrade Request!*\n\n"
+                    f"👤 User ID: `{uid_r}`\n"
+                    f"Username: @{uname_r}\n"
+                    f"Name: {dname_r}\n\n"
+                    f"Approve: `/upgrade {uid_r} 30`"
+                )
+                notified = False
+                for admin_id in list(_admin_chat_ids):
+                    try:
+                        await bot.send_message(
+                            chat_id=admin_id, text=msg, parse_mode="Markdown"
+                        )
+                        notified = True
+                        logger.info(f"[UpgradeNotifier] Notified admin {admin_id} about uid={uid_r}")
+                    except Exception as _e:
+                        logger.warning(f"[UpgradeNotifier] Could not reach admin {admin_id}: {_e}")
+                if notified:
+                    _notified_upgrade_ids.add(uid_r)
+                    # Clean up any previously-approved IDs that are no longer pending
+                    # so re-requests from the same user work in future
+                    current_pending_ids = {r.get("user_id") for r in pending}
+                    _notified_upgrade_ids &= current_pending_ids
+                    # Also notify the requesting user that their request was received
+                    try:
+                        await bot.send_message(
+                            chat_id=uid_r,
+                            text=(
+                                "✅ *Your upgrade request has been submitted!*\n\n"
+                                "The admin has been notified. You will receive a message here once approved."
+                            ),
+                            parse_mode="Markdown"
+                        )
+                    except Exception:
+                        pass
+        except Exception as _loop_err:
+            logger.error(f"[UpgradeNotifier] Loop error: {_loop_err}")
+
+
 async def _session_auto_reset_loop():
     """Reset stale in-memory sessions every hour to prevent slowdown."""
     while True:
@@ -3836,7 +4030,10 @@ def start_bot():
         # Auto-clear old DB sessions every 12h
         asyncio.create_task(_db_session_cleanup_loop())
 
-        logger.info("🟡 Paga queue + session manager started")
+        # Background upgrade request notifier (polls DB, notifies admins)
+        asyncio.create_task(_upgrade_notifier_loop(app.bot))
+
+        logger.info("🟡 Paga queue + session manager + upgrade notifier started")
 
     application.post_init = _post_init
     logger.info("🤖 Bot handlers registered")
