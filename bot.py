@@ -1,4 +1,5 @@
 import asyncio
+from functools import partial
 import logging
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime
@@ -14,7 +15,6 @@ from bybit import (
     get_btc_usdt_price, get_eth_usdt_price, get_token_usdt_price,
     get_max_float_pct, get_min_float_pct, currency_needs_ref,
     get_pending_orders, get_sell_orders, get_incoming_sell_orders, get_order_detail,
-    set_user_credentials, restore_env_account,
     get_counterparty_info, mark_order_paid,
     send_chat_message, get_payment_name, release_assets,
     set_active_account, get_active_account, get_all_accounts,
@@ -177,6 +177,29 @@ def next_setup_hint() -> str:
     if mode == "floating" and needs_ref_cur and not user_settings.get("local_usdt_ref"):
         return f"👉 Next: tap *💱 Set {currency_upper}/USDT Ref* to set the reference rate"
     return "✅ *All set!* Tap *🟢 Start Auto-Update* to begin"
+
+
+# ─────────────────────────────────────────
+# 🔑 Per-user credential helper
+# ─────────────────────────────────────────
+def get_user_creds(user_id: int) -> dict | None:
+    """
+    Load this user's Bybit API credentials for the currently active account slot.
+    - Slot is determined by bybit._active_index (0 = Account 1, 1 = Account 2).
+    - Returns {"key": ..., "secret": ...} if saved, or None to fall back to env keys.
+    - Admins always use env keys (None returned).
+    - NEVER touches global bybit variables — credentials are passed per-call.
+    """
+    if is_admin(user_id):
+        return None  # admin uses env account via bybit._resolve_creds(None)
+    slot   = str(bybit._active_index + 1)  # "1" or "2"
+    key    = db.get_api(user_id, f"bybit_key_{slot}")
+    secret = db.get_api(user_id, f"bybit_secret_{slot}")
+    if key and secret:
+        logger.debug(f"[Creds] User {user_id} using DB key for slot {slot}")
+        return {"key": key, "secret": secret}
+    logger.debug(f"[Creds] User {user_id} has no key for slot {slot} — using env fallback")
+    return None  # bybit will use env account
 
 
 # ─────────────────────────────────────────
@@ -858,7 +881,7 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
             payment_id = str(pay_term.get("id", ""))
             bybit_ok   = False
             if pay_type and payment_id:
-                pr       = await asyncio.get_event_loop().run_in_executor(None, mark_order_paid, order_id, pay_type, payment_id)
+                pr       = await asyncio.get_event_loop().run_in_executor(None, partial(mark_order_paid, order_id, pay_type, payment_id, creds=get_user_creds(chat_id)))
                 bybit_ok = pr.get("retCode", -1) == 0
             paid_order_ids.add(order_id)
             await _remove_order_buttons(bot, chat_id, order_id)
@@ -1514,9 +1537,9 @@ async def order_monitor_loop(bot, chat_id):
     while order_monitor_running:
         try:
             buy_res, sell_incoming_res, sell_paid_res = await asyncio.gather(
-                asyncio.get_event_loop().run_in_executor(None, get_pending_orders),
-                asyncio.get_event_loop().run_in_executor(None, get_incoming_sell_orders),
-                asyncio.get_event_loop().run_in_executor(None, get_sell_orders),
+                asyncio.get_event_loop().run_in_executor(None, partial(get_pending_orders, creds=get_user_creds(chat_id))),
+                asyncio.get_event_loop().run_in_executor(None, partial(get_incoming_sell_orders, creds=get_user_creds(chat_id))),
+                asyncio.get_event_loop().run_in_executor(None, partial(get_sell_orders, creds=get_user_creds(chat_id))),
             )
 
             buy_items       = buy_res.get("result", {}).get("items", [])           if buy_res.get("retCode", buy_res.get("ret_code",-1)) == 0 else []
@@ -1559,7 +1582,7 @@ async def order_monitor_loop(bot, chat_id):
 
 async def _handle_buy_order(bot, chat_id, order_id):
     try:
-        det = await asyncio.get_event_loop().run_in_executor(None, get_order_detail, order_id)
+        det = await asyncio.get_event_loop().run_in_executor(None, partial(get_order_detail, order_id, creds=get_user_creds(chat_id)))
         if det.get("retCode", -1) != 0:
             return
         order_detail = det.get("result", {})
@@ -1692,7 +1715,7 @@ async def _handle_buy_order(bot, chat_id, order_id):
 
 async def _handle_sell_incoming(bot, chat_id, order_id):
     try:
-        det = await asyncio.get_event_loop().run_in_executor(None, get_order_detail, order_id)
+        det = await asyncio.get_event_loop().run_in_executor(None, partial(get_order_detail, order_id, creds=get_user_creds(chat_id)))
         if det.get("retCode", -1) != 0:
             return
         order_detail = det.get("result", {})
@@ -1794,7 +1817,7 @@ async def _handle_sell_incoming(bot, chat_id, order_id):
 
 async def _handle_sell_paid(bot, chat_id, order_id):
     try:
-        det = await asyncio.get_event_loop().run_in_executor(None, get_order_detail, order_id)
+        det = await asyncio.get_event_loop().run_in_executor(None, partial(get_order_detail, order_id, creds=get_user_creds(chat_id)))
         if det.get("retCode", -1) != 0:
             return
         order_detail = det.get("result", {})
@@ -2087,7 +2110,7 @@ async def ping_bybit_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     await update.message.reply_text("⏳ Testing Bybit API...")
     from bybit import ping_api
-    result   = await asyncio.get_event_loop().run_in_executor(None, ping_api)
+    result   = await asyncio.get_event_loop().run_in_executor(None, partial(ping_api, creds=get_user_creds(chat_id)))
     ret_code = result.get("retCode", -1)
     if ret_code == 0:
         info      = result.get("result", {})
@@ -2255,24 +2278,15 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
     # ── Per-user isolated state for non-admin users ──
     # Admin uses the global user_state; non-admins get their own isolated dict
-    # stored in context.user_data so their API key flows don't collide.
     if is_admin(tuser.id):
         _btn_state = user_state
-        restore_env_account()   # admin always uses env Bybit keys
     else:
         if "state" not in context.user_data:
             context.user_data["state"] = {}
         _btn_state = context.user_data["state"]
-        # Load this user's saved Bybit credentials for the CURRENTLY ACTIVE account slot.
-        # Account 1 (index 0) → bybit_key_1 / bybit_secret_1
-        # Account 2 (index 1) → bybit_key_2 / bybit_secret_2
-        _slot     = str(bybit._active_index + 1)
-        _u_key    = db.get_api(tuser.id, f"bybit_key_{_slot}")
-        _u_secret = db.get_api(tuser.id, f"bybit_secret_{_slot}")
-        if _u_key and _u_secret:
-            set_user_credentials(_u_key, _u_secret)
-        else:
-            restore_env_account()  # fall back to env keys if user has none saved for this slot
+    # NOTE: Bybit credentials are loaded per-call via get_user_creds(tuser.id)
+    # — no globals are mutated here. See get_user_creds() for details.
+
 
     # ── Pro feature guard ──
     # Block non-admin free users from ALL functional sections.
@@ -2711,7 +2725,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
     # ── 📋 Check Orders Now ──
     elif data == "check_orders_now":
         await edit_menu(query, "⏳ Checking for orders...", orders_section_keyboard())
-        result   = await asyncio.get_event_loop().run_in_executor(None, get_pending_orders)
+        result   = await asyncio.get_event_loop().run_in_executor(None, partial(get_pending_orders, creds=get_user_creds(uid)))
         ret_code = result.get("retCode", result.get("ret_code",-1))
         if ret_code == 0:
             items = result.get("result",{}).get("items",[])
@@ -2781,7 +2795,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
     # ── 📃 My Ads ──
     elif data == "fetch_my_ads":
         await edit_menu(query, "⏳ Fetching your ads...", ads_section_keyboard())
-        result   = await asyncio.get_event_loop().run_in_executor(None, get_my_ads)
+        result   = await asyncio.get_event_loop().run_in_executor(None, partial(get_my_ads, creds=get_user_creds(uid)))
         ret_code = result.get("retCode", result.get("ret_code",-1))
         if ret_code == 0:
             items = result.get("result",{}).get("items",[])
@@ -2996,7 +3010,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             await edit_menu(query, "❌ Set a Manage Ad ID first.", InlineKeyboardMarkup(back_manager()))
             return
         await edit_menu(query, f"⏳ Fetching ad `{manage_id}`...", InlineKeyboardMarkup(back_manager()))
-        result = await asyncio.get_event_loop().run_in_executor(None, get_ad_details, manage_id)
+        result = await asyncio.get_event_loop().run_in_executor(None, partial(get_ad_details, manage_id, creds=get_user_creds(uid)))
         rc = result.get("retCode", result.get("ret_code", -1))
         if rc == 0:
             mdata = result.get("result", {})
@@ -3033,11 +3047,11 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             await edit_menu(query, "❌ Fetch Manage Ad details first.", InlineKeyboardMarkup(back_manager()))
             return
         await edit_menu(query, f"⏳ Posting ad `{manage_id}` back online...", InlineKeyboardMarkup(back_manager()))
-        result = await asyncio.get_event_loop().run_in_executor(None, put_ad_online, manage_id, mdata)
+        result = await asyncio.get_event_loop().run_in_executor(None, partial(put_ad_online, manage_id, mdata, creds=get_user_creds(uid)))
         rc = result.get("retCode", result.get("ret_code", -1))
         rm = result.get("retMsg",  result.get("ret_msg", ""))
         if rc == 0:
-            fresh = await asyncio.get_event_loop().run_in_executor(None, get_ad_details, manage_id)
+            fresh = await asyncio.get_event_loop().run_in_executor(None, partial(get_ad_details, manage_id, creds=get_user_creds(uid)))
             if fresh.get("retCode", -1) == 0:
                 user_settings["manage_ad_data"] = fresh.get("result", mdata)
             await edit_menu(query,
@@ -3087,11 +3101,11 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             await edit_menu(query, "❌ No Manage Ad ID set.", InlineKeyboardMarkup(back_manager()))
             return
         await edit_menu(query, f"⏳ Taking ad `{manage_id}` offline...", InlineKeyboardMarkup(back_manager()))
-        result = await asyncio.get_event_loop().run_in_executor(None, take_ad_offline, manage_id, mdata)
+        result = await asyncio.get_event_loop().run_in_executor(None, partial(take_ad_offline, manage_id, mdata, creds=get_user_creds(uid)))
         rc = result.get("retCode", result.get("ret_code", -1))
         rm = result.get("retMsg",  result.get("ret_msg", ""))
         if rc == 0:
-            fresh = await asyncio.get_event_loop().run_in_executor(None, get_ad_details, manage_id)
+            fresh = await asyncio.get_event_loop().run_in_executor(None, partial(get_ad_details, manage_id, creds=get_user_creds(uid)))
             if fresh.get("retCode", -1) == 0:
                 user_settings["manage_ad_data"] = fresh.get("result", mdata)
             await edit_menu(query,
@@ -3224,7 +3238,6 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
     elif data == "delete_apis_confirm":
         uid_del = query.from_user.id
         db.delete_all_apis(uid_del)
-        restore_env_account()
         await edit_menu(query,
             "✅ *All API keys deleted.*\n\n"
             "Your account is still active but API credentials have been removed.\n"
@@ -3252,8 +3265,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         db.save_api(uid_del, "bybit_secret_1", "")
         # If currently on account slot 1, fall back to env key
         if bybit._active_index == 0:
-            restore_env_account()
-        logger.info(f"[APIs] Bybit Account 1 keys deleted for user {uid_del}")
+            logger.info(f"[APIs] Bybit Account 1 keys deleted for user {uid_del}")
         await edit_menu(query,
             "✅ *Bybit Account 1 API deleted.*\n\nYou can re-add it anytime via 🔑 Set APIs.",
             InlineKeyboardMarkup([*back_section("section_apis")])
@@ -3278,8 +3290,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         db.save_api(uid_del, "bybit_secret_2", "")
         # If currently on account slot 2, fall back to env key
         if bybit._active_index == 1:
-            restore_env_account()
-        logger.info(f"[APIs] Bybit Account 2 keys deleted for user {uid_del}")
+            logger.info(f"[APIs] Bybit Account 2 keys deleted for user {uid_del}")
         await edit_menu(query,
             "✅ *Bybit Account 2 API deleted.*\n\nYou can re-add it anytime via 🔑 Set APIs.",
             InlineKeyboardMarkup([*back_section("section_apis")])
@@ -3427,7 +3438,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         order_id = data[4:]
         await context.bot.send_message(chat_id=chat_id,
             text=f"⏳ Marking order `{order_id}` as paid...", parse_mode="Markdown")
-        det = await asyncio.get_event_loop().run_in_executor(None, get_order_detail, order_id)
+        det = await asyncio.get_event_loop().run_in_executor(None, partial(get_order_detail, order_id, creds=get_user_creds(uid)))
         if det.get("retCode",-1) != 0:
             await context.bot.send_message(chat_id=chat_id,
                 text=f"❌ Could not fetch order\n`{det.get('retMsg','')}`", parse_mode="Markdown")
@@ -3464,7 +3475,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         order_id = data[8:]
         await context.bot.send_message(chat_id=chat_id,
             text=f"⏳ Marking paid + sending warning for `{order_id}`...", parse_mode="Markdown")
-        det = await asyncio.get_event_loop().run_in_executor(None, get_order_detail, order_id)
+        det = await asyncio.get_event_loop().run_in_executor(None, partial(get_order_detail, order_id, creds=get_user_creds(uid)))
         if det.get("retCode",-1) != 0:
             await context.bot.send_message(chat_id=chat_id,
                 text=f"❌ `{det.get('retMsg','')}`", parse_mode="Markdown")
@@ -3507,7 +3518,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         order_id = data[8:]
         await context.bot.send_message(chat_id=chat_id,
             text=f"⏳ Releasing coins for order `{order_id}`...", parse_mode="Markdown")
-        result   = await asyncio.get_event_loop().run_in_executor(None, release_assets, order_id)
+        result   = await asyncio.get_event_loop().run_in_executor(None, partial(release_assets, order_id, creds=get_user_creds(uid)))
         ret_code = result.get("retCode", result.get("ret_code", -1))
         ret_msg  = result.get("retMsg",  result.get("ret_msg",  ""))
         if ret_code == 0:
@@ -3578,10 +3589,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         key_temp = _state.pop("_api_bybit_key_temp", "")
         db.save_api(uid, f"bybit_key_{slot}",    key_temp)
         db.save_api(uid, f"bybit_secret_{slot}", text.strip())
-        # Determine which account slot is currently active and load if it matches
-        active_idx   = str(bybit._active_index + 1)   # 0→"1", 1→"2"
-        if not is_admin(uid) and active_idx == slot:
-            set_user_credentials(key_temp, text.strip())
+        # Credentials are loaded per-call via get_user_creds() — no global mutation needed.
         _state["action"] = None
         await update.message.reply_text(
             f"✅ *Bybit Account {slot} API saved!*\n\n"
