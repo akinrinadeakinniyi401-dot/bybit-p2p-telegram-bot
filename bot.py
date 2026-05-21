@@ -364,7 +364,7 @@ def ads_section_text(uid: int = 0) -> str:
         if ad_data.get("currencyId","").upper() == "NGN":
             mode_info += f" | 💱 {cur_label}/USDT: `{local_ref}`"
 
-    hint = next_setup_hint(tuser.id)
+    hint = next_setup_hint(uid)
     acct_label = bybit.BYBIT_ACCOUNTS[bybit._active_index]["label"] if bybit.BYBIT_ACCOUNTS else f"Account {slot}"
 
     return (
