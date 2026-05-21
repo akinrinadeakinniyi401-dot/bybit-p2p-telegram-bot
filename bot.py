@@ -1027,7 +1027,7 @@ async def _remove_order_buttons(bot, chat_id: int, order_id: str):
     Remove the pay buttons from the BUY order notification message.
     Called by auto-pay after success — no query object available.
     """
-    msg_id = order_msg_ids.get(order_id)
+    msg_id = _s(chat_id).order_msg_ids.get(order_id)
     if not msg_id:
         return
     try:
@@ -1612,6 +1612,15 @@ async def _handle_buy_order(bot, chat_id, order_id):
         # Store message_id so auto-pay can remove buttons without a query object
         _s(chat_id).order_msg_ids[order_id] = sent_msg.message_id
 
+        # ── Persist cumulative buy order count to DB ──
+        try:
+            user_rec = db.get_user(chat_id)
+            if user_rec is not None:
+                new_buy_count = (user_rec.get("total_buy_orders") or 0) + 1
+                db.update_user_stats(chat_id, total_buy_orders=new_buy_count)
+        except Exception as _stat_err:
+            logger.debug(f"[Stats] Could not update buy count for {chat_id}: {_stat_err}")
+
         # ── Name Match check (Bybit auto-pay path) ──
         if _s(chat_id).name_match_enabled and (_s(chat_id).auto_pay_enabled or _s(chat_id).flw_pay_enabled or _s(chat_id).paga_pay_enabled):
             has_info, _, _ = _has_account_info(order_detail)
@@ -1647,7 +1656,7 @@ async def _handle_buy_order(bot, chat_id, order_id):
             seller_release = 0
         order_detail["_seller_release_mins"] = seller_release
 
-        if _s(chat_id).paga_pay_enabled and order_id not in paid_order_ids:
+        if _s(chat_id).paga_pay_enabled and order_id not in _s(chat_id).paid_order_ids:
             await asyncio.sleep(5)
             # ── Enqueue instead of calling directly ──
             # This ensures orders are paid one at a time, preventing
@@ -1664,11 +1673,11 @@ async def _handle_buy_order(bot, chat_id, order_id):
                     parse_mode="Markdown"
                 )
 
-        elif _s(chat_id).flw_pay_enabled and order_id not in paid_order_ids:
+        elif _s(chat_id).flw_pay_enabled and order_id not in _s(chat_id).paid_order_ids:
             await asyncio.sleep(5)
             await _flw_autopay(bot, chat_id, order_id, order_detail)
 
-        elif _s(chat_id).auto_pay_enabled and order_id not in paid_order_ids:
+        elif _s(chat_id).auto_pay_enabled and order_id not in _s(chat_id).paid_order_ids:
             try:
                 release_mins = float(seller_info.get("averageReleaseTime", "0") or 0)
             except (ValueError, TypeError):
@@ -1844,6 +1853,15 @@ async def _handle_sell_paid(bot, chat_id, order_id):
             reply_markup=sell_order_buttons(order_id),
             parse_mode="Markdown"
         )
+
+        # ── Persist cumulative sell order count to DB ──
+        try:
+            user_rec = db.get_user(chat_id)
+            if user_rec is not None:
+                new_sell_count = (user_rec.get("total_sell_orders") or 0) + 1
+                db.update_user_stats(chat_id, total_sell_orders=new_sell_count)
+        except Exception as _stat_err:
+            logger.debug(f"[Stats] Could not update sell count for {chat_id}: {_stat_err}")
 
         # ── 🚨 Fraud Check at paid stage (buyer name most reliable here) ──
         buyer_name = (
@@ -2182,7 +2200,7 @@ async def ping_flutterwave_command(update: Update, context: ContextTypes.DEFAULT
 
     await update.message.reply_text("⏳ Testing Flutterwave v3 API...")
     from flutterwave import ping_flutterwave
-    result = await asyncio.get_event_loop().run_in_executor(None, partial(ping_flutterwave, secret_key=key_to_use))
+    result = await asyncio.get_event_loop().run_in_executor(None, partial(ping_flutterwave, key_to_use))
     if "error" in result:
         ip = await _get_current_ip()
         await update.message.reply_text(
@@ -2735,7 +2753,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
     # ── ❌ Cancel Chat Reply ──
     elif data == "cancel_chat_reply":
         _s(tuser.id).reply_state.pop(chat_id, None)
-        user_state["action"] = None
+        _btn_state["action"] = None
         await context.bot.send_message(
             chat_id=chat_id,
             text="❌ Reply cancelled.",
@@ -3757,7 +3775,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     elif action == "chat_reply":
-        state    = reply_state.pop(update.message.chat_id, {})
+        state    = _s(uid).reply_state.pop(uid, {})
         order_id = state.get("order_id", "")
         nick     = state.get("nick", "counterparty")
         _state["action"] = None
@@ -3765,7 +3783,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ No active reply state. Tap Reply on a message first.")
             return
         result = await asyncio.get_event_loop().run_in_executor(
-            None, send_chat_message, order_id, text
+            None, partial(send_chat_message, order_id, text, creds=get_user_creds(uid))
         )
         rc = result.get("retCode", result.get("ret_code", -1))
         if rc == 0:
@@ -4122,6 +4140,41 @@ def start_bot():
 
         # Background upgrade request notifier (polls DB, notifies admins)
         asyncio.create_task(_upgrade_notifier_loop(app.bot))
+
+        # ── Set admin-scoped bot commands so only current ADMIN_IDS see admin cmds ──
+        # This re-syncs on every deploy, so removed admin IDs lose the menu immediately.
+        from telegram import BotCommand, BotCommandScopeChat
+        admin_commands = [
+            BotCommand("upgrade",   "Upgrade a user to Pro"),
+            BotCommand("downgrade", "Downgrade a user"),
+            BotCommand("requests",  "List upgrade requests"),
+            BotCommand("listusers", "List all users"),
+            BotCommand("userdata",  "Download user data Excel"),
+        ]
+        user_commands = [
+            BotCommand("start",           "Start the bot"),
+            BotCommand("menu",            "Open main menu"),
+            BotCommand("pingbybit",       "Test Bybit API"),
+            BotCommand("pingflutterwave", "Test Flutterwave API"),
+            BotCommand("pingpaga",        "Test Paga API"),
+            BotCommand("refreshscammers", "Refresh scammer list"),
+            BotCommand("checkname",       "Check a name against scammer list"),
+        ]
+        # Set user-level commands for everyone (default scope)
+        try:
+            await app.bot.set_my_commands(user_commands)
+        except Exception as _e:
+            logger.warning(f"[Init] Could not set default commands: {_e}")
+        # Set combined commands for each active admin individually
+        for _admin_id in list(ADMIN_IDS):
+            try:
+                await app.bot.set_my_commands(
+                    user_commands + admin_commands,
+                    scope=BotCommandScopeChat(chat_id=_admin_id)
+                )
+                logger.info(f"[Init] Admin commands set for {_admin_id}")
+            except Exception as _e:
+                logger.warning(f"[Init] Could not set admin commands for {_admin_id}: {_e}")
 
         logger.info("🟡 Paga queue + session manager + upgrade notifier started")
 
