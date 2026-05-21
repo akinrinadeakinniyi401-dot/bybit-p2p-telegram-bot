@@ -458,12 +458,11 @@ def autopay_section_text(uid: int = 0) -> str:
     bybit_status = "✅ ENABLED" if sess.auto_pay_enabled  else "❌ DISABLED"
     flw_status   = "✅ ENABLED" if sess.flw_pay_enabled   else "❌ DISABLED"
     paga_status  = "✅ ENABLED" if sess.paga_pay_enabled  else "❌ DISABLED"
-    # FLW/Paga are env-level — user can also save own keys via Set APIs
-    flw_key   = db.get_api(uid, "flw_key")
+    # All API keys are per-user — stored in DB only
+    flw_key   = db.get_api(uid, "flw_secret_key")
     paga_key  = db.get_api(uid, "paga_principal")
-    from config import FLW_SECRET_KEY, PAGA_PRINCIPAL, PAGA_CREDENTIAL, PAGA_API_KEY
-    flw_configured  = "✅ Configured" if (flw_key or FLW_SECRET_KEY) else "❌ Not configured"
-    paga_configured = "✅ Configured" if (paga_key or (PAGA_PRINCIPAL and PAGA_CREDENTIAL)) else "❌ Not configured"
+    flw_configured  = "✅ Configured" if flw_key else "❌ Not configured"
+    paga_configured = "✅ Configured" if paga_key else "❌ Not configured"
     sender_name  = sess.settings.get("sender_name", "Not set")
     unpaid_count = len(sess.unpaid_log)
     bp_status    = f"✅ ON — threshold: {sess.buyer_protection_mins} min" if sess.buyer_protection_on else "❌ OFF"
@@ -692,6 +691,18 @@ def sell_order_buttons(order_id: str, uid: int = 0) -> InlineKeyboardMarkup | No
 async def _flw_autopay(bot, chat_id, order_id, order_detail):
     from flutterwave import match_bank_code, verify_account, send_transfer, get_transfer_status
 
+    # Load this user's FLW secret key from DB
+    flw_secret_key = db.get_api(chat_id, "flw_secret_key")
+    if not flw_secret_key:
+        await bot.send_message(chat_id=chat_id,
+            text=(
+                f"❌ *FLW Auto-Pay* — Order `{order_id}`\n\n"
+                "No Flutterwave API configured.\n"
+                "Go to 🔑 *Set APIs* → Set Flutterwave API first."
+            ),
+            parse_mode="Markdown")
+        return
+
     try:
         # ── Name Match check ──
         if _s(chat_id).name_match_enabled:
@@ -740,7 +751,7 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
                 parse_mode="Markdown")
             return
 
-        bank_code = match_bank_code(bank_name, pay_type_name)
+        bank_code = match_bank_code(bank_name, pay_type_name, secret_key=flw_secret_key)
         if not bank_code:
             await bot.send_message(chat_id=chat_id,
                 text=(
@@ -792,7 +803,7 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
             parse_mode="Markdown")
 
         verify = await asyncio.get_event_loop().run_in_executor(
-            None, verify_account, account_no, bank_code
+            None, verify_account, account_no, bank_code, flw_secret_key
         )
 
         if verify.get("status") != "success" or "error" in verify:
@@ -830,7 +841,7 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
         ref    = f"p2p{order_id[-12:]}"
         result = await asyncio.get_event_loop().run_in_executor(
             None, send_transfer, account_no, working_code, amount,
-            f"{sender_name} payment to {verified_name}", ref
+            f"{sender_name} payment to {verified_name}", ref, flw_secret_key
         )
 
         if "error" in result:
@@ -882,7 +893,7 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
             await asyncio.sleep(5)
             if final_status in ("SUCCESSFUL", "FAILED"):
                 break
-            poll         = await asyncio.get_event_loop().run_in_executor(None, get_transfer_status, transfer_id)
+            poll         = await asyncio.get_event_loop().run_in_executor(None, get_transfer_status, transfer_id, flw_secret_key)
             final_status = poll.get("data", {}).get("status", final_status)
 
         if final_status == "SUCCESSFUL":
@@ -903,7 +914,7 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
                 ),
                 parse_mode="Markdown")
         elif final_status == "FAILED":
-            last_poll    = await asyncio.get_event_loop().run_in_executor(None, get_transfer_status, transfer_id)
+            last_poll    = await asyncio.get_event_loop().run_in_executor(None, get_transfer_status, transfer_id, flw_secret_key)
             complete_msg = last_poll.get("data", {}).get("complete_message", "")
             _s(chat_id).unpaid_log.append({
                 "order_id": order_id, "account_no": account_no,
@@ -1106,6 +1117,21 @@ async def _paga_autopay(bot, chat_id, order_id, order_detail):
     from paga import match_bank_uuid, validate_account, deposit_to_bank, check_status
     import os
 
+    # Load this user's Paga credentials from DB
+    paga_api_key    = db.get_api(chat_id, "paga_api_key")
+    paga_credential = db.get_api(chat_id, "paga_credential")
+    paga_principal  = db.get_api(chat_id, "paga_principal")
+
+    if not (paga_api_key and paga_credential and paga_principal):
+        await bot.send_message(chat_id=chat_id,
+            text=(
+                f"❌ *Paga Auto-Pay* — Order `{order_id}`\n\n"
+                "No Paga API configured.\n"
+                "Go to 🔑 *Set APIs* → Set Paga API first."
+            ),
+            parse_mode="Markdown")
+        return
+
     try:
         # ── Name Match check ──
         if _s(chat_id).name_match_enabled:
@@ -1154,7 +1180,8 @@ async def _paga_autopay(bot, chat_id, order_id, order_detail):
                 parse_mode="Markdown")
             return
 
-        bank_uuid = match_bank_uuid(bank_name, pay_type_name)
+        bank_uuid = match_bank_uuid(bank_name, pay_type_name,
+                                    api_key=paga_api_key, credential=paga_credential, principal=paga_principal)
         if not bank_uuid:
             await bot.send_message(chat_id=chat_id,
                 text=(
@@ -1206,7 +1233,8 @@ async def _paga_autopay(bot, chat_id, order_id, order_detail):
             parse_mode="Markdown")
 
         validate = await asyncio.get_event_loop().run_in_executor(
-            None, validate_account, account_no, bank_uuid, amount
+            None, validate_account, account_no, bank_uuid, amount,
+            paga_api_key, paga_credential, paga_principal
         )
 
         if validate.get("responseCode") != 0 or "error" in validate:
@@ -1253,7 +1281,8 @@ async def _paga_autopay(bot, chat_id, order_id, order_detail):
             None, deposit_to_bank,
             account_no, bank_uuid, amount,
             verified_name, "",          # recipient_name, recipient_phone
-            narration, callback_url, ref
+            narration, callback_url, ref,
+            paga_api_key, paga_credential, paga_principal
         )
 
         if "error" in result:
@@ -1311,7 +1340,8 @@ async def _paga_autopay(bot, chat_id, order_id, order_detail):
             for attempt in range(12):
                 await asyncio.sleep(10)
                 poll = await asyncio.get_event_loop().run_in_executor(
-                    None, check_status, ref
+                    None, check_status, ref,
+                    paga_api_key, paga_credential, paga_principal
                 )
                 final_code = poll.get("responseCode", -1)
                 final_msg  = poll.get("message", "") or ""
@@ -2174,38 +2204,26 @@ async def ping_bybit_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 async def ping_flutterwave_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Test Flutterwave API — uses the user's own saved FLW key (or admin env key)."""
-    uid   = update.effective_user.id
-    flw_k = db.get_api(uid, "flw_key")
-    from config import FLW_SECRET_KEY
+    """Test Flutterwave API — uses the user's own saved FLW secret key from DB."""
+    uid       = update.effective_user.id
+    secret_key = db.get_api(uid, "flw_secret_key")
 
-    if is_admin(uid):
-        # Admin: use env key
-        key_to_use = FLW_SECRET_KEY
-        if not key_to_use:
-            await update.message.reply_text(
-                "❌ *FLW_SECRET_KEY not set in Render environment.*",
-                parse_mode="Markdown"
-            )
-            return
-    else:
-        # Non-admin: must have their own key saved in DB
-        key_to_use = flw_k
-        if not key_to_use:
-            await update.message.reply_text(
-                "❌ *No Flutterwave API set.*\n\nGo to 🔑 *Set APIs* → Set Flutterwave API first.",
-                parse_mode="Markdown"
-            )
-            return
+    if not secret_key:
+        await update.message.reply_text(
+            "❌ *No Flutterwave API set.*\n\nGo to 🔑 *Set APIs* → Set Flutterwave API first.\n\n"
+            "You need to provide:\n`FLW_CLIENT_ID` → `FLW_CLIENT_SECRET` → `FLW_PUBLIC_KEY`",
+            parse_mode="Markdown"
+        )
+        return
 
     await update.message.reply_text("⏳ Testing Flutterwave v3 API...")
     from flutterwave import ping_flutterwave
-    result = await asyncio.get_event_loop().run_in_executor(None, partial(ping_flutterwave, key_to_use))
+    result = await asyncio.get_event_loop().run_in_executor(None, ping_flutterwave, secret_key)
     if "error" in result:
         ip = await _get_current_ip()
         await update.message.reply_text(
             f"❌ *Flutterwave connection failed*\n\n`{result['error'][:300]}`\n\n"
-            f"• Check your FLW Secret Key starts with `FLWSECK_`\n"
+            f"• Check your FLW Client Secret starts with `FLWSECK_`\n"
             f"• Whitelist IP `{ip}` on Flutterwave → Settings → API → IP Whitelist",
             parse_mode="Markdown"
         )
@@ -2227,31 +2245,19 @@ async def ping_flutterwave_command(update: Update, context: ContextTypes.DEFAULT
 
 
 async def ping_paga_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Test Paga API — uses the user's own saved Paga keys (or admin env keys)."""
-    uid    = update.effective_user.id
-    from config import PAGA_PRINCIPAL as ENV_PRINCIPAL, PAGA_CREDENTIAL as ENV_CRED, PAGA_API_KEY as ENV_KEY
+    """Test Paga API — uses the user's own saved Paga keys from DB."""
+    uid        = update.effective_user.id
+    principal  = db.get_api(uid, "paga_principal")
+    credential = db.get_api(uid, "paga_credential")
+    api_key    = db.get_api(uid, "paga_api_key")
 
-    if is_admin(uid):
-        principal  = ENV_PRINCIPAL
-        credential = ENV_CRED
-        api_key    = ENV_KEY
-        if not (principal and credential and api_key):
-            await update.message.reply_text(
-                "❌ *Paga credentials not set in Render environment.*\n\n"
-                "Add `PAGA_PRINCIPAL`, `PAGA_CREDENTIAL`, `PAGA_API_KEY`.",
-                parse_mode="Markdown"
-            )
-            return
-    else:
-        principal  = db.get_api(uid, "paga_principal")
-        credential = db.get_api(uid, "paga_credential")
-        api_key    = db.get_api(uid, "paga_api_key")
-        if not (principal and credential and api_key):
-            await update.message.reply_text(
-                "❌ *No Paga API set.*\n\nGo to 🔑 *Set APIs* → Set Paga API first.",
-                parse_mode="Markdown"
-            )
-            return
+    if not (principal and credential and api_key):
+        await update.message.reply_text(
+            "❌ *No Paga API set.*\n\nGo to 🔑 *Set APIs* → Set Paga API first.\n\n"
+            "You need to provide:\n`PAGA_API_KEY` → `PAGA_CREDENTIAL` → `PAGA_PRINCIPAL`",
+            parse_mode="Markdown"
+        )
+        return
 
     await update.message.reply_text("⏳ Testing Paga Business API...")
     from paga import ping_paga
@@ -2603,8 +2609,8 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
     # ── 🟢 Toggle Flutterwave Pay ──
     elif data == "toggle_flw_pay":
         if not _s(tuser.id).flw_pay_enabled:
-            # Check the user has a FLW key configured
-            _flw_key = db.get_api(tuser.id, "flw_key") if not is_admin(tuser.id) else True
+            # All users (including admin) must have FLW key in DB
+            _flw_key = db.get_api(tuser.id, "flw_secret_key")
             if not _flw_key:
                 await query.answer(
                     "❌ No Flutterwave API saved. Go to 🔑 Set APIs → Set Flutterwave API first.",
@@ -2621,7 +2627,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
     # ── 🟡 Toggle Paga Pay ──
     elif data == "toggle_paga_pay":
         if not _s(tuser.id).paga_pay_enabled:
-            _paga_key = db.get_api(tuser.id, "paga_principal") if not is_admin(tuser.id) else True
+            _paga_key = db.get_api(tuser.id, "paga_principal")
             if not _paga_key:
                 await query.answer(
                     "❌ No Paga API saved. Go to 🔑 Set APIs → Set Paga API first.",
@@ -3207,7 +3213,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         uid  = query.from_user.id
         bk1  = "✅" if db.get_api(uid, "bybit_key_1")    else "❌"
         bk2  = "✅" if db.get_api(uid, "bybit_key_2")    else "❌"
-        fk   = "✅" if db.get_api(uid, "flw_key")        else "❌"
+        fk   = "✅" if db.get_api(uid, "flw_secret_key")  else "❌"
         pk   = "✅" if db.get_api(uid, "paga_principal") else "❌"
         await edit_menu(query,
             f"🔑 *API Setup*\n\n"
@@ -3269,26 +3275,26 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         )
 
     elif data == "set_api_flw":
-        _btn_state["action"]       = "api_flw_key"
+        _btn_state["action"]       = "api_flw_client_id"
         _btn_state["prev_section"] = "section_apis"
         uid = query.from_user.id
-        has = bool(db.get_api(uid, "flw_key"))
+        has = bool(db.get_api(uid, "flw_secret_key"))
         await edit_menu(query,
             f"🟢 *Set Flutterwave API*\n\n"
-            f"Status: {'✅ Already configured' if has else '❌ Not set'}\n\n"
-            "Step 1 of 3: Send your FLW Secret Key\n(starts with `FLWSECK_`)",
+            f"Status: {'✅ Already configured — new values will replace it' if has else '❌ Not set'}\n\n"
+            "Step 1 of 3: Send your *FLW_CLIENT_ID*\n_(from Flutterwave dashboard → API Keys)_",
             InlineKeyboardMarkup(back_section("section_apis"))
         )
 
     elif data == "set_api_paga":
-        _btn_state["action"]       = "api_paga_principal"
+        _btn_state["action"]       = "api_paga_api_key"
         _btn_state["prev_section"] = "section_apis"
         uid = query.from_user.id
         has = bool(db.get_api(uid, "paga_principal"))
         await edit_menu(query,
             f"🟡 *Set Paga API*\n\n"
-            f"Status: {'✅ Already configured' if has else '❌ Not set'}\n\n"
-            "Step 1 of 3: Send your Paga Principal (Public Key).",
+            f"Status: {'✅ Already configured — new values will replace it' if has else '❌ Not set'}\n\n"
+            "Step 1 of 3: Send your *PAGA_API_KEY*\n_(HMAC Hash Key from Paga dashboard)_",
             InlineKeyboardMarkup(back_section("section_apis"))
         )
 
@@ -3296,7 +3302,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         uid_d = query.from_user.id
         bk1 = "✅" if db.get_api(uid_d, "bybit_key_1")    else "—"
         bk2 = "✅" if db.get_api(uid_d, "bybit_key_2")    else "—"
-        fk  = "✅" if db.get_api(uid_d, "flw_key")        else "—"
+        fk  = "✅" if db.get_api(uid_d, "flw_secret_key")  else "—"
         pk  = "✅" if db.get_api(uid_d, "paga_principal") else "—"
         await edit_menu(query,
             f"🗑 *Delete API Keys*\n\n"
@@ -3378,11 +3384,11 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
     elif data == "delete_flw_apis":
         uid_d = query.from_user.id
-        has   = bool(db.get_api(uid_d, "flw_key"))
+        has   = bool(db.get_api(uid_d, "flw_secret_key"))
         await edit_menu(query,
             f"🟢 *Delete Flutterwave API?*\n\n"
             f"Status: {'✅ Saved' if has else '❌ Already empty'}\n\n"
-            "This permanently removes your FLW Secret Key, Secret and Hash.",
+            "This permanently removes your FLW Client ID, Client Secret and Public Key.",
             InlineKeyboardMarkup([
                 [InlineKeyboardButton("✅ Yes, Delete", callback_data="delete_flw_confirm")],
                 [InlineKeyboardButton("❌ Cancel",       callback_data="delete_apis")],
@@ -3391,7 +3397,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
     elif data == "delete_flw_confirm":
         uid_del = query.from_user.id
-        for k in ("flw_key", "flw_secret", "flw_hash"):
+        for k in ("flw_client_id", "flw_client_secret", "flw_secret_key", "flw_public_key"):
             db.save_api(uid_del, k, "")
         logger.info(f"[APIs] FLW keys deleted for user {uid_del}")
         await edit_menu(query,
@@ -3697,65 +3703,76 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    elif action == "api_flw_key":
-        _state["action"]               = "api_flw_secret"
-        _state["_api_flw_key_temp"]    = text.strip()
+    elif action == "api_flw_client_id":
+        _state["action"]                  = "api_flw_client_secret"
+        _state["_api_flw_client_id_temp"] = text.strip()
         await update.message.reply_text(
-            "✅ FLW Secret Key received.\n\nStep 2 of 3: Send your FLW *Secret Hash*.",
+            "✅ *FLW_CLIENT_ID received.*\n\n"
+            "Step 2 of 3: Send your *FLW_CLIENT_SECRET*\n_(starts with `FLWSECK_`)_",
             parse_mode="Markdown"
         )
         return
 
-    elif action == "api_flw_secret":
-        _state["action"]               = "api_flw_hash"
-        _state["_api_flw_secret_temp"] = text.strip()
+    elif action == "api_flw_client_secret":
+        _state["action"]                      = "api_flw_public_key"
+        _state["_api_flw_client_secret_temp"] = text.strip()
         await update.message.reply_text(
-            "✅ FLW Secret received.\n\nStep 3 of 3: Send your FLW *Secret Hash*.",
+            "✅ *FLW_CLIENT_SECRET received.*\n\n"
+            "Step 3 of 3: Send your *FLW_PUBLIC_KEY*\n_(starts with `FLWPUBK_`)_",
             parse_mode="Markdown"
         )
         return
 
-    elif action == "api_flw_hash":
+    elif action == "api_flw_public_key":
         uid = update.effective_user.id
-        db.save_api(uid, "flw_key",    _state.pop("_api_flw_key_temp", ""))
-        db.save_api(uid, "flw_secret", _state.pop("_api_flw_secret_temp", ""))
-        db.save_api(uid, "flw_hash",   text.strip())
+        client_id     = _state.pop("_api_flw_client_id_temp", "")
+        client_secret = _state.pop("_api_flw_client_secret_temp", "")
+        db.save_api(uid, "flw_client_id",     client_id)
+        db.save_api(uid, "flw_client_secret",  client_secret)
+        db.save_api(uid, "flw_secret_key",     client_secret)   # used for all API calls
+        db.save_api(uid, "flw_public_key",    text.strip())
         _state["action"] = None
         _save_settings(uid)
         await update.message.reply_text(
-            "✅ *Flutterwave API saved!*\n\nKey, Secret and Hash stored securely.",
+            "✅ *Flutterwave API saved!*\n\n"
+            "Client ID, Client Secret and Public Key stored securely.\n"
+            "Use /pingflutterwave to test the connection.",
             parse_mode="Markdown",
             reply_markup=back_prev("section_apis")
         )
         return
 
-    elif action == "api_paga_principal":
-        _state["action"]                    = "api_paga_credential"
-        _state["_api_paga_principal_temp"]  = text.strip()
+    elif action == "api_paga_api_key":
+        _state["action"]                 = "api_paga_credential"
+        _state["_api_paga_api_key_temp"] = text.strip()
         await update.message.reply_text(
-            "✅ Paga Principal received.\n\nStep 2 of 3: Send your Paga *Credential* (password).",
+            "✅ *PAGA_API_KEY received.*\n\n"
+            "Step 2 of 3: Send your *PAGA_CREDENTIAL*\n_(Live Primary Secret Key from Paga dashboard)_",
             parse_mode="Markdown"
         )
         return
 
     elif action == "api_paga_credential":
-        _state["action"]                     = "api_paga_api_key"
+        _state["action"]                     = "api_paga_principal"
         _state["_api_paga_credential_temp"]  = text.strip()
         await update.message.reply_text(
-            "✅ Paga Credential received.\n\nStep 3 of 3: Send your Paga *API Key* (HMAC hash key).",
+            "✅ *PAGA_CREDENTIAL received.*\n\n"
+            "Step 3 of 3: Send your *PAGA_PRINCIPAL*\n_(Your Public Key / Principal from Paga dashboard)_",
             parse_mode="Markdown"
         )
         return
 
-    elif action == "api_paga_api_key":
+    elif action == "api_paga_principal":
         uid = update.effective_user.id
-        db.save_api(uid, "paga_principal",  _state.pop("_api_paga_principal_temp", ""))
+        db.save_api(uid, "paga_api_key",    _state.pop("_api_paga_api_key_temp", ""))
         db.save_api(uid, "paga_credential", _state.pop("_api_paga_credential_temp", ""))
-        db.save_api(uid, "paga_api_key",    text.strip())
+        db.save_api(uid, "paga_principal",  text.strip())
         _state["action"] = None
         _save_settings(uid)
         await update.message.reply_text(
-            "✅ *Paga API saved!*\n\nPrincipal, Credential and API Key stored securely.",
+            "✅ *Paga API saved!*\n\n"
+            "API Key, Credential and Principal stored securely.\n"
+            "Use /pingpaga to test the connection.",
             parse_mode="Markdown",
             reply_markup=back_prev("section_apis")
         )
