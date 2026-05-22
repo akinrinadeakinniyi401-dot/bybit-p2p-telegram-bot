@@ -69,7 +69,21 @@ user_state: dict = {}   # admin input action state (non-admins use context.user_
 
 def _s(uid: int) -> SessionState:
     """Shorthand: get the per-user session for uid."""
-    return get_session(uid)
+    sess = get_session(uid)
+    # Ensure per-user slot field exists (backfill for sessions created before this patch)
+    if not hasattr(sess, "selected_slot"):
+        sess.selected_slot = 0   # 0 = slot 1, 1 = slot 2 (matches bybit._active_index values)
+    return sess
+
+
+def _get_user_slot(uid: int) -> int:
+    """Return the active account slot index (0-based) for this specific user."""
+    return _s(uid).selected_slot
+
+
+def _get_user_slot_str(uid: int) -> str:
+    """Return slot as 1-based string: '1' or '2'."""
+    return str(_s(uid).selected_slot + 1)
 
 def _settings(uid: int) -> dict:
     """Shorthand: get the mutable settings dict for uid."""
@@ -120,7 +134,7 @@ def _get_admin_chat_ids() -> set:
 def setup_progress(uid: int) -> tuple:
     s     = _settings(uid)
     sess  = _s(uid)
-    slot  = str(bybit._active_index + 1)
+    slot  = _get_user_slot_str(uid)   # per-user slot — NOT global
     steps = [
         bool(s.get(f"ad_id_{slot}") or s.get("ad_id")),
         bool(s.get(f"bybit_uid_{slot}") or s.get("bybit_uid")),
@@ -137,7 +151,7 @@ def setup_progress(uid: int) -> tuple:
 def next_setup_hint(uid: int) -> str:
     s    = _settings(uid)
     sess = _s(uid)
-    slot = str(bybit._active_index + 1)
+    slot = _get_user_slot_str(uid)   # per-user slot — NOT global
     ad_id    = s.get(f"ad_id_{slot}") or s.get("ad_id","")
     bybit_uid = s.get(f"bybit_uid_{slot}") or s.get("bybit_uid","")
     if not ad_id:
@@ -161,9 +175,16 @@ def next_setup_hint(uid: int) -> str:
 # ─────────────────────────────────────────
 # 🔑 Per-user credential helper
 # ─────────────────────────────────────────
-def get_user_creds(user_id: int) -> dict | None:
+def get_user_creds(user_id: int, slot: int | None = None) -> dict | None:
     """
-    Load Bybit credentials for a user for the currently active account slot.
+    Load Bybit credentials for a user using THEIR OWN per-user slot.
+
+    CRITICAL: Uses _s(user_id).selected_slot — NOT the global bybit._active_index.
+    This ensures User A switching slots never affects User B.
+
+    Args:
+        user_id: Telegram user ID
+        slot: Optional override (0-based index). If None, uses user's own selected_slot.
 
     Return values:
       - Admin        → None  (bybit._resolve_creds(None) uses the active env account)
@@ -175,15 +196,19 @@ def get_user_creds(user_id: int) -> dict | None:
     """
     if is_admin(user_id):
         return None  # admin always uses env account — no restriction
-    slot   = str(bybit._active_index + 1)  # "1" or "2"
-    key    = db.get_api(user_id, f"bybit_key_{slot}")
-    secret = db.get_api(user_id, f"bybit_secret_{slot}")
+
+    # ── Per-user slot — NEVER reads global bybit._active_index ──
+    user_slot = slot if slot is not None else _get_user_slot(user_id)
+    slot_str  = str(user_slot + 1)   # "1" or "2"
+
+    key    = db.get_api(user_id, f"bybit_key_{slot_str}")
+    secret = db.get_api(user_id, f"bybit_secret_{slot_str}")
     if key and secret:
-        logger.debug(f"[Creds] User {user_id} slot {slot} — DB key found")
+        logger.debug(f"[Creds] User {user_id} slot {slot_str} — DB key found")
         return {"key": key, "secret": secret}
+
     # No key saved for this user/slot — return sentinel (empty strings)
-    # so callers can distinguish "no key" from "admin (None)"
-    logger.info(f"[Creds] User {user_id} slot {slot} — NO API KEY SAVED")
+    logger.info(f"[Creds] User {user_id} slot {slot_str} — NO API KEY SAVED")
     return {"key": "", "secret": ""}
 
 
@@ -199,9 +224,10 @@ def main_menu_keyboard(uid: int = 0):
 
     kb = []
     if len(all_ac) > 1:
+        _user_slot_idx = _s(uid).selected_slot if uid else 0
         kb.append([
             InlineKeyboardButton(
-                f"{'✅ ' if i == bybit._active_index else ''}{ac['label']}",
+                f"{'✅ ' if i == _user_slot_idx else ''}{ac['label']}",
                 callback_data=f"switch_account_{i}"
             )
             for i, ac in enumerate(all_ac)
@@ -227,7 +253,10 @@ def main_menu_text(uid: int = 0) -> str:
     o_status = "🔔 Active"  if sess.order_monitor_running else "🔕 Off"
     p_status = "💳 ON"      if sess.auto_pay_enabled       else "💳 OFF"
     r_status = "🟢 Running" if sess.refresh_running        else "🔴 Off"
-    acct     = get_active_account()
+    # Per-user active account — NOT global
+    _uid_slot = _s(uid).selected_slot
+    _all_ac   = get_all_accounts()
+    acct      = _all_ac[_uid_slot] if _uid_slot < len(_all_ac) else _all_ac[0]
     bp_status = f"🛡 ON ({sess.buyer_protection_mins}min)" if sess.buyer_protection_on else "🛡 OFF"
     nm_status = "🔍 ON"     if sess.name_match_enabled     else "🔍 OFF"
     badge     = sub.plan_badge(uid) if uid else _current_plan_badge
@@ -326,7 +355,7 @@ def ads_section_text(uid: int = 0) -> str:
     uid  = uid or _current_user_id
     sess = _s(uid)
     s    = sess.settings
-    slot = str(bybit._active_index + 1)
+    slot = _get_user_slot_str(uid)   # per-user slot — NOT global
     ad_id     = s.get(f"ad_id_{slot}") or s.get("ad_id","") or "❗ Not set"
     bybit_uid = s.get(f"bybit_uid_{slot}") or s.get("bybit_uid","") or "❗ Not set"
     mode      = s.get("mode",           "fixed")
@@ -365,7 +394,8 @@ def ads_section_text(uid: int = 0) -> str:
             mode_info += f" | 💱 {cur_label}/USDT: `{local_ref}`"
 
     hint = next_setup_hint(uid)
-    acct_label = bybit.BYBIT_ACCOUNTS[bybit._active_index]["label"] if bybit.BYBIT_ACCOUNTS else f"Account {slot}"
+    user_slot_idx = _get_user_slot(uid)
+    acct_label = bybit.BYBIT_ACCOUNTS[user_slot_idx]["label"] if (bybit.BYBIT_ACCOUNTS and user_slot_idx < len(bybit.BYBIT_ACCOUNTS)) else f"Account {slot}"
 
     return (
         f"📊 <b>AD PRICE BOT — {acct_label}</b>\n\n"
@@ -721,11 +751,12 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
                 pid = str(pay_term_nm.get("id", ""))
                 if pt and pid:
                     await asyncio.get_event_loop().run_in_executor(
-                        None, mark_order_paid, order_id, pt, pid
+                        None, partial(mark_order_paid, order_id, pt, pid, creds=get_user_creds(chat_id))
                     )
                     _s(chat_id).paid_order_ids.add(order_id)
                 await asyncio.get_event_loop().run_in_executor(
-                    None, send_chat_message, order_id, NO_ACCOUNT_WARN_MSG
+                    None, partial(send_chat_message, order_id, NO_ACCOUNT_WARN_MSG,
+                                  creds=get_user_creds(chat_id))
                 )
                 oid = _esc(order_id)
                 await bot.send_message(chat_id=chat_id,
@@ -789,11 +820,12 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
                 payment_id = str(pay_term.get("id", ""))
                 if pay_type and payment_id:
                     await asyncio.get_event_loop().run_in_executor(
-                        None, mark_order_paid, order_id, pay_type, payment_id
+                        None, partial(mark_order_paid, order_id, pay_type, payment_id, creds=get_user_creds(chat_id))
                     )
                     _s(chat_id).paid_order_ids.add(order_id)
                 await asyncio.get_event_loop().run_in_executor(
-                    None, send_chat_message, order_id, SELLER_WARN_MSG
+                    None, partial(send_chat_message, order_id, SELLER_WARN_MSG,
+                                  creds=get_user_creds(chat_id))
                 )
                 oid    = _esc(order_id)
                 thresh = _s(chat_id).buyer_protection_mins
@@ -1092,7 +1124,7 @@ async def _paga_handle_success(bot, chat_id, order_id, pay_term, amount, holder_
     bybit_ok   = False
     if pay_type and payment_id:
         pr       = await asyncio.get_event_loop().run_in_executor(
-            None, mark_order_paid, order_id, pay_type, payment_id
+            None, partial(mark_order_paid, order_id, pay_type, payment_id, creds=get_user_creds(chat_id))
         )
         bybit_ok = pr.get("retCode", -1) == 0
     _s(chat_id).paid_order_ids.add(order_id)
@@ -1177,11 +1209,12 @@ async def _paga_autopay(bot, chat_id, order_id, order_detail):
                 pid = str(pay_term_nm.get("id", ""))
                 if pt and pid:
                     await asyncio.get_event_loop().run_in_executor(
-                        None, mark_order_paid, order_id, pt, pid
+                        None, partial(mark_order_paid, order_id, pt, pid, creds=get_user_creds(chat_id))
                     )
                     _s(chat_id).paid_order_ids.add(order_id)
                 await asyncio.get_event_loop().run_in_executor(
-                    None, send_chat_message, order_id, NO_ACCOUNT_WARN_MSG
+                    None, partial(send_chat_message, order_id, NO_ACCOUNT_WARN_MSG,
+                                  creds=get_user_creds(chat_id))
                 )
                 await bot.send_message(chat_id=chat_id,
                     text=(
@@ -1245,11 +1278,12 @@ async def _paga_autopay(bot, chat_id, order_id, order_detail):
                 payment_id = str(pay_term.get("id", ""))
                 if pay_type and payment_id:
                     await asyncio.get_event_loop().run_in_executor(
-                        None, mark_order_paid, order_id, pay_type, payment_id
+                        None, partial(mark_order_paid, order_id, pay_type, payment_id, creds=get_user_creds(chat_id))
                     )
                     _s(chat_id).paid_order_ids.add(order_id)
                 await asyncio.get_event_loop().run_in_executor(
-                    None, send_chat_message, order_id, SELLER_WARN_MSG
+                    None, partial(send_chat_message, order_id, SELLER_WARN_MSG,
+                                  creds=get_user_creds(chat_id))
                 )
                 await bot.send_message(chat_id=chat_id,
                     text=(
@@ -1605,23 +1639,82 @@ async def chat_monitor_loop(bot, chat_id: int):
 
 
 async def order_monitor_loop(bot, chat_id):
-    """Per-user order monitor loop. chat_id == user_id in private Telegram chats."""
+    """
+    Per-user order monitor loop. chat_id == user_id in private Telegram chats.
+
+    ISOLATION: Each user gets their own task, their own creds (via get_user_creds),
+    their own sess object. No shared state with other users.
+    """
     sess = _s(chat_id)
     sess.order_monitor_running = True
-    logger.info(f"🔔 ORDER MONITOR STARTED for user {chat_id}")
+    logger.info(f"🔔 ORDER MONITOR STARTED for user {chat_id} (slot {_get_user_slot_str(chat_id)})")
+
+    _ip_error_notified = False   # Track if we already warned this user about IP issue
 
     while sess.order_monitor_running:
         try:
+            # ── Load THIS user's credentials using THEIR slot (not global) ──
             creds = get_user_creds(chat_id)
+
+            # ── Guard: no API key saved for this user's slot ──
+            if not is_admin(chat_id) and not creds.get("key"):
+                sess.order_monitor_running = False
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        "❌ <b>Order Monitor stopped.</b>\n\n"
+                        f"No Bybit API key found for Account {_get_user_slot_str(chat_id)}.\n"
+                        "Go to 🔑 <b>Set APIs</b> and add your API key first."
+                    ),
+                    parse_mode="HTML"
+                )
+                break
+
             buy_res, sell_incoming_res, sell_paid_res = await asyncio.gather(
                 asyncio.get_event_loop().run_in_executor(None, partial(get_pending_orders, creds=creds)),
                 asyncio.get_event_loop().run_in_executor(None, partial(get_incoming_sell_orders, creds=creds)),
                 asyncio.get_event_loop().run_in_executor(None, partial(get_sell_orders, creds=creds)),
             )
 
-            buy_items       = buy_res.get("result", {}).get("items", [])           if buy_res.get("retCode", buy_res.get("ret_code",-1)) == 0 else []
-            sell_incoming   = sell_incoming_res.get("result", {}).get("items", []) if sell_incoming_res.get("retCode", sell_incoming_res.get("ret_code",-1)) == 0 else []
-            sell_paid_items = sell_paid_res.get("result", {}).get("items", [])     if sell_paid_res.get("retCode", sell_paid_res.get("ret_code",-1)) == 0 else []
+            # ── IP Whitelist error (10010) — stop polling, notify once ──
+            for res, label in [
+                (buy_res,          "pending orders"),
+                (sell_incoming_res, "incoming sell orders"),
+                (sell_paid_res,    "paid sell orders"),
+            ]:
+                rc  = res.get("retCode", res.get("ret_code", -1))
+                msg = res.get("retMsg",  res.get("ret_msg", ""))
+                if rc == 10010 or (rc != 0 and "IP" in str(msg).upper()):
+                    if not _ip_error_notified:
+                        _ip_error_notified = True
+                        ip = await _get_current_ip()
+                        await bot.send_message(
+                            chat_id=chat_id,
+                            text=(
+                                "🚫 <b>Bybit IP Whitelist Error (10010)</b>\n\n"
+                                f"Your API key for Account {_get_user_slot_str(chat_id)} "
+                                "is not whitelisted for this server IP.\n\n"
+                                f"👉 Add <code>{_esc(ip)}</code> to your Bybit API key's IP whitelist:\n"
+                                "Bybit → Account → API Management → Edit Key → Bind IP\n\n"
+                                "⚠️ Order monitor has been <b>paused</b> to prevent error spam.\n"
+                                "Restart monitoring after whitelisting the IP."
+                            ),
+                            parse_mode="HTML"
+                        )
+                        sess.order_monitor_running = False
+                    break
+            if not sess.order_monitor_running:
+                break
+
+            _ip_error_notified = False   # Reset on successful poll
+
+            def _items(res):
+                rc = res.get("retCode", res.get("ret_code", -1))
+                return res.get("result", {}).get("items", []) if rc == 0 else []
+
+            buy_items       = _items(buy_res)
+            sell_incoming   = _items(sell_incoming_res)
+            sell_paid_items = _items(sell_paid_res)
 
             tasks = []
             for item in buy_items:
@@ -1649,11 +1742,15 @@ async def order_monitor_loop(bot, chat_id):
                     if isinstance(r, Exception):
                         logger.error(f"[Orders] Task error for user {chat_id}: {r}")
 
+        except asyncio.CancelledError:
+            logger.info(f"[Orders] Monitor task cancelled for user {chat_id}")
+            break
         except Exception as e:
             logger.error(f"[Orders] Loop error for user {chat_id}: {e}")
 
         await asyncio.sleep(10)
 
+    sess.order_monitor_running = False
     logger.info(f"🔕 ORDER MONITOR STOPPED for user {chat_id}")
 
 
@@ -1704,12 +1801,14 @@ async def _handle_buy_order(bot, chat_id, order_id):
                 pid = str(pay_term_nm.get("id", ""))
                 if pt and pid:
                     await asyncio.get_event_loop().run_in_executor(
-                        None, mark_order_paid, order_id, pt, pid
+                        None, partial(mark_order_paid, order_id, pt, pid,
+                                      creds=get_user_creds(chat_id))
                     )
                     _s(chat_id).paid_order_ids.add(order_id)
                     await _remove_order_buttons(bot, chat_id, order_id)
                 await asyncio.get_event_loop().run_in_executor(
-                    None, send_chat_message, order_id, NO_ACCOUNT_WARN_MSG
+                    None, partial(send_chat_message, order_id, NO_ACCOUNT_WARN_MSG,
+                                  creds=get_user_creds(chat_id))
                 )
                 await bot.send_message(chat_id=chat_id,
                     text=(
@@ -1754,47 +1853,92 @@ async def _handle_buy_order(bot, chat_id, order_id):
             except (ValueError, TypeError):
                 release_mins = 0
 
-            await asyncio.sleep(5)
-            pay_term = order_detail.get("confirmedPayTerm", {}) or {}
-            if not pay_term:
-                terms    = order_detail.get("paymentTermList", [])
-                pay_term = terms[0] if terms else {}
-
-            payment_type = str(pay_term.get("paymentType", ""))
-            payment_id   = str(pay_term.get("id", ""))
-
-            if payment_type and payment_id:
-                pr = await asyncio.get_event_loop().run_in_executor(
-                    None, mark_order_paid, order_id, payment_type, payment_id
+            # ── Buyer Protection check BEFORE marking paid ──
+            if _s(chat_id).buyer_protection_on and release_mins >= _s(chat_id).buyer_protection_mins:
+                pay_term_bp = order_detail.get("confirmedPayTerm", {}) or {}
+                if not pay_term_bp:
+                    terms_bp    = order_detail.get("paymentTermList", [])
+                    pay_term_bp = terms_bp[0] if terms_bp else {}
+                pt_bp  = str(pay_term_bp.get("paymentType", ""))
+                pid_bp = str(pay_term_bp.get("id", ""))
+                if pt_bp and pid_bp and order_id not in _s(chat_id).paid_order_ids:
+                    pr_bp = await asyncio.get_event_loop().run_in_executor(
+                        None, partial(mark_order_paid, order_id, pt_bp, pid_bp,
+                                      creds=get_user_creds(chat_id))
+                    )
+                    if pr_bp.get("retCode", -1) == 0:
+                        _s(chat_id).paid_order_ids.add(order_id)
+                        await _remove_order_buttons(bot, chat_id, order_id)
+                await asyncio.get_event_loop().run_in_executor(
+                    None, partial(send_chat_message, order_id, SELLER_WARN_MSG,
+                                  creds=get_user_creds(chat_id))
                 )
-                if pr.get("retCode", -1) == 0:
-                    _s(chat_id).paid_order_ids.add(order_id)
-                    await _remove_order_buttons(bot, chat_id, order_id)
-                    note = ""
-                    if _s(chat_id).buyer_protection_on and release_mins >= _s(chat_id).buyer_protection_mins:
-                        await asyncio.get_event_loop().run_in_executor(
-                            None, send_chat_message, order_id, SELLER_WARN_MSG
+                _s(chat_id).unpaid_log.append({
+                    "order_id":   order_id,
+                    "account_no": str(pay_term_bp.get("accountNo","—")),
+                    "bank":       get_payment_name(str(pay_term_bp.get("paymentType",""))),
+                    "amount":     float(order_detail.get("amount","0")),
+                    "reason":     f"Buyer Protection: seller release {release_mins:.0f} min ≥ {_s(chat_id).buyer_protection_mins} min",
+                    "timestamp":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                })
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"🛡 <b>Buyer Protection</b> — Order <code>{_esc(order_id)}</code>\n\n"
+                        f"Seller release: <code>{release_mins:.0f} min</code> ≥ <code>{_s(chat_id).buyer_protection_mins} min</code>\n"
+                        "✅ Marked paid on Bybit + warning sent to seller."
+                    ),
+                    parse_mode="HTML"
+                )
+            else:
+                # ── Normal auto-pay path ──
+                await asyncio.sleep(5)   # brief delay before marking
+
+                # Re-fetch order to confirm it is still unpaid
+                recheck = await asyncio.get_event_loop().run_in_executor(
+                    None, partial(get_order_detail, order_id, creds=get_user_creds(chat_id))
+                )
+                if recheck.get("retCode", -1) != 0:
+                    logger.warning(f"[AutoPay] Could not re-fetch order {order_id} — skipping")
+                    return
+                recheck_detail = recheck.get("result", {})
+                # Bybit order status: 10=pending, 20=paid, 30=done, 40=cancelled
+                if str(recheck_detail.get("status","")) not in ("10",):
+                    logger.info(f"[AutoPay] Order {order_id} already processed (status={recheck_detail.get('status')}) — skipping")
+                    return
+                if order_id in _s(chat_id).paid_order_ids:
+                    return   # already handled by a parallel path
+
+                pay_term = recheck_detail.get("confirmedPayTerm", {}) or {}
+                if not pay_term:
+                    terms    = recheck_detail.get("paymentTermList", [])
+                    pay_term = terms[0] if terms else {}
+
+                payment_type = str(pay_term.get("paymentType", ""))
+                payment_id   = str(pay_term.get("id", ""))
+
+                if payment_type and payment_id:
+                    pr = await asyncio.get_event_loop().run_in_executor(
+                        None, partial(mark_order_paid, order_id, payment_type, payment_id,
+                                      creds=get_user_creds(chat_id))
+                    )
+                    if pr.get("retCode", -1) == 0:
+                        _s(chat_id).paid_order_ids.add(order_id)
+                        await _remove_order_buttons(bot, chat_id, order_id)
+                        await bot.send_message(
+                            chat_id=chat_id,
+                            text=f"💳 <b>Auto-Pay ✅</b> Order <code>{_esc(order_id)}</code> marked paid.",
+                            parse_mode="HTML"
                         )
-                        note = f"\n🛡 *Buyer Protection:* release `{release_mins:.0f} min` ≥ `{_s(chat_id).buyer_protection_mins} min` — warning sent to seller"
-                        _s(chat_id).unpaid_log.append({
-                            "order_id":   order_id,
-                            "account_no": str(pay_term.get("accountNo","—")),
-                            "bank":       get_payment_name(str(pay_term.get("paymentType",""))),
-                            "amount":     float(order_detail.get("amount","0")),
-                            "reason":     f"Buyer Protection: seller release {release_mins:.0f} min ≥ {_s(chat_id).buyer_protection_mins} min (marked paid + warned)",
-                            "timestamp":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        })
-                    await bot.send_message(
-                        chat_id=chat_id,
-                        text=f"💳 <b>Auto-Pay ✅</b> Order <code>{_esc(order_id)}</code> marked paid{_esc(note)}",
-                        parse_mode="HTML"
-                    )
-                else:
-                    await bot.send_message(
-                        chat_id=chat_id,
-                        text=f"❌ <b>Auto-Pay failed</b> <code>{_esc(order_id)}</code>\n<code>{_esc(pr.get('retMsg',''))}</code>",
-                        parse_mode="HTML"
-                    )
+                    else:
+                        await bot.send_message(
+                            chat_id=chat_id,
+                            text=(
+                                f"❌ <b>Auto-Pay failed</b> — Order <code>{_esc(order_id)}</code>\n"
+                                f"<code>{_esc(pr.get('retMsg',''))}</code>"
+                            ),
+                            parse_mode="HTML"
+                        )
     except Exception as e:
         logger.error(f"[BUY] _handle_buy_order {order_id} error: {e}")
 
@@ -1893,7 +2037,8 @@ async def _handle_sell_incoming(bot, chat_id, order_id):
         if _s(chat_id).sell_msg_enabled and _s(chat_id).sell_custom_msg:
             for i in range(_s(chat_id).sell_msg_count):
                 await asyncio.get_event_loop().run_in_executor(
-                    None, send_chat_message, order_id, _s(chat_id).sell_custom_msg
+                    None, partial(send_chat_message, order_id, _s(chat_id).sell_custom_msg,
+                                  creds=get_user_creds(chat_id))
                 )
                 if i < _s(chat_id).sell_msg_count - 1:
                     await asyncio.sleep(1)
@@ -2241,7 +2386,8 @@ async def ping_bybit_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             parse_mode="HTML"
         )
         return
-    slot = str(bybit._active_index + 1)
+    uid  = update.effective_user.id
+    slot = _get_user_slot_str(uid)   # per-user slot
     await update.message.reply_text(f"⏳ Testing Bybit Account {slot} API...")
     from bybit import ping_api
     result   = await asyncio.get_event_loop().run_in_executor(None, partial(ping_api, creds=creds))
@@ -2506,7 +2652,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
     # ── 🔑 Switch Account ──
     elif data.startswith("switch_account_"):
-        idx = int(data.split("_")[-1])
+        idx      = int(data.split("_")[-1])
         accounts = get_all_accounts()
         if idx >= len(accounts):
             await query.answer("Invalid account", show_alert=True)
@@ -2514,16 +2660,24 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         if _s(tuser.id).refresh_running or _s(tuser.id).order_monitor_running:
             await query.answer("⚠️ Stop all running tasks before switching accounts.", show_alert=True)
             return
-        set_active_account(idx)
+
+        # ── PER-USER slot switch — does NOT affect any other user ──
+        # NEVER call set_active_account() here — that modifies the global
+        # bybit._active_index which is shared across ALL users.
+        _s(tuser.id).selected_slot = idx   # only this user changes
+
+        # Clear this user's session data (other users are untouched)
         _s(tuser.id).ad_data.clear()
         _s(tuser.id).seen_order_ids.clear(); _s(tuser.id).paid_order_ids.clear()
-        _s(tuser.id).seen_sell_ids.clear(); _s(tuser.id).released_ids.clear()
+        _s(tuser.id).seen_sell_ids.clear();  _s(tuser.id).released_ids.clear()
         for k, v in [("ad_id",""),("bybit_uid",""),("mode","fixed"),
                      ("increment","0.05"),("float_pct",""),("local_usdt_ref",""),("interval",2)]:
             _s(tuser.id).settings[k] = v
+
         acct = accounts[idx]
+        logger.info(f"[Slot] User {tuser.id} switched to slot {idx+1} ({acct['label']}) — other users unaffected")
         await edit_menu(query,
-            f"✅ <b>Switched to {acct['label']}</b>\n\nAll session data cleared.\n\n" + main_menu_text(tuser.id),
+            f"✅ <b>Switched to {acct['label']}</b>\n\nYour session cleared.\n\n" + main_menu_text(tuser.id),
             main_menu_keyboard(tuser.id)
         )
 
@@ -2547,7 +2701,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         nm_s = "🔍 ON" if _s(tuser.id).name_match_enabled else "🔍 OFF"
         txt = (
             f"📡 <b>Bot Status</b>\n\n"
-            f"🔑 Active: <b>{get_active_account()['label']}</b>\n"
+            f"🔑 Active: <b>{(get_all_accounts()[_s(tuser.id).selected_slot] if _s(tuser.id).selected_slot < len(get_all_accounts()) else get_all_accounts()[0])['label']}</b>\n"
             f"Setup: {bar} <code>{done}/{total}</code>\n\n"
             f"📊 Price Bot: {r_status}\n"
             f"📦 Order Monitor: {o_status}\n"
@@ -2591,7 +2745,8 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         _s(tuser.id).seen_order_ids = set(); _s(tuser.id).paid_order_ids = set()
         _s(tuser.id).seen_sell_ids = set(); _s(tuser.id).released_ids = set()
         _s(tuser.id).sell_msg_enabled = False; _s(tuser.id).sell_msg_count = 1
-        set_active_account(0)
+        # Reset ONLY this user's slot — NOT global
+        _s(tuser.id).selected_slot = 0
         for k, v in [("ad_id",""),("bybit_uid",""),("mode","fixed"),
                      ("increment","0.05"),("float_pct",""),("local_usdt_ref",""),("interval",2)]:
             _s(tuser.id).settings[k] = v
@@ -3452,9 +3607,9 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         uid_del = query.from_user.id
         db.save_api(uid_del, "bybit_key_1",    "")
         db.save_api(uid_del, "bybit_secret_1", "")
-        # If currently on account slot 1, fall back to env key
-        if bybit._active_index == 0:
-            logger.info(f"[APIs] Bybit Account 1 keys deleted for user {uid_del}")
+        # If this user is currently on slot 1, reset their slot to 0 (no global change)
+        if _s(uid_del).selected_slot == 0:
+            logger.info(f"[APIs] Bybit Account 1 keys deleted for user {uid_del} (was on slot 1)")
         await edit_menu(query,
             "✅ *Bybit Account 1 API deleted.*\n\nYou can re-add it anytime via 🔑 Set APIs.",
             InlineKeyboardMarkup([*back_section("section_apis")])
@@ -3477,9 +3632,10 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         uid_del = query.from_user.id
         db.save_api(uid_del, "bybit_key_2",    "")
         db.save_api(uid_del, "bybit_secret_2", "")
-        # If currently on account slot 2, fall back to env key
-        if bybit._active_index == 1:
-            logger.info(f"[APIs] Bybit Account 2 keys deleted for user {uid_del}")
+        # If this user is currently on slot 2, reset their slot to 0 (no global change)
+        if _s(uid_del).selected_slot == 1:
+            _s(uid_del).selected_slot = 0
+            logger.info(f"[APIs] Bybit Account 2 keys deleted for user {uid_del} — slot reset to 1")
         await edit_menu(query,
             "✅ *Bybit Account 2 API deleted.*\n\nYou can re-add it anytime via 🔑 Set APIs.",
             InlineKeyboardMarkup([*back_section("section_apis")])
@@ -3665,7 +3821,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 text="❌ No payment info found. Buyer may not have selected payment yet.", parse_mode="HTML")
             return
         result = await asyncio.get_event_loop().run_in_executor(
-            None, mark_order_paid, order_id, payment_type, payment_id
+            None, partial(mark_order_paid, order_id, payment_type, payment_id, creds=get_user_creds(chat_id))
         )
         if result.get("retCode", result.get("ret_code",-1)) == 0:
             _s(tuser.id).paid_order_ids.add(order_id)
@@ -3702,12 +3858,13 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 text="❌ No payment info found.", parse_mode="HTML")
             return
         pr = await asyncio.get_event_loop().run_in_executor(
-            None, mark_order_paid, order_id, payment_type, payment_id
+            None, partial(mark_order_paid, order_id, payment_type, payment_id, creds=get_user_creds(chat_id))
         )
         if pr.get("retCode", pr.get("ret_code",-1)) == 0:
             _s(tuser.id).paid_order_ids.add(order_id)
             mr = await asyncio.get_event_loop().run_in_executor(
-                None, send_chat_message, order_id, SELLER_WARN_MSG
+                None, partial(send_chat_message, order_id, SELLER_WARN_MSG,
+                                  creds=get_user_creds(chat_id))
             )
             warn = "✅ Warning sent to seller" \
                    if mr.get("retCode", mr.get("ret_code",-1)) == 0 \
