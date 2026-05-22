@@ -94,12 +94,33 @@ def _save_settings(uid: int):
     db.save_settings(uid, get_session(uid).settings)
 
 def _load_settings_from_disk(uid: int):
-    """Load persisted settings from disk into the user's session on first access."""
+    """Load persisted settings from disk into the user's session on first access.
+
+    Also back-populates slot-keyed keys from generic keys (and vice versa)
+    so that both ad_id_1/bybit_uid_1 and ad_id/bybit_uid are always in sync.
+    This ensures UID and Ad ID survive /start, restarts, and slot switches.
+    """
     saved = db.load_settings(uid)
     if saved:
         sess = get_session(uid)
         for k, v in saved.items():
             sess.settings[k] = v
+        # Back-fill: if only generic key exists, populate slot-keyed keys (slots 1 & 2)
+        for field in ("ad_id", "bybit_uid"):
+            generic_val = sess.settings.get(field, "")
+            for slot in ("1", "2"):
+                slot_key = f"{field}_{slot}"
+                if not sess.settings.get(slot_key) and generic_val:
+                    sess.settings[slot_key] = generic_val
+        # Back-fill: if only slot-keyed keys exist, populate generic key from slot 1
+        for field in ("ad_id", "bybit_uid"):
+            if not sess.settings.get(field):
+                slot1_val = sess.settings.get(f"{field}_1", "")
+                if slot1_val:
+                    sess.settings[field] = slot1_val
+        logger.debug(f"[Settings] Loaded for user={uid}: ad_id={sess.settings.get('ad_id')!r} "
+                     f"bybit_uid={sess.settings.get('bybit_uid')!r} "
+                     f"ad_id_1={sess.settings.get('ad_id_1')!r} bybit_uid_1={sess.settings.get('bybit_uid_1')!r}")
 
 SELLER_WARN_MSG = (
     "Dear seller, your average release time is too long, I can't proceed with the payment. "
@@ -722,12 +743,32 @@ def sell_order_buttons(order_id: str, uid: int = 0) -> InlineKeyboardMarkup | No
 # 📦 ORDER MONITOR LOOP
 # ─────────────────────────────────────────
 async def _flw_autopay(bot, chat_id, order_id, order_detail):
+    """
+    Flutterwave auto-pay flow — fully NoneType-safe, correct order:
+      STEP 1 → Name Match / Buyer Protection checks
+      STEP 2 → Resolve bank code
+      STEP 3 → Verify account
+      STEP 4 → Initiate transfer
+      STEP 5 → Poll transfer until SUCCESSFUL or FAILED
+      STEP 6 → ONLY if SUCCESSFUL → mark Bybit order paid
+      STEP 7 → Send confirmation to user
+
+    Per-user isolated: uses chat_id to load FLW keys and Bybit creds.
+    NEVER marks Bybit paid before transfer is confirmed SUCCESSFUL.
+    """
     from flutterwave import match_bank_code, verify_account, send_transfer, get_transfer_status
 
-    # Load this user's FLW secret key from DB
+    # ── Per-user FLW secret key (slot-independent — FLW is shared across slots) ──
     flw_secret_key = db.get_api(chat_id, "flw_secret_key")
+    user_slot      = _get_user_slot_str(chat_id)
+
+    logger.info(
+        f"[FLW] _flw_autopay START | user={chat_id} slot={user_slot} order={order_id}"
+    )
+
     if not flw_secret_key:
         oid = _esc(order_id)
+        logger.warning(f"[FLW] No FLW secret key for user={chat_id} — aborting order={order_id}")
         await bot.send_message(chat_id=chat_id,
             text=(
                 f"❌ <b>FLW Auto-Pay</b> — Order <code>{oid}</code>\n\n"
@@ -738,14 +779,14 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
         return
 
     try:
-        # ── Name Match check ──
+        # ── STEP 1a: Name Match check ──
         if _s(chat_id).name_match_enabled:
             has_info, account_no_chk, real_name_chk = _has_account_info(order_detail)
             if not has_info:
-                logger.info(f"[NameMatch] Missing info on order {order_id} — marking paid + warn")
+                logger.info(f"[FLW][NameMatch] Missing account info on order={order_id} — marking paid + warn, skipping FLW")
                 pay_term_nm = order_detail.get("confirmedPayTerm", {}) or {}
                 if not pay_term_nm:
-                    terms_nm   = order_detail.get("paymentTermList", [])
+                    terms_nm    = order_detail.get("paymentTermList", [])
                     pay_term_nm = terms_nm[0] if terms_nm else {}
                 pt  = str(pay_term_nm.get("paymentType", ""))
                 pid = str(pay_term_nm.get("id", ""))
@@ -769,6 +810,7 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
                     parse_mode="HTML")
                 return
 
+        # ── Extract payment term details ──
         pay_term = order_detail.get("confirmedPayTerm", {}) or {}
         if not pay_term:
             terms    = order_detail.get("paymentTermList", [])
@@ -778,36 +820,48 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
         bank_name     = pay_term.get("bankName",  "").strip()
         pay_cfg       = pay_term.get("paymentConfigVo", {}) or pay_term.get("paymentConfig", {}) or {}
         pay_type_name = pay_cfg.get("paymentName", "").strip()
-        amount_str    = order_detail.get("amount", "0")
-        seller_name   = pay_term.get("realName", order_detail.get("sellerRealName", "Seller"))
+        seller_name   = pay_term.get("realName", order_detail.get("sellerRealName", "Seller")).strip() or "Seller"
+
+        # ── Amount: parse safely, format as float rounded to 2 dp ──
+        try:
+            amount = round(float(str(order_detail.get("amount", "0")).replace(",", "")), 2)
+        except (ValueError, TypeError):
+            amount = 0.0
+
+        currency = str(order_detail.get("currencyId", "NGN")).upper()
+
+        logger.info(
+            f"[FLW] Payload preview | user={chat_id} slot={user_slot} order={order_id} "
+            f"account_no={account_no!r} bank_name={bank_name!r} pay_type_name={pay_type_name!r} "
+            f"amount={amount} currency={currency} seller={seller_name!r}"
+        )
 
         if not account_no:
             oid = _esc(order_id)
+            logger.warning(f"[FLW] No account_no for order={order_id} | user={chat_id}")
             await bot.send_message(chat_id=chat_id,
-                text=f"❌ <b>FLW Auto-Pay</b> — Order <code>{oid}</code>\nNo account number found.",
+                text=f"❌ <b>FLW Auto-Pay</b> — Order <code>{oid}</code>\nNo account number found in order. Mark manually.",
                 parse_mode="HTML")
             return
 
-        bank_code = match_bank_code(bank_name, pay_type_name, secret_key=flw_secret_key)
-        if not bank_code:
-            oid  = _esc(order_id)
-            bank = _esc(bank_name or pay_type_name)
+        if amount <= 0:
+            oid = _esc(order_id)
+            logger.warning(f"[FLW] Invalid amount={amount} for order={order_id} | user={chat_id}")
             await bot.send_message(chat_id=chat_id,
-                text=(
-                    f"❌ <b>FLW Auto-Pay</b> — Order <code>{oid}</code>\n"
-                    f"Unknown bank: <code>{bank}</code>\nMark this order manually."
-                ),
+                text=f"❌ <b>FLW Auto-Pay</b> — Order <code>{oid}</code>\nInvalid order amount: <code>{amount}</code>. Mark manually.",
                 parse_mode="HTML")
             return
 
-        amount = float(amount_str)
-
-        # ── Buyer Protection: slow seller → skip FLW, mark paid + warn ──
+        # ── STEP 1b: Buyer Protection — slow seller → skip FLW, mark paid + warn ──
         if _s(chat_id).buyer_protection_on:
-            release_mins = float(order_detail.get("_seller_release_mins", 0))
+            release_mins = 0.0
+            try:
+                release_mins = float(order_detail.get("_seller_release_mins", 0) or 0)
+            except (ValueError, TypeError):
+                release_mins = 0.0
             if release_mins >= _s(chat_id).buyer_protection_mins:
                 reason = f"Seller avg release time ({release_mins:.0f} min) ≥ threshold ({_s(chat_id).buyer_protection_mins} min)"
-                logger.info(f"[BuyerProtection] Skipping FLW — {reason}")
+                logger.info(f"[FLW][BuyerProtection] Skipping FLW — {reason} | order={order_id} user={chat_id}")
                 _s(chat_id).unpaid_log.append({
                     "order_id":   order_id,
                     "account_no": account_no,
@@ -839,138 +893,285 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
                     parse_mode="HTML")
                 return
 
-        # ── Step 1: Verify account ──
         acct_safe = _esc(account_no)
         bank_safe = _esc(bank_name or pay_type_name)
+        oid       = _esc(order_id)
+
+        # ── STEP 2: Resolve bank code ──
+        bank_code = match_bank_code(bank_name, pay_type_name, secret_key=flw_secret_key)
+        logger.info(f"[FLW] Bank resolve | user={chat_id} order={order_id} bank_name={bank_name!r} pay_type={pay_type_name!r} → bank_code={bank_code!r}")
+        if not bank_code:
+            logger.warning(f"[FLW] Unknown bank for order={order_id} | user={chat_id} | bank={bank_name!r} type={pay_type_name!r}")
+            await bot.send_message(chat_id=chat_id,
+                text=(
+                    f"❌ <b>FLW Auto-Pay</b> — Order <code>{oid}</code>\n"
+                    f"Unknown bank: <code>{bank_safe}</code>\n"
+                    f"Cannot resolve bank code — mark this order manually."
+                ),
+                parse_mode="HTML")
+            return
+
+        # ── STEP 3: Verify account ──
         await bot.send_message(chat_id=chat_id,
-            text=f"⏳ <b>FLW</b> Verifying account <code>{acct_safe}</code> ({bank_safe})...",
+            text=(
+                f"⏳ <b>FLW</b> — Order <code>{oid}</code>\n"
+                f"Verifying account <code>{acct_safe}</code> ({bank_safe})...\n"
+                f"Amount: <b>{amount:,.2f} {currency}</b>"
+            ),
             parse_mode="HTML")
 
         verify = await asyncio.get_event_loop().run_in_executor(
             None, verify_account, account_no, bank_code, flw_secret_key
         )
 
-        if verify.get("status") != "success" or "error" in verify:
-            err = _esc(str(verify.get("message", verify.get("error", "Unknown error"))))
+        # Safely extract verify data — data may be null
+        verify_data   = verify.get("data") or {}
+        verify_status = verify.get("status", "")
+        verify_error  = verify.get("message", verify.get("error", ""))
+
+        logger.info(
+            f"[FLW] Account verify result | user={chat_id} order={order_id} "
+            f"status={verify_status!r} data={verify_data} error={verify_error!r}"
+        )
+
+        if verify_status != "success" or "error" in verify:
+            err = _esc(str(verify_error or "Unknown verification error")[:200])
             _s(chat_id).unpaid_log.append({
                 "order_id":   order_id,
                 "account_no": account_no,
                 "bank":       bank_name or pay_type_name,
                 "amount":     amount,
-                "reason":     f"Account verification failed: {err}",
+                "reason":     f"Account verification failed: {verify_error}",
                 "timestamp":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             })
-            oid = _esc(order_id)
             await bot.send_message(chat_id=chat_id,
                 text=(
                     f"❌ <b>FLW Account Invalid</b> — Order <code>{oid}</code>\n\n"
-                    f"Account <code>{acct_safe}</code> @ {bank_safe} failed verification.\n"
-                    f"Reason: <code>{err}</code>\n\nTransfer aborted. Mark order manually."
+                    f"Account <code>{acct_safe}</code> @ {bank_safe}\n"
+                    f"Reason: <code>{err}</code>\n\n"
+                    f"Transfer aborted. Mark order manually."
                 ),
                 parse_mode="HTML")
             return
 
-        verified_name = verify.get("data", {}).get("account_name", seller_name)
-        working_code  = verify.get("_working_bank_code", bank_code)
+        verified_name = (verify_data.get("account_name") or seller_name or "Seller").strip()
+        working_code  = verify.get("_working_bank_code") or bank_code
         vname_safe    = _esc(verified_name)
 
-        oid = _esc(order_id)
         await bot.send_message(chat_id=chat_id,
             text=(
                 f"✅ <b>Account Verified:</b> {vname_safe}\n"
                 f"Account: <code>{acct_safe}</code> ({bank_safe})\n\n"
-                f"⏳ Sending <b>{amount:,.2f} NGN</b>..."
+                f"⏳ Initiating transfer of <b>{amount:,.2f} {currency}</b>..."
             ),
             parse_mode="HTML")
 
-        # ── Step 2: Send transfer ──
-        sender_name = _s(chat_id).settings.get("sender_name", "Akinrinade Akinniyi")
-        ref    = f"p2p{order_id[-12:]}"
-        result = await asyncio.get_event_loop().run_in_executor(
-            None, send_transfer, account_no, working_code, amount,
-            f"{sender_name} payment to {verified_name}", ref, flw_secret_key
+        # ── STEP 4: Initiate transfer ──
+        sender_name = (_s(chat_id).settings.get("sender_name") or "P2P Bot").strip()
+        narration   = f"{sender_name} payment to {verified_name}"[:100]
+        ref         = f"p2p{order_id[-12:]}"
+
+        transfer_payload = {
+            "account_no":    account_no,
+            "bank_code":     working_code,
+            "amount":        amount,
+            "narration":     narration,
+            "reference":     ref,
+            "currency":      currency,
+            "beneficiary":   verified_name,
+        }
+        logger.info(
+            f"[FLW] Transfer payload | user={chat_id} slot={user_slot} order={order_id} "
+            f"account={account_no} bank_code={working_code} amount={amount} "
+            f"currency={currency} ref={ref!r} narration={narration!r}"
         )
 
-        if "error" in result:
-            err_msg = result["error"]
-            ip = await _get_current_ip()
-            err_safe = _esc(err_msg[:200])
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, send_transfer, account_no, working_code, amount,
+            narration, ref, flw_secret_key
+        )
+
+        # ── Sanitised response log (never log full response to avoid key leaks) ──
+        result_status = result.get("status", "")
+        result_msg    = result.get("message", "")
+        result_error  = result.get("error", "")
+        # Safely get data — Flutterwave sometimes returns "data": null on errors
+        result_data   = result.get("data") or {}
+        logger.info(
+            f"[FLW] Transfer response | user={chat_id} slot={user_slot} order={order_id} "
+            f"status={result_status!r} message={result_msg!r} error={result_error!r} "
+            f"data_keys={list(result_data.keys()) if result_data else 'null'}"
+        )
+
+        # ── Handle hard error key ──
+        if result_error:
+            err_msg  = str(result_error)
+            ip       = await _get_current_ip()
+            err_safe = _esc(err_msg[:250])
             ip_safe  = _esc(ip)
-            oid      = _esc(order_id)
-            if "Empty response" in err_msg or "401" in err_msg or "403" in err_msg:
-                await bot.send_message(chat_id=chat_id,
-                    text=(
-                        f"❌ <b>FLW blocked</b> — Order <code>{oid}</code>\n\n"
-                        f"<code>{err_safe}</code>\n\n"
-                        f"👉 Add <code>{ip_safe}</code> to Flutterwave IP Whitelist"
-                    ),
-                    parse_mode="HTML")
-            else:
-                err_safe2 = _esc(err_msg[:300])
-                await bot.send_message(chat_id=chat_id,
-                    text=f"❌ <b>FLW error</b> — Order <code>{oid}</code>\n<code>{err_safe2}</code>",
-                    parse_mode="HTML")
-            return
-
-        transfer_data = result.get("data", {})
-        transfer_id   = str(transfer_data.get("id", ""))
-        status        = transfer_data.get("status", "NEW")
-        tid_safe      = _esc(transfer_id)
-        oid           = _esc(order_id)
-
-        if status == "FAILED":
-            complete_msg = transfer_data.get("complete_message", "Rejected by bank")
+            logger.error(f"[FLW] Transfer error | user={chat_id} order={order_id} | {err_msg}")
             _s(chat_id).unpaid_log.append({
                 "order_id": order_id, "account_no": account_no,
                 "bank": bank_name or pay_type_name, "amount": amount,
-                "reason": complete_msg or "Transfer failed on creation",
+                "reason": err_msg[:300],
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            })
+            if "Empty response" in err_msg or "401" in err_msg or "403" in err_msg:
+                await bot.send_message(chat_id=chat_id,
+                    text=(
+                        f"❌ <b>FLW Blocked</b> — Order <code>{oid}</code>\n\n"
+                        f"<code>{err_safe}</code>\n\n"
+                        f"👉 Add <code>{ip_safe}</code> to Flutterwave IP Whitelist.\n"
+                        f"Mark order manually."
+                    ),
+                    parse_mode="HTML")
+            else:
+                await bot.send_message(chat_id=chat_id,
+                    text=(
+                        f"❌ <b>FLW Transfer Error</b> — Order <code>{oid}</code>\n\n"
+                        f"<code>{err_safe}</code>\n\n"
+                        f"Mark order manually."
+                    ),
+                    parse_mode="HTML")
+            return
+
+        # ── Handle API-level error status (e.g. "data": null + "status": "error") ──
+        if result_status == "error" or (not result_data and result_status != "success"):
+            api_err  = _esc((result_msg or "Flutterwave rejected the transfer request")[:300])
+            logger.error(
+                f"[FLW] API-level error | user={chat_id} slot={user_slot} order={order_id} "
+                f"message={result_msg!r} data=null"
+            )
+            _s(chat_id).unpaid_log.append({
+                "order_id": order_id, "account_no": account_no,
+                "bank": bank_name or pay_type_name, "amount": amount,
+                "reason": result_msg or "FLW API error — data null",
+                "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            })
+            # Check for the specific "contact administrator" error
+            if "administrator" in (result_msg or "").lower() or "cannot be processed" in (result_msg or "").lower():
+                await bot.send_message(chat_id=chat_id,
+                    text=(
+                        f"❌ <b>FLW Transfer Rejected</b> — Order <code>{oid}</code>\n\n"
+                        f"Flutterwave returned an account restriction error:\n"
+                        f"<code>{api_err}</code>\n\n"
+                        f"⚠️ <b>Action required:</b> Log into your Flutterwave dashboard and check:\n"
+                        f"  • Account limits or KYC requirements\n"
+                        f"  • Transfer restrictions or compliance holds\n"
+                        f"  • Contact Flutterwave support if this persists\n\n"
+                        f"Order has NOT been marked paid. Mark manually when resolved."
+                    ),
+                    parse_mode="HTML")
+            else:
+                await bot.send_message(chat_id=chat_id,
+                    text=(
+                        f"❌ <b>FLW Transfer Failed</b> — Order <code>{oid}</code>\n\n"
+                        f"<code>{api_err}</code>\n\n"
+                        f"Order has NOT been marked paid. Mark manually."
+                    ),
+                    parse_mode="HTML")
+            return
+
+        # ── result_data is guaranteed non-None from here ──
+        transfer_id = str(result_data.get("id") or "")
+        status      = str(result_data.get("status") or "NEW")
+        tid_safe    = _esc(transfer_id)
+
+        logger.info(
+            f"[FLW] Transfer initiated | user={chat_id} slot={user_slot} order={order_id} "
+            f"transfer_id={transfer_id!r} initial_status={status!r}"
+        )
+
+        # ── Handle immediate FAILED status on creation ──
+        if status == "FAILED":
+            complete_msg = str(result_data.get("complete_message") or "Rejected by bank")
+            logger.warning(f"[FLW] Transfer immediately FAILED | user={chat_id} order={order_id} | {complete_msg}")
+            _s(chat_id).unpaid_log.append({
+                "order_id": order_id, "account_no": account_no,
+                "bank": bank_name or pay_type_name, "amount": amount,
+                "reason": complete_msg,
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             })
             cmsg_safe = _esc(complete_msg)
             if "insufficient" in complete_msg.lower() or "funds" in complete_msg.lower():
                 fail_text = (
                     f"❌ <b>FLW Failed — Insufficient Funds</b>\n\nOrder: <code>{oid}</code>\n"
-                    f"Amount needed: <b>{amount:,.2f} NGN</b>\n\n"
-                    f"👉 Top up Flutterwave → Balances → Fund Wallet"
+                    f"Amount needed: <b>{amount:,.2f} {currency}</b>\n\n"
+                    f"👉 Top up Flutterwave → Balances → Fund Wallet\n\n"
+                    f"Order has NOT been marked paid."
                 )
             else:
                 fail_text = (
-                    f"❌ <b>FLW Transfer Failed</b>\n\nOrder: <code>{oid}</code>\n"
-                    f"Transfer ID: <code>{tid_safe}</code>\nReason: <code>{cmsg_safe}</code>"
+                    f"❌ <b>FLW Transfer Failed on Creation</b>\n\nOrder: <code>{oid}</code>\n"
+                    f"Transfer ID: <code>{tid_safe}</code>\n"
+                    f"Reason: <code>{cmsg_safe}</code>\n\n"
+                    f"Order has NOT been marked paid. Mark manually."
                 )
             await bot.send_message(chat_id=chat_id, text=fail_text, parse_mode="HTML")
             return
 
-        # Step 3: Poll status up to 60 seconds
+        # ── STEP 5: Poll transfer status up to 60 seconds ──
         final_status = status
         for attempt in range(12):
             await asyncio.sleep(5)
             if final_status in ("SUCCESSFUL", "FAILED"):
                 break
-            poll         = await asyncio.get_event_loop().run_in_executor(None, get_transfer_status, transfer_id, flw_secret_key)
-            final_status = poll.get("data", {}).get("status", final_status)
+            poll      = await asyncio.get_event_loop().run_in_executor(
+                None, get_transfer_status, transfer_id, flw_secret_key
+            )
+            # Safely extract — data can be null even on polling
+            poll_data    = poll.get("data") or {}
+            final_status = str(poll_data.get("status") or final_status)
+            logger.debug(
+                f"[FLW] Poll attempt={attempt+1} | user={chat_id} order={order_id} "
+                f"transfer_id={transfer_id!r} status={final_status!r}"
+            )
+
+        logger.info(
+            f"[FLW] Final transfer status | user={chat_id} slot={user_slot} order={order_id} "
+            f"transfer_id={transfer_id!r} final_status={final_status!r}"
+        )
 
         if final_status == "SUCCESSFUL":
+            # ── STEP 6: ONLY now mark Bybit order paid ──
             pay_type   = str(pay_term.get("paymentType", ""))
             payment_id = str(pay_term.get("id", ""))
             bybit_ok   = False
             if pay_type and payment_id:
-                pr       = await asyncio.get_event_loop().run_in_executor(None, partial(mark_order_paid, order_id, pay_type, payment_id, creds=get_user_creds(chat_id)))
-                bybit_ok = pr.get("retCode", -1) == 0
+                pr = await asyncio.get_event_loop().run_in_executor(
+                    None, partial(mark_order_paid, order_id, pay_type, payment_id,
+                                  creds=get_user_creds(chat_id))
+                )
+                bybit_ok = (pr or {}).get("retCode", -1) == 0
+                logger.info(
+                    f"[FLW] Bybit mark-paid | user={chat_id} order={order_id} "
+                    f"bybit_ok={bybit_ok} retCode={(pr or {}).get('retCode','?')}"
+                )
             _s(chat_id).paid_order_ids.add(order_id)
             await _remove_order_buttons(bot, chat_id, order_id)
-            bybit_label = "✅" if bybit_ok else "⚠️ Mark manually"
+            bybit_label = "✅ Marked paid" if bybit_ok else "⚠️ Mark manually on Bybit"
+            # ── STEP 7: Send confirmation ──
             await bot.send_message(chat_id=chat_id,
                 text=(
-                    f"✅ <b>FLW Payment SUCCESS</b>\n\nOrder: <code>{oid}</code>\n"
-                    f"Amount: <b>{amount:,.2f} NGN</b> → {vname_safe}\n"
+                    f"✅ <b>FLW Payment SUCCESS</b>\n\n"
+                    f"Order: <code>{oid}</code>\n"
+                    f"Amount: <b>{amount:,.2f} {currency}</b> → {vname_safe}\n"
                     f"Transfer ID: <code>{tid_safe}</code>\n"
-                    f"Bybit marked paid: {bybit_label}"
+                    f"Bybit: {bybit_label}"
                 ),
                 parse_mode="HTML")
+
         elif final_status == "FAILED":
-            last_poll    = await asyncio.get_event_loop().run_in_executor(None, get_transfer_status, transfer_id, flw_secret_key)
-            complete_msg = last_poll.get("data", {}).get("complete_message", "")
+            # Fetch final state for complete_message
+            last_poll    = await asyncio.get_event_loop().run_in_executor(
+                None, get_transfer_status, transfer_id, flw_secret_key
+            )
+            last_data    = last_poll.get("data") or {}
+            complete_msg = str(last_data.get("complete_message") or "")
+            logger.warning(
+                f"[FLW] Transfer FAILED after polling | user={chat_id} order={order_id} "
+                f"transfer_id={transfer_id!r} complete_message={complete_msg!r}"
+            )
             _s(chat_id).unpaid_log.append({
                 "order_id": order_id, "account_no": account_no,
                 "bank": bank_name or pay_type_name, "amount": amount,
@@ -980,35 +1181,60 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
             cmsg_safe = _esc(complete_msg)
             if "insufficient" in complete_msg.lower() or "funds" in complete_msg.lower():
                 fail_text = (
-                    f"❌ <b>FLW Failed — Insufficient Funds</b>\n\nOrder: <code>{oid}</code>\n"
-                    f"Amount: <b>{amount:,.2f} NGN</b>\n\n👉 Top up Flutterwave → Balances → Fund Wallet"
+                    f"❌ <b>FLW Failed — Insufficient Funds</b>\n\n"
+                    f"Order: <code>{oid}</code>\n"
+                    f"Amount: <b>{amount:,.2f} {currency}</b>\n\n"
+                    f"👉 Top up Flutterwave → Balances → Fund Wallet\n\n"
+                    f"Order has NOT been marked paid."
                 )
             else:
                 reason_line = f"Reason: <code>{cmsg_safe}</code>\n" if complete_msg else ""
                 fail_text = (
-                    f"❌ <b>FLW Transfer FAILED</b>\n\nOrder: <code>{oid}</code>\n"
+                    f"❌ <b>FLW Transfer FAILED</b>\n\n"
+                    f"Order: <code>{oid}</code>\n"
                     f"Transfer ID: <code>{tid_safe}</code>\n"
                     f"{reason_line}"
-                    "Mark order manually."
+                    f"Order has NOT been marked paid. Mark manually."
                 )
             await bot.send_message(chat_id=chat_id, text=fail_text, parse_mode="HTML")
+
         else:
+            # Status still pending after 60s — do NOT mark paid
             fstatus_safe = _esc(final_status)
+            logger.info(
+                f"[FLW] Transfer still pending after polling | user={chat_id} order={order_id} "
+                f"transfer_id={transfer_id!r} status={final_status!r}"
+            )
             await bot.send_message(chat_id=chat_id,
                 text=(
-                    f"⏳ <b>FLW Transfer Pending</b>\n\nOrder: <code>{oid}</code>\n"
-                    f"Transfer ID: <code>{tid_safe}</code> | Status: <code>{fstatus_safe}</code>\n"
-                    "Webhook will notify you when complete."
+                    f"⏳ <b>FLW Transfer Pending</b>\n\n"
+                    f"Order: <code>{oid}</code>\n"
+                    f"Transfer ID: <code>{tid_safe}</code> | Status: <code>{fstatus_safe}</code>\n\n"
+                    f"Order has NOT been marked paid yet.\n"
+                    f"Flutterwave webhook will confirm when complete.\n"
+                    f"Check /pingflutterwave or mark manually if needed."
                 ),
                 parse_mode="HTML")
 
     except Exception as e:
-        logger.error(f"[FLW] _flw_autopay error: {e}")
+        import traceback
+        tb = traceback.format_exc()
+        logger.error(
+            f"[FLW] _flw_autopay UNHANDLED ERROR | user={chat_id} order={order_id} | "
+            f"error={e}\n{tb}"
+        )
         oid      = _esc(order_id)
-        err_safe = _esc(str(e)[:200])
-        await bot.send_message(chat_id=chat_id,
-            text=f"❌ <b>FLW error</b> — Order <code>{oid}</code>\n<code>{err_safe}</code>",
-            parse_mode="HTML")
+        err_safe = _esc(str(e)[:250])
+        try:
+            await bot.send_message(chat_id=chat_id,
+                text=(
+                    f"❌ <b>FLW Auto-Pay Error</b> — Order <code>{oid}</code>\n\n"
+                    f"<code>{err_safe}</code>\n\n"
+                    f"Order has NOT been marked paid. Mark manually."
+                ),
+                parse_mode="HTML")
+        except Exception as _notify_err:
+            logger.error(f"[FLW] Could not notify user {chat_id} of error: {_notify_err}")
 
 
 # ─────────────────────────────────────────
@@ -3084,9 +3310,14 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
     elif data == "set_ad_id":
         _btn_state["action"]       = "ad_id"
         _btn_state["prev_section"] = "section_ads"
-        cur = _s(tuser.id).settings.get("ad_id","") or "Not set"
+        slot_str = _get_user_slot_str(tuser.id)
+        cur = (
+            _s(tuser.id).settings.get(f"ad_id_{slot_str}", "")
+            or _s(tuser.id).settings.get("ad_id", "")
+            or "Not set"
+        )
         await edit_menu(query,
-            f"🆔 <b>Set Ad ID</b>\n\nCurrent: <code>{cur}</code>\n\n"
+            f"🆔 <b>Set Ad ID — Account {slot_str}</b>\n\nCurrent: <code>{_esc(cur)}</code>\n\n"
             "Send your Bybit Ad ID.\n💡 Use 📃 My Ads List to find it.\n\n"
             "Example: `2040156088201854976`",
             InlineKeyboardMarkup(back_section("section_ads"))
@@ -3096,9 +3327,16 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
     elif data == "set_uid":
         _btn_state["action"]       = "bybit_uid"
         _btn_state["prev_section"] = "section_ads"
-        cur = _s(tuser.id).settings.get("bybit_uid","") or "Not set"
+        slot_str = _get_user_slot_str(tuser.id)
+        # Read the slot-keyed value first (what ads_section_text displays),
+        # fall back to the generic key for backwards compatibility
+        cur = (
+            _s(tuser.id).settings.get(f"bybit_uid_{slot_str}", "")
+            or _s(tuser.id).settings.get("bybit_uid", "")
+            or "Not set"
+        )
         await edit_menu(query,
-            f"👤 <b>Set Bybit UID</b>\n\nCurrent: <code>{cur}</code>\n\n"
+            f"👤 <b>Set Bybit UID — Account {slot_str}</b>\n\nCurrent: <code>{_esc(cur)}</code>\n\n"
             "Bybit App → Profile → copy UID under your username.\n\n"
             "Example: `520097760`",
             InlineKeyboardMarkup(back_section("section_ads"))
@@ -4178,15 +4416,50 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     elif action == "ad_id":
-        _s(uid).settings["ad_id"] = text
+        # Save under BOTH the slot-keyed key and the generic fallback key
+        slot_str = _get_user_slot_str(uid)
+        _s(uid).settings[f"ad_id_{slot_str}"] = text.strip()
+        _s(uid).settings["ad_id"]              = text.strip()
         _s(uid).ad_data.clear()
         _state["action"] = None
-        await reply_with_back(f"✅ *Ad ID saved!*\n\n`{text}`\n\n_{next_setup_hint(uid)}_")
+        # Persist to disk immediately so it survives /start and restarts
+        _save_settings(uid)
+        logger.info(f"[AdID] Saved ad_id for user={uid} slot={slot_str} ad_id={text.strip()!r}")
+        hint = next_setup_hint(uid)
+        await update.message.reply_text(
+            f"✅ <b>Ad ID saved for Account {slot_str}!</b>\n\n"
+            f"<code>{_esc(text.strip())}</code>\n\n"
+            f"<i>{_esc(hint)}</i>",
+            parse_mode="HTML",
+            reply_markup=back_prev("section_ads")
+        )
 
     elif action == "bybit_uid":
-        _s(uid).settings["bybit_uid"] = text
+        # Save under BOTH the slot-keyed key (what ads_section_text reads first)
+        # AND the generic fallback key, so it works regardless of how it is read.
+        slot_str = _get_user_slot_str(uid)
+        _s(uid).settings[f"bybit_uid_{slot_str}"] = text.strip()
+        _s(uid).settings["bybit_uid"]              = text.strip()
         _state["action"] = None
-        await reply_with_back(f"✅ *UID saved!*\n\n`{text}`\n\n_{next_setup_hint(uid)}_")
+        # Persist to disk immediately so it survives /start, restarts, slot switches
+        _save_settings(uid)
+        logger.info(f"[UID] Saved bybit_uid for user={uid} slot={slot_str} uid_value={text.strip()!r}")
+        hint = next_setup_hint(uid)
+        # Return to section_ads with back button pointing to the AD PRICE BOT menu
+        try:
+            await update.message.reply_text(
+                f"✅ <b>UID saved for Account {slot_str}!</b>\n\n"
+                f"<code>{_esc(text.strip())}</code>\n\n"
+                f"<i>{_esc(hint)}</i>",
+                parse_mode="HTML",
+                reply_markup=back_prev("section_ads")
+            )
+        except Exception as _uid_reply_err:
+            logger.warning(f"[UID] Reply failed: {_uid_reply_err}")
+            await update.message.reply_text(
+                f"✅ UID saved: <code>{_esc(text.strip())}</code>",
+                parse_mode="HTML"
+            )
 
     elif action == "increment":
         try:
