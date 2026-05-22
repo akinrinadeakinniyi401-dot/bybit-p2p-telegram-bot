@@ -234,9 +234,9 @@ def main_menu_text(uid: int = 0) -> str:
 
     return (
         "🤖 *P2P Auto Bot — Control Panel*\n\n"
-        f"🆔 Your ID: `{uid}` | {badge}\n"
-        f"🔑 Active Account: *{acct['label']}*\n"
-        f"📋 Setup: {bar} `{done}/{total}`\n\n"
+        f"🆔 Your ID: <code>{uid}</code> | {badge}\n"
+        f"🔑 Active Account: <b>{acct['label']}</b>\n"
+        f"📋 Setup: {bar} <code>{done}/{total}</code>\n\n"
         f"┌ 📊 Price Bot: {r_status}\n"
         f"├ 📦 Orders: {o_status}\n"
         f"├ 💳 Auto-Pay: {p_status}\n"
@@ -349,10 +349,10 @@ def ads_section_text(uid: int = 0) -> str:
         ad_stat  = {10:"🟢 Online",20:"🔴 Offline",30:"✅ Done"}.get(ad_data.get("status"),"?")
         max_pct  = get_max_float_pct(currency, token)
         ad_info  = (
-            f"\n📋 *Loaded Ad:*\n"
-            f"  💱 `{token}/{currency}` | 💲 `{price}`\n"
-            f"  Min: `{min_amt}` | Max: `{max_amt}` | Qty: `{qty}`\n"
-            f"  Status: {ad_stat} | Max float: `{max_pct}%`\n"
+            f"\n📋 <b>Loaded Ad:</b>\n"
+            f"  💱 <code>{token}/{currency}</code> | 💲 <code>{price}</code>\n"
+            f"  Min: <code>{min_amt}</code> | Max: <code>{max_amt}</code> | Qty: <code>{qty}</code>\n"
+            f"  Status: {ad_stat} | Max float: <code>{max_pct}%</code>\n"
         )
     else:
         ad_info = "\n  ⚠️ No ad loaded yet\n"
@@ -368,14 +368,14 @@ def ads_section_text(uid: int = 0) -> str:
     acct_label = bybit.BYBIT_ACCOUNTS[bybit._active_index]["label"] if bybit.BYBIT_ACCOUNTS else f"Account {slot}"
 
     return (
-        f"📊 *AD PRICE BOT — {acct_label}*\n\n"
-        f"🆔 Ad ID: `{ad_id}`\n"
-        f"👤 UID (Acct {slot}): `{bybit_uid}`\n"
-        f"🔀 Mode: `{mode.upper()}` | ⏱ Every `{interval}` min\n"
+        f"📊 <b>AD PRICE BOT — {acct_label}</b>\n\n"
+        f"🆔 Ad ID: <code>{ad_id}</code>\n"
+        f"👤 UID (Acct {slot}): <code>{bybit_uid}</code>\n"
+        f"🔀 Mode: <code>{mode.upper()}</code> | ⏱ Every <code>{interval}</code> min\n"
         f"{mode_info}\n"
         f"{ad_info}\n"
-        f"📈 Session price: `{cur}` | {status}\n\n"
-        f"_{hint}_"
+        f"📈 Session price: <code>{cur}</code> | {status}\n\n"
+        f"<i>{hint}</i>"
     )
 
 
@@ -414,12 +414,12 @@ def orders_section_text(uid: int = 0) -> str:
     return (
         "📦 *ORDER MONITOR*\n\n"
         f"Status: {status}\n"
-        f"BUY orders seen: `{seen_buy}` | Marked paid: `{paid}`\n"
-        f"SELL orders seen: `{seen_sell}` | Released: `{released}`\n\n"
+        f"BUY orders seen: <code>{seen_buy}</code> | Marked paid: <code>{paid}</code>\n"
+        f"SELL orders seen: <code>{seen_sell}</code> | Released: <code>{released}</code>\n\n"
         f"Auto-Pay (BUY): {ap_status}\n\n"
-        f"💬 *Chat Monitor:* {chat_status}\n\n"
-        f"✉️ *Sell Order Message: {sm_status}*\n"
-        f"Message (`{sess.sell_msg_count}x`): _{msg_preview}_\n\n"
+        f"💬 <b>Chat Monitor:</b> {chat_status}\n\n"
+        f"✉️ <b>Sell Order Message: {sm_status}</b>\n"
+        f"Message (<code>{sess.sell_msg_count}x</code>): _{msg_preview}_\n\n"
         "_BUY orders → Mark as Paid buttons_\n"
         "_SELL orders → Release Coin button_\n"
         "_Both show seller/buyer info + payment details_"
@@ -459,25 +459,28 @@ def autopay_section_text(uid: int = 0) -> str:
     flw_status   = "✅ ENABLED" if sess.flw_pay_enabled   else "❌ DISABLED"
     paga_status  = "✅ ENABLED" if sess.paga_pay_enabled  else "❌ DISABLED"
     # All API keys are per-user — stored in DB only
-    flw_key   = db.get_api(uid, "flw_secret_key")
+    flw_fully_set = all(db.get_api(uid, k) for k in (
+        "flw_client_id", "flw_client_secret", "flw_public_key",
+        "flw_secret_hash", "flw_secret_key"
+    ))
     paga_key  = db.get_api(uid, "paga_principal")
-    flw_configured  = "✅ Configured" if flw_key else "❌ Not configured"
+    flw_configured  = "✅ Configured (5/5 keys)" if flw_fully_set else "❌ Not configured"
     paga_configured = "✅ Configured" if paga_key else "❌ Not configured"
     sender_name  = sess.settings.get("sender_name", "Not set")
     unpaid_count = len(sess.unpaid_log)
     bp_status    = f"✅ ON — threshold: {sess.buyer_protection_mins} min" if sess.buyer_protection_on else "❌ OFF"
     nm_status    = "✅ ON — skips orders with missing account info" if sess.name_match_enabled else "❌ OFF"
     return (
-        f"💳 *AUTO-PAY*\n\n"
-        f"Bybit Mark-Paid: *{bybit_status}*\n"
-        f"Flutterwave Pay: *{flw_status}*\n"
-        f"Paga Pay: *{paga_status}*\n\n"
+        f"💳 <b>AUTO-PAY</b>\n\n"
+        f"Bybit Mark-Paid: <b>{bybit_status}</b>\n"
+        f"Flutterwave Pay: <b>{flw_status}</b>\n"
+        f"Paga Pay: <b>{paga_status}</b>\n\n"
         f"Flutterwave: {flw_configured}\n"
         f"Paga: {paga_configured}\n"
-        f"✏️ Sender name: `{sender_name}`\n"
-        f"📋 Unpaid orders this session: `{unpaid_count}`\n\n"
-        f"🛡 *Buyer Protection:* {bp_status}\n"
-        f"🔍 *Name Match:* {nm_status}\n\n"
+        f"✏️ Sender name: <code>{sender_name}</code>\n"
+        f"📋 Unpaid orders this session: <code>{unpaid_count}</code>\n\n"
+        f"🛡 <b>Buyer Protection:</b> {bp_status}\n"
+        f"🔍 <b>Name Match:</b> {nm_status}\n\n"
         "⚠️ Enable only ONE of Bybit or Flutterwave at a time.\n"
         "Bybit marks the order paid without sending money.\n"
         "Flutterwave actually sends the money then marks paid.\n\n"
@@ -516,8 +519,8 @@ def buyer_protection_menu_text(uid: int = 0):
         "  1️⃣ Mark the order as paid on Bybit\n"
         "  2️⃣ Send a warning message to the seller\n"
         "  3️⃣ Skip Flutterwave transfer (if FLW Pay is active)\n\n"
-        f"⏱ *Choose your threshold time:*\n"
-        f"  Current: `{thresh} min`\n\n"
+        f"⏱ <b>Choose your threshold time:</b>\n"
+        f"  Current: <code>{thresh} min</code>\n\n"
         "_Tap a time button below or enter a custom value:_"
     )
 
@@ -599,18 +602,18 @@ def format_order_message(order_detail: dict, seller_info: dict, uid: int = 0) ->
 
     return (
         f"{'─' * 28}\n"
-        f"🆔 `{order_id}`\n"
-        f"🔄 `{order_type}` | 🪙 `{token}`\n"
-        f"📦 Qty: `{quantity}` | 💵 `{amount} {currency}`\n"
-        f"💲 Price: `{price}`\n"
+        f"🆔 <code>{order_id}</code>\n"
+        f"🔄 <code>{order_type}</code> | 🪙 <code>{token}</code>\n"
+        f"📦 Qty: <code>{quantity}</code> | 💵 <code>{amount} {currency}</code>\n"
+        f"💲 Price: <code>{price}</code>\n"
         f"{'─' * 28}\n"
-        f"💳 Payment: *{pay_name}*\n"
-        f"🏦 Bank: `{bank_name}`\n"
-        f"👤 Seller Name: `{real_name}`\n"
-        f"🔢 Account: `{account_no}`\n"
+        f"💳 Payment: <b>{pay_name}</b>\n"
+        f"🏦 Bank: <code>{bank_name}</code>\n"
+        f"👤 Seller Name: <code>{real_name}</code>\n"
+        f"🔢 Account: <code>{account_no}</code>\n"
         f"{'─' * 28}\n"
-        f"📊 Seller Rating: `{good_rate}%`\n"
-        f"⏱ Avg Release: `{release_str}`"
+        f"📊 Seller Rating: <code>{good_rate}%</code>\n"
+        f"⏱ Avg Release: <code>{release_str}</code>"
         f"{slow_warn}"
         f"{missing_warn}"
     )
@@ -645,19 +648,19 @@ def format_sell_order_message(order_detail: dict, buyer_info: dict) -> str:
 
     return (
         f"{'─' * 28}\n"
-        f"🆔 `{order_id}`\n"
-        f"🪙 Token: `{token}` | Qty: `{quantity}`\n"
-        f"💵 Amount: `{amount} {currency}` | 💲 `{price}`\n"
+        f"🆔 <code>{order_id}</code>\n"
+        f"🪙 Token: <code>{token}</code> | Qty: <code>{quantity}</code>\n"
+        f"💵 Amount: <code>{amount} {currency}</code> | 💲 <code>{price}</code>\n"
         f"{'─' * 28}\n"
-        f"👤 *Buyer Name:* `{buyer_name}`\n"
-        f"📊 Buyer Rating: `{good_rate}%`\n"
-        f"⏱ Avg Transfer Time: `{avg_transfer} min`\n"
+        f"👤 <b>Buyer Name:</b> <code>{buyer_name}</code>\n"
+        f"📊 Buyer Rating: <code>{good_rate}%</code>\n"
+        f"⏱ Avg Transfer Time: <code>{avg_transfer} min</code>\n"
         f"{'─' * 28}\n"
-        f"🏦 *My Payment Details:*\n"
-        f"💳 Method: *{my_pay_name}*\n"
-        f"🏦 Bank: `{my_bank}`\n"
-        f"👤 My Name: `{my_name}`\n"
-        f"🔢 Account: `{my_account}`\n"
+        f"🏦 <b>My Payment Details:</b>\n"
+        f"💳 Method: <b>{my_pay_name}</b>\n"
+        f"🏦 Bank: <code>{my_bank}</code>\n"
+        f"👤 My Name: <code>{my_name}</code>\n"
+        f"🔢 Account: <code>{my_account}</code>\n"
         f"{'─' * 28}"
     )
 
@@ -694,13 +697,14 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
     # Load this user's FLW secret key from DB
     flw_secret_key = db.get_api(chat_id, "flw_secret_key")
     if not flw_secret_key:
+        oid = _esc(order_id)
         await bot.send_message(chat_id=chat_id,
             text=(
-                f"❌ *FLW Auto-Pay* — Order `{order_id}`\n\n"
+                f"❌ <b>FLW Auto-Pay</b> — Order <code>{oid}</code>\n\n"
                 "No Flutterwave API configured.\n"
-                "Go to 🔑 *Set APIs* → Set Flutterwave API first."
+                "Go to 🔑 <b>Set APIs</b> → Set Flutterwave API first."
             ),
-            parse_mode="Markdown")
+            parse_mode="HTML")
         return
 
     try:
@@ -723,14 +727,15 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
                 await asyncio.get_event_loop().run_in_executor(
                     None, send_chat_message, order_id, NO_ACCOUNT_WARN_MSG
                 )
+                oid = _esc(order_id)
                 await bot.send_message(chat_id=chat_id,
                     text=(
-                        f"🔍 *Name Match — Missing Info*\n\n"
-                        f"Order: `{order_id}`\n"
+                        f"🔍 <b>Name Match — Missing Info</b>\n\n"
+                        f"Order: <code>{oid}</code>\n"
                         f"Account details incomplete — FLW transfer skipped.\n"
                         f"Marked paid on Bybit + seller asked to cancel."
                     ),
-                    parse_mode="Markdown")
+                    parse_mode="HTML")
                 return
 
         pay_term = order_detail.get("confirmedPayTerm", {}) or {}
@@ -746,19 +751,22 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
         seller_name   = pay_term.get("realName", order_detail.get("sellerRealName", "Seller"))
 
         if not account_no:
+            oid = _esc(order_id)
             await bot.send_message(chat_id=chat_id,
-                text=f"❌ *FLW Auto-Pay* — Order `{order_id}`\nNo account number found.",
-                parse_mode="Markdown")
+                text=f"❌ <b>FLW Auto-Pay</b> — Order <code>{oid}</code>\nNo account number found.",
+                parse_mode="HTML")
             return
 
         bank_code = match_bank_code(bank_name, pay_type_name, secret_key=flw_secret_key)
         if not bank_code:
+            oid  = _esc(order_id)
+            bank = _esc(bank_name or pay_type_name)
             await bot.send_message(chat_id=chat_id,
                 text=(
-                    f"❌ *FLW Auto-Pay* — Order `{order_id}`\n"
-                    f"Unknown bank: `{bank_name or pay_type_name}`\nMark this order manually."
+                    f"❌ <b>FLW Auto-Pay</b> — Order <code>{oid}</code>\n"
+                    f"Unknown bank: <code>{bank}</code>\nMark this order manually."
                 ),
-                parse_mode="Markdown")
+                parse_mode="HTML")
             return
 
         amount = float(amount_str)
@@ -787,27 +795,31 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
                 await asyncio.get_event_loop().run_in_executor(
                     None, send_chat_message, order_id, SELLER_WARN_MSG
                 )
+                oid    = _esc(order_id)
+                thresh = _s(chat_id).buyer_protection_mins
                 await bot.send_message(chat_id=chat_id,
                     text=(
-                        f"🛡 *Buyer Protection Triggered* — Order `{order_id}`\n\n"
-                        f"Seller release time: `{release_mins:.0f} min` ≥ `{_s(chat_id).buyer_protection_mins} min`\n"
+                        f"🛡 <b>Buyer Protection Triggered</b> — Order <code>{oid}</code>\n\n"
+                        f"Seller release time: <code>{release_mins:.0f} min</code> ≥ <code>{thresh} min</code>\n"
                         f"✅ Marked paid on Bybit + warning sent to seller.\n"
                         f"FLW transfer was skipped."
                     ),
-                    parse_mode="Markdown")
+                    parse_mode="HTML")
                 return
 
         # ── Step 1: Verify account ──
+        acct_safe = _esc(account_no)
+        bank_safe = _esc(bank_name or pay_type_name)
         await bot.send_message(chat_id=chat_id,
-            text=f"⏳ *FLW* Verifying account `{account_no}` ({bank_name or pay_type_name})...",
-            parse_mode="Markdown")
+            text=f"⏳ <b>FLW</b> Verifying account <code>{acct_safe}</code> ({bank_safe})...",
+            parse_mode="HTML")
 
         verify = await asyncio.get_event_loop().run_in_executor(
             None, verify_account, account_no, bank_code, flw_secret_key
         )
 
         if verify.get("status") != "success" or "error" in verify:
-            err = verify.get("message", verify.get("error", "Unknown error"))
+            err = _esc(str(verify.get("message", verify.get("error", "Unknown error"))))
             _s(chat_id).unpaid_log.append({
                 "order_id":   order_id,
                 "account_no": account_no,
@@ -816,25 +828,28 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
                 "reason":     f"Account verification failed: {err}",
                 "timestamp":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             })
+            oid = _esc(order_id)
             await bot.send_message(chat_id=chat_id,
                 text=(
-                    f"❌ *FLW Account Invalid* — Order `{order_id}`\n\n"
-                    f"Account `{account_no}` @ `{bank_name or pay_type_name}` failed verification.\n"
-                    f"Reason: `{err}`\n\nTransfer aborted. Mark order manually."
+                    f"❌ <b>FLW Account Invalid</b> — Order <code>{oid}</code>\n\n"
+                    f"Account <code>{acct_safe}</code> @ {bank_safe} failed verification.\n"
+                    f"Reason: <code>{err}</code>\n\nTransfer aborted. Mark order manually."
                 ),
-                parse_mode="Markdown")
+                parse_mode="HTML")
             return
 
         verified_name = verify.get("data", {}).get("account_name", seller_name)
         working_code  = verify.get("_working_bank_code", bank_code)
+        vname_safe    = _esc(verified_name)
 
+        oid = _esc(order_id)
         await bot.send_message(chat_id=chat_id,
             text=(
-                f"✅ *Account Verified*: *{verified_name}*\n"
-                f"Account: `{account_no}` ({bank_name or pay_type_name})\n\n"
-                f"⏳ Sending *{amount:,.2f} NGN*..."
+                f"✅ <b>Account Verified:</b> {vname_safe}\n"
+                f"Account: <code>{acct_safe}</code> ({bank_safe})\n\n"
+                f"⏳ Sending <b>{amount:,.2f} NGN</b>..."
             ),
-            parse_mode="Markdown")
+            parse_mode="HTML")
 
         # ── Step 2: Send transfer ──
         sender_name = _s(chat_id).settings.get("sender_name", "Akinrinade Akinniyi")
@@ -847,23 +862,29 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
         if "error" in result:
             err_msg = result["error"]
             ip = await _get_current_ip()
+            err_safe = _esc(err_msg[:200])
+            ip_safe  = _esc(ip)
+            oid      = _esc(order_id)
             if "Empty response" in err_msg or "401" in err_msg or "403" in err_msg:
                 await bot.send_message(chat_id=chat_id,
                     text=(
-                        f"❌ *FLW blocked* — Order `{order_id}`\n\n"
-                        f"`{err_msg[:200]}`\n\n"
-                        f"👉 Add `{ip}` to Flutterwave IP Whitelist"
+                        f"❌ <b>FLW blocked</b> — Order <code>{oid}</code>\n\n"
+                        f"<code>{err_safe}</code>\n\n"
+                        f"👉 Add <code>{ip_safe}</code> to Flutterwave IP Whitelist"
                     ),
-                    parse_mode="Markdown")
+                    parse_mode="HTML")
             else:
+                err_safe2 = _esc(err_msg[:300])
                 await bot.send_message(chat_id=chat_id,
-                    text=f"❌ *FLW error* — `{order_id}`\n`{err_msg[:300]}`",
-                    parse_mode="Markdown")
+                    text=f"❌ <b>FLW error</b> — Order <code>{oid}</code>\n<code>{err_safe2}</code>",
+                    parse_mode="HTML")
             return
 
         transfer_data = result.get("data", {})
         transfer_id   = str(transfer_data.get("id", ""))
         status        = transfer_data.get("status", "NEW")
+        tid_safe      = _esc(transfer_id)
+        oid           = _esc(order_id)
 
         if status == "FAILED":
             complete_msg = transfer_data.get("complete_message", "Rejected by bank")
@@ -873,18 +894,19 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
                 "reason": complete_msg or "Transfer failed on creation",
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             })
+            cmsg_safe = _esc(complete_msg)
             if "insufficient" in complete_msg.lower() or "funds" in complete_msg.lower():
                 fail_text = (
-                    f"❌ *FLW Failed — Insufficient Funds*\n\nOrder: `{order_id}`\n"
-                    f"Amount needed: *{amount:,.2f} NGN*\n\n"
+                    f"❌ <b>FLW Failed — Insufficient Funds</b>\n\nOrder: <code>{oid}</code>\n"
+                    f"Amount needed: <b>{amount:,.2f} NGN</b>\n\n"
                     f"👉 Top up Flutterwave → Balances → Fund Wallet"
                 )
             else:
                 fail_text = (
-                    f"❌ *FLW Transfer Failed*\n\nOrder: `{order_id}`\n"
-                    f"Transfer ID: `{transfer_id}`\nReason: `{complete_msg}`"
+                    f"❌ <b>FLW Transfer Failed</b>\n\nOrder: <code>{oid}</code>\n"
+                    f"Transfer ID: <code>{tid_safe}</code>\nReason: <code>{cmsg_safe}</code>"
                 )
-            await bot.send_message(chat_id=chat_id, text=fail_text, parse_mode="Markdown")
+            await bot.send_message(chat_id=chat_id, text=fail_text, parse_mode="HTML")
             return
 
         # Step 3: Poll status up to 60 seconds
@@ -905,14 +927,15 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
                 bybit_ok = pr.get("retCode", -1) == 0
             _s(chat_id).paid_order_ids.add(order_id)
             await _remove_order_buttons(bot, chat_id, order_id)
+            bybit_label = "✅" if bybit_ok else "⚠️ Mark manually"
             await bot.send_message(chat_id=chat_id,
                 text=(
-                    f"✅ *FLW Payment SUCCESS*\n\nOrder: `{order_id}`\n"
-                    f"Amount: *{amount:,.2f} NGN* → `{verified_name}`\n"
-                    f"Transfer ID: `{transfer_id}`\n"
-                    f"Bybit marked paid: {'✅' if bybit_ok else '⚠️ Mark manually'}"
+                    f"✅ <b>FLW Payment SUCCESS</b>\n\nOrder: <code>{oid}</code>\n"
+                    f"Amount: <b>{amount:,.2f} NGN</b> → {vname_safe}\n"
+                    f"Transfer ID: <code>{tid_safe}</code>\n"
+                    f"Bybit marked paid: {bybit_label}"
                 ),
-                parse_mode="Markdown")
+                parse_mode="HTML")
         elif final_status == "FAILED":
             last_poll    = await asyncio.get_event_loop().run_in_executor(None, get_transfer_status, transfer_id, flw_secret_key)
             complete_msg = last_poll.get("data", {}).get("complete_message", "")
@@ -922,33 +945,38 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
                 "reason": complete_msg or "Transfer FAILED after polling",
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             })
+            cmsg_safe = _esc(complete_msg)
             if "insufficient" in complete_msg.lower() or "funds" in complete_msg.lower():
                 fail_text = (
-                    f"❌ *FLW Failed — Insufficient Funds*\n\nOrder: `{order_id}`\n"
-                    f"Amount: *{amount:,.2f} NGN*\n\n👉 Top up Flutterwave → Balances → Fund Wallet"
+                    f"❌ <b>FLW Failed — Insufficient Funds</b>\n\nOrder: <code>{oid}</code>\n"
+                    f"Amount: <b>{amount:,.2f} NGN</b>\n\n👉 Top up Flutterwave → Balances → Fund Wallet"
                 )
             else:
+                reason_line = f"Reason: <code>{cmsg_safe}</code>\n" if complete_msg else ""
                 fail_text = (
-                    f"❌ *FLW Transfer FAILED*\n\nOrder: `{order_id}`\n"
-                    f"Transfer ID: `{transfer_id}`\n"
-                    f"{'Reason: `' + complete_msg + '`' + chr(10) if complete_msg else ''}"
+                    f"❌ <b>FLW Transfer FAILED</b>\n\nOrder: <code>{oid}</code>\n"
+                    f"Transfer ID: <code>{tid_safe}</code>\n"
+                    f"{reason_line}"
                     "Mark order manually."
                 )
-            await bot.send_message(chat_id=chat_id, text=fail_text, parse_mode="Markdown")
+            await bot.send_message(chat_id=chat_id, text=fail_text, parse_mode="HTML")
         else:
+            fstatus_safe = _esc(final_status)
             await bot.send_message(chat_id=chat_id,
                 text=(
-                    f"⏳ *FLW Transfer Pending*\n\nOrder: `{order_id}`\n"
-                    f"Transfer ID: `{transfer_id}` | Status: `{final_status}`\n"
+                    f"⏳ <b>FLW Transfer Pending</b>\n\nOrder: <code>{oid}</code>\n"
+                    f"Transfer ID: <code>{tid_safe}</code> | Status: <code>{fstatus_safe}</code>\n"
                     "Webhook will notify you when complete."
                 ),
-                parse_mode="Markdown")
+                parse_mode="HTML")
 
     except Exception as e:
         logger.error(f"[FLW] _flw_autopay error: {e}")
+        oid      = _esc(order_id)
+        err_safe = _esc(str(e)[:200])
         await bot.send_message(chat_id=chat_id,
-            text=f"❌ *FLW error* — `{order_id}`\n`{str(e)[:200]}`",
-            parse_mode="Markdown")
+            text=f"❌ <b>FLW error</b> — Order <code>{oid}</code>\n<code>{err_safe}</code>",
+            parse_mode="HTML")
 
 
 # ─────────────────────────────────────────
@@ -986,10 +1014,10 @@ async def _paga_queue_worker():
                 await bot.send_message(
                     chat_id=chat_id,
                     text=(
-                        f"🟡 *Paga Queue* — Processing order `{order_id}`\n"
-                        f"📋 `{remaining}` order(s) waiting after this one."
+                        f"🟡 <b>Paga Queue</b> — Processing order <code>{_esc(order_id)}</code>\n"
+                        f"📋 <code>{remaining}</code> order(s) waiting after this one."
                     ),
-                    parse_mode="Markdown"
+                    parse_mode="HTML"
                 )
 
             try:
@@ -997,10 +1025,12 @@ async def _paga_queue_worker():
             except Exception as e:
                 logger.error(f"[Paga Queue] Error processing {order_id}: {e}")
                 try:
+                    oid      = _esc(order_id)
+                    err_safe = _esc(str(e)[:200])
                     await bot.send_message(
                         chat_id=chat_id,
-                        text=f"❌ *Paga Queue error* — `{order_id}`\n`{str(e)[:200]}`",
-                        parse_mode="Markdown"
+                        text=f"❌ <b>Paga Queue error</b> — Order <code>{oid}</code>\n<code>{err_safe}</code>",
+                        parse_mode="HTML"
                     )
                 except Exception:
                     pass
@@ -1070,14 +1100,14 @@ async def _paga_handle_success(bot, chat_id, order_id, pay_term, amount, holder_
     await _remove_order_buttons(bot, chat_id, order_id)
     await bot.send_message(chat_id=chat_id,
         text=(
-            f"✅ *Paga Payment SUCCESS*\n\n"
-            f"Order: `{order_id}`\n"
-            f"Amount: *{amount:,.2f} NGN* → `{holder_name}`\n"
-            f"Transaction ID: `{txn_id or 'N/A'}`\n"
-            f"Reference: `{ref}`\n"
+            f"✅ <b>Paga Payment SUCCESS</b>\n\n"
+            f"Order: <code>{order_id}</code>\n"
+            f"Amount: <b>{amount:,.2f} NGN</b> → <code>{holder_name}</code>\n"
+            f"Transaction ID: <code>{txn_id or 'N/A'}</code>\n"
+            f"Reference: <code>{ref}</code>\n"
             f"Bybit marked paid: {'✅' if bybit_ok else '⚠️ Mark manually'}"
         ),
-        parse_mode="Markdown")
+        parse_mode="HTML")
 
 
 async def _paga_handle_failure(bot, chat_id, order_id, account_no, bank, amount, code, message_txt):
@@ -1094,19 +1124,19 @@ async def _paga_handle_failure(bot, chat_id, order_id, account_no, bank, amount,
     logger.error(f"[Paga] ❌ FAILED: order={order_id} code={code} msg={message_txt}")
     if "insufficient" in err_lower or "balance" in err_lower or "funds" in err_lower:
         fail_text = (
-            f"❌ *Paga Failed — Insufficient Funds*\n\n"
-            f"Order: `{order_id}`\nAmount needed: *{amount:,.2f} NGN*\n\n"
+            f"❌ <b>Paga Failed — Insufficient Funds</b>\n\n"
+            f"Order: <code>{order_id}</code>\nAmount needed: <b>{amount:,.2f} NGN</b>\n\n"
             f"👉 Top up your Paga business account balance.\n"
             f"Mark this order manually."
         )
     else:
         fail_text = (
-            f"❌ *Paga Transfer Failed*\n\n"
-            f"Order: `{order_id}`\n"
-            f"Code: `{code}` | Message: `{(message_txt or 'Unknown')[:200]}`\n\n"
+            f"❌ <b>Paga Transfer Failed</b>\n\n"
+            f"Order: <code>{order_id}</code>\n"
+            f"Code: <code>{code}</code> | Message: <code>{(message_txt or 'Unknown')[:200]}</code>\n\n"
             f"Mark order manually."
         )
-    await bot.send_message(chat_id=chat_id, text=fail_text, parse_mode="Markdown")
+    await bot.send_message(chat_id=chat_id, text=fail_text, parse_mode="HTML")
 
 
 # ─────────────────────────────────────────
@@ -1123,13 +1153,14 @@ async def _paga_autopay(bot, chat_id, order_id, order_detail):
     paga_principal  = db.get_api(chat_id, "paga_principal")
 
     if not (paga_api_key and paga_credential and paga_principal):
+        oid = _esc(order_id)
         await bot.send_message(chat_id=chat_id,
             text=(
-                f"❌ *Paga Auto-Pay* — Order `{order_id}`\n\n"
+                f"❌ <b>Paga Auto-Pay</b> — Order <code>{oid}</code>\n\n"
                 "No Paga API configured.\n"
-                "Go to 🔑 *Set APIs* → Set Paga API first."
+                "Go to 🔑 <b>Set APIs</b> → Set Paga API first."
             ),
-            parse_mode="Markdown")
+            parse_mode="HTML")
         return
 
     try:
@@ -1154,12 +1185,12 @@ async def _paga_autopay(bot, chat_id, order_id, order_detail):
                 )
                 await bot.send_message(chat_id=chat_id,
                     text=(
-                        f"🔍 *Name Match — Missing Info*\n\n"
-                        f"Order: `{order_id}`\n"
+                        f"🔍 <b>Name Match — Missing Info</b>\n\n"
+                        f"Order: <code>{order_id}</code>\n"
                         f"Account details incomplete — Paga transfer skipped.\n"
                         f"Marked paid on Bybit + seller asked to cancel."
                     ),
-                    parse_mode="Markdown")
+                    parse_mode="HTML")
                 return
 
         pay_term = order_detail.get("confirmedPayTerm", {}) or {}
@@ -1175,20 +1206,23 @@ async def _paga_autopay(bot, chat_id, order_id, order_detail):
         seller_name   = pay_term.get("realName", order_detail.get("sellerRealName", "Seller"))
 
         if not account_no:
+            oid = _esc(order_id)
             await bot.send_message(chat_id=chat_id,
-                text=f"❌ *Paga Auto-Pay* — Order `{order_id}`\nNo account number found.",
-                parse_mode="Markdown")
+                text=f"❌ <b>Paga Auto-Pay</b> — Order <code>{oid}</code>\nNo account number found.",
+                parse_mode="HTML")
             return
 
         bank_uuid = match_bank_uuid(bank_name, pay_type_name,
                                     api_key=paga_api_key, credential=paga_credential, principal=paga_principal)
         if not bank_uuid:
+            oid  = _esc(order_id)
+            bank = _esc(bank_name or pay_type_name)
             await bot.send_message(chat_id=chat_id,
                 text=(
-                    f"❌ *Paga Auto-Pay* — Order `{order_id}`\n"
-                    f"Unknown bank: `{bank_name or pay_type_name}`\nMark this order manually."
+                    f"❌ <b>Paga Auto-Pay</b> — Order <code>{oid}</code>\n"
+                    f"Unknown bank: <code>{bank}</code>\nMark this order manually."
                 ),
-                parse_mode="Markdown")
+                parse_mode="HTML")
             return
 
         amount = float(amount_str)
@@ -1219,18 +1253,18 @@ async def _paga_autopay(bot, chat_id, order_id, order_detail):
                 )
                 await bot.send_message(chat_id=chat_id,
                     text=(
-                        f"🛡 *Buyer Protection Triggered* — Order `{order_id}`\n\n"
-                        f"Seller release time: `{release_mins:.0f} min` ≥ `{_s(chat_id).buyer_protection_mins} min`\n"
+                        f"🛡 <b>Buyer Protection Triggered</b> — Order <code>{order_id}</code>\n\n"
+                        f"Seller release time: <code>{release_mins:.0f} min</code> ≥ <code>{_s(chat_id).buyer_protection_mins} min</code>\n"
                         f"✅ Marked paid on Bybit + warning sent.\n"
                         f"Paga transfer was skipped."
                     ),
-                    parse_mode="Markdown")
+                    parse_mode="HTML")
                 return
 
         # ── Step 1: Validate account ──
         await bot.send_message(chat_id=chat_id,
-            text=f"⏳ *Paga* Validating account `{account_no}` ({bank_name or pay_type_name})...",
-            parse_mode="Markdown")
+            text=f"⏳ <b>Paga</b> Validating account <code>{_esc(account_no)}</code> ({_esc(bank_name or pay_type_name)})...",
+            parse_mode="HTML")
 
         validate = await asyncio.get_event_loop().run_in_executor(
             None, validate_account, account_no, bank_uuid, amount,
@@ -1249,11 +1283,11 @@ async def _paga_autopay(bot, chat_id, order_id, order_detail):
             })
             await bot.send_message(chat_id=chat_id,
                 text=(
-                    f"❌ *Paga Account Invalid* — Order `{order_id}`\n\n"
-                    f"Account `{account_no}` @ `{bank_name or pay_type_name}` failed validation.\n"
-                    f"Reason: `{err}`\n\nTransfer aborted. Mark order manually."
+                    f"❌ <b>Paga Account Invalid</b> — Order <code>{order_id}</code>\n\n"
+                    f"Account <code>{_esc(account_no)}</code> @ {_esc(bank_name or pay_type_name)} failed validation.\n"
+                    f"Reason: <code>{_esc(str(err))}</code>\n\nTransfer aborted. Mark order manually."
                 ),
-                parse_mode="Markdown")
+                parse_mode="HTML")
             return
 
         # Use helper functions that try all known field names (visible in Render logs)
@@ -1264,12 +1298,12 @@ async def _paga_autopay(bot, chat_id, order_id, order_detail):
 
         await bot.send_message(chat_id=chat_id,
             text=(
-                f"✅ *Account Verified*: *{verified_name}*\n"
-                f"Account: `{account_no}` ({bank_name or pay_type_name})\n"
-                f"Fee: `₦{fee:,.2f}`\n\n"
-                f"⏳ Sending *{amount:,.2f} NGN*..."
+                f"✅ <b>Account Verified</b>: <b>{verified_name}</b>\n"
+                f"Account: <code>{account_no}</code> ({bank_name or pay_type_name})\n"
+                f"Fee: <b>₦{fee:,.2f}</b>\n\n"
+                f"⏳ Sending <b>{amount:,.2f} NGN</b>..."
             ),
-            parse_mode="Markdown")
+            parse_mode="HTML")
         # ── Step 2: Send transfer ──
         render_url   = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
         callback_url = f"{render_url}/paga-webhook" if render_url else ""
@@ -1289,17 +1323,22 @@ async def _paga_autopay(bot, chat_id, order_id, order_detail):
             err_msg = result["error"]
             ip = await _get_current_ip()
             if "401" in err_msg or "403" in err_msg or "IP" in err_msg:
+                oid      = _esc(order_id)
+                err_safe = _esc(err_msg[:200])
+                ip_safe  = _esc(ip)
                 await bot.send_message(chat_id=chat_id,
                     text=(
-                        f"❌ *Paga blocked* — Order `{order_id}`\n\n"
-                        f"`{err_msg[:200]}`\n\n"
-                        f"👉 Whitelist IP `{ip}` on Paga dashboard → Settings → IP Whitelist"
+                        f"❌ <b>Paga blocked</b> — Order <code>{oid}</code>\n\n"
+                        f"<code>{err_safe}</code>\n\n"
+                        f"👉 Whitelist IP <code>{ip_safe}</code> on Paga dashboard → Settings → IP Whitelist"
                     ),
-                    parse_mode="Markdown")
+                    parse_mode="HTML")
             else:
+                oid      = _esc(order_id)
+                err_safe = _esc(err_msg[:300])
                 await bot.send_message(chat_id=chat_id,
-                    text=f"❌ *Paga error* — `{order_id}`\n`{err_msg[:300]}`",
-                    parse_mode="Markdown")
+                    text=f"❌ <b>Paga error</b> — Order <code>{oid}</code>\n<code>{err_safe}</code>",
+                    parse_mode="HTML")
             return
 
         response_code = result.get("responseCode", -1)
@@ -1325,13 +1364,13 @@ async def _paga_autopay(bot, chat_id, order_id, order_detail):
             logger.info(f"[Paga] PENDING — polling check_status for ref={ref}")
             await bot.send_message(chat_id=chat_id,
                 text=(
-                    f"⏳ *Paga Transfer Pending*\n\n"
-                    f"Order: `{order_id}`\n"
-                    f"Amount: *{amount:,.2f} NGN* → `{holder_name}`\n"
-                    f"Reference: `{ref}`\n\n"
+                    f"⏳ <b>Paga Transfer Pending</b>\n\n"
+                    f"Order: <code>{order_id}</code>\n"
+                    f"Amount: <b>{amount:,.2f} NGN</b> → <code>{holder_name}</code>\n"
+                    f"Reference: <code>{ref}</code>\n\n"
                     f"Polling for status update (up to 2 minutes)..."
                 ),
-                parse_mode="Markdown")
+                parse_mode="HTML")
 
             final_code = response_code
             final_msg  = message_txt
@@ -1364,14 +1403,14 @@ async def _paga_autopay(bot, chat_id, order_id, order_detail):
                 # Still pending after 2 min — notify but don't mark failed
                 await bot.send_message(chat_id=chat_id,
                     text=(
-                        f"⏳ *Paga Still Pending After 2 Min*\n\n"
-                        f"Order: `{order_id}`\n"
-                        f"Reference: `{ref}`\n\n"
+                        f"⏳ <b>Paga Still Pending After 2 Min</b>\n\n"
+                        f"Order: <code>{order_id}</code>\n"
+                        f"Reference: <code>{ref}</code>\n\n"
                         f"Paga webhook will notify you when complete.\n"
                         f"Check your Paga dashboard if no update arrives.\n"
                         f"Do NOT mark Bybit order paid yet."
                     ),
-                    parse_mode="Markdown")
+                    parse_mode="HTML")
             else:
                 await _paga_handle_failure(
                     bot, chat_id, order_id,
@@ -1388,9 +1427,11 @@ async def _paga_autopay(bot, chat_id, order_id, order_detail):
 
     except Exception as e:
         logger.error(f"[Paga] _paga_autopay error: {e}")
+        oid      = _esc(order_id)
+        err_safe = _esc(str(e)[:200])
         await bot.send_message(chat_id=chat_id,
-            text=f"❌ *Paga error* — `{order_id}`\n`{str(e)[:200]}`",
-            parse_mode="Markdown")
+            text=f"❌ <b>Paga error</b> — Order <code>{oid}</code>\n<code>{err_safe}</code>",
+            parse_mode="HTML")
 
 
 # ─────────────────────────────────────────
@@ -1509,9 +1550,9 @@ async def _poll_order_chat(bot, chat_id: int, order_id: str):
             display_content = content if len(content) <= 300 else content[:297] + "..."
 
             text = (
-                f"💬 *New Bybit Message*\n\n"
-                f"🆔 Order: `{order_id}`\n"
-                f"👤 From: *{nick}*\n"
+                f"💬 <b>New Bybit Message</b>\n\n"
+                f"🆔 Order: <code>{order_id}</code>\n"
+                f"👤 From: <b>{nick}</b>\n"
                 f"{type_label} _{display_content}_"
             )
 
@@ -1526,7 +1567,7 @@ async def _poll_order_chat(bot, chat_id: int, order_id: str):
                 chat_id=chat_id,
                 text=text,
                 reply_markup=reply_kb,
-                parse_mode="Markdown"
+                parse_mode="HTML"
             )
             logger.info(
                 f"[ChatMonitor] ✅ Forwarded msg {msg_id} from '{nick}' "
@@ -1635,9 +1676,9 @@ async def _handle_buy_order(bot, chat_id, order_id):
         msg = format_order_message(order_detail, seller_info)
         sent_msg = await bot.send_message(
             chat_id=chat_id,
-            text=f"🛒 *BUY Order — Pay Seller*\n{msg}",
+            text=f"🛒 <b>BUY Order — Pay Seller</b>\n{msg}",
             reply_markup=order_buttons(order_id),
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
         # Store message_id so auto-pay can remove buttons without a query object
         _s(chat_id).order_msg_ids[order_id] = sent_msg.message_id
@@ -1672,11 +1713,11 @@ async def _handle_buy_order(bot, chat_id, order_id):
                 )
                 await bot.send_message(chat_id=chat_id,
                     text=(
-                        f"🔍 *Name Match — Missing Info*\n\n"
-                        f"Order `{order_id}`\nNo account details found.\n"
+                        f"🔍 <b>Name Match — Missing Info</b>\n\n"
+                        f"Order <code>{order_id}</code>\nNo account details found.\n"
                         f"Marked paid + seller asked to cancel."
                     ),
-                    parse_mode="Markdown")
+                    parse_mode="HTML")
                 return
 
         # ── compute seller release time once (shared by all pay paths) ──
@@ -1696,11 +1737,11 @@ async def _handle_buy_order(bot, chat_id, order_id):
                 await bot.send_message(
                     chat_id=chat_id,
                     text=(
-                        f"🟡 *Paga Queue* — Order `{order_id}` added\n"
-                        f"📋 Position: `{pos}` in queue\n"
+                        f"🟡 <b>Paga Queue</b> — Order <code>{order_id}</code> added\n"
+                        f"📋 Position: <code>{_esc(str(pos))}</code> in queue\n"
                         f"Will be processed after the current order completes."
                     ),
-                    parse_mode="Markdown"
+                    parse_mode="HTML"
                 )
 
         elif _s(chat_id).flw_pay_enabled and order_id not in _s(chat_id).paid_order_ids:
@@ -1745,14 +1786,14 @@ async def _handle_buy_order(bot, chat_id, order_id):
                         })
                     await bot.send_message(
                         chat_id=chat_id,
-                        text=f"💳 *Auto-Pay ✅* Order `{order_id}` marked paid{note}",
-                        parse_mode="Markdown"
+                        text=f"💳 <b>Auto-Pay ✅</b> Order <code>{_esc(order_id)}</code> marked paid{_esc(note)}",
+                        parse_mode="HTML"
                     )
                 else:
                     await bot.send_message(
                         chat_id=chat_id,
-                        text=f"❌ *Auto-Pay failed* `{order_id}`\n`{pr.get('retMsg','')}`",
-                        parse_mode="Markdown"
+                        text=f"❌ <b>Auto-Pay failed</b> <code>{_esc(order_id)}</code>\n<code>{_esc(pr.get('retMsg',''))}</code>",
+                        parse_mode="HTML"
                     )
     except Exception as e:
         logger.error(f"[BUY] _handle_buy_order {order_id} error: {e}")
@@ -1777,8 +1818,8 @@ async def _handle_sell_incoming(bot, chat_id, order_id):
         msg = format_sell_order_message(order_detail, buyer_info)
         await bot.send_message(
             chat_id=chat_id,
-            text=f"💰 *SELL Order — Awaiting Buyer Payment*\n{msg}",
-            parse_mode="Markdown"
+            text=f"💰 <b>SELL Order — Awaiting Buyer Payment</b>\n{msg}",
+            parse_mode="HTML"
         )
 
         # ── 🚨 Fraud Check (SELL orders only) ──
@@ -1797,18 +1838,18 @@ async def _handle_sell_incoming(bot, chat_id, order_id):
             await bot.send_message(
                 chat_id=chat_id,
                 text=(
-                    f"🔍 *Fraud Check — Order `{order_id}`*\n\n"
+                    f"🔍 <b>Fraud Check — Order <code>{order_id}</code></b>\n\n"
                     f"⚠️ Buyer name not available yet at this stage.\n"
                     f"Name will be checked again when buyer pays (status 20).\n"
                     f"_(Database: {scammer_count} names loaded)_"
                 ),
-                parse_mode="Markdown"
+                parse_mode="HTML"
             )
         else:
             await bot.send_message(
                 chat_id=chat_id,
-                text=f"🔍 *Verifying buyer name...*\n👤 `{buyer_name}`",
-                parse_mode="Markdown"
+                text=f"🔍 <b>Verifying buyer name...</b>\n👤 <code>{buyer_name}</code>",
+                parse_mode="HTML"
             )
             fraud = await asyncio.get_event_loop().run_in_executor(
                 None, check_buyer_name, buyer_name
@@ -1822,15 +1863,15 @@ async def _handle_sell_incoming(bot, chat_id, order_id):
                 await bot.send_message(
                     chat_id=chat_id,
                     text=(
-                        f"🚨 *FRAUD WARNING — Order `{order_id}`*\n\n"
-                        f"👤 Buyer: *{buyer_name}*\n"
-                        f"{match_label}: `{fraud['matched_name']}`\n"
-                        f"Similarity: `{fraud['similarity']:.0%}`\n\n"
-                        f"⛔ *Do NOT accept payment from this buyer.*\n"
+                        f"🚨 <b>FRAUD WARNING — Order <code>{order_id}</code></b>\n\n"
+                        f"👤 Buyer: <b>{buyer_name}</b>\n"
+                        f"{match_label}: <code>{fraud['matched_name']}</code>\n"
+                        f"Similarity: <code>{fraud['similarity']:.0%}</code>\n\n"
+                        f"⛔ <b>Do NOT accept payment from this buyer.</b>\n"
                         f"Fraudulent / chargeback records found.\n\n"
                         f"👉 Request order cancellation immediately."
                     ),
-                    parse_mode="Markdown"
+                    parse_mode="HTML"
                 )
                 logger.warning(
                     f"[FraudCheck] 🚨 FLAGGED {order_id} | buyer='{buyer_name}' "
@@ -1840,11 +1881,11 @@ async def _handle_sell_incoming(bot, chat_id, order_id):
                 await bot.send_message(
                     chat_id=chat_id,
                     text=(
-                        f"✅ *Buyer Verified — Not in fraud list*\n\n"
-                        f"👤 `{buyer_name}`\n"
+                        f"✅ <b>Buyer Verified — Not in fraud list</b>\n\n"
+                        f"👤 <code>{buyer_name}</code>\n"
                         f"_(Checked against {scammer_count} names)_"
                     ),
-                    parse_mode="Markdown"
+                    parse_mode="HTML"
                 )
                 logger.info(f"[FraudCheck] ✅ Clean: '{buyer_name}' on order {order_id}")
 
@@ -1879,9 +1920,9 @@ async def _handle_sell_paid(bot, chat_id, order_id):
         msg = format_sell_order_message(order_detail, buyer_info)
         await bot.send_message(
             chat_id=chat_id,
-            text=f"✅ *SELL Order — Buyer Has Paid! Release Coin Now*\n{msg}",
+            text=f"✅ <b>SELL Order — Buyer Has Paid! Release Coin Now</b>\n{msg}",
             reply_markup=sell_order_buttons(order_id),
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
 
         # ── Persist cumulative sell order count to DB ──
@@ -1904,8 +1945,8 @@ async def _handle_sell_paid(bot, chat_id, order_id):
             scammer_count = get_scammer_count()
             await bot.send_message(
                 chat_id=chat_id,
-                text=f"🔍 *Verifying buyer name before release...*\n👤 `{buyer_name}`",
-                parse_mode="Markdown"
+                text=f"🔍 <b>Verifying buyer name before release...</b>\n👤 <code>{buyer_name}</code>",
+                parse_mode="HTML"
             )
             fraud = await asyncio.get_event_loop().run_in_executor(
                 None, check_buyer_name, buyer_name
@@ -1919,16 +1960,16 @@ async def _handle_sell_paid(bot, chat_id, order_id):
                 await bot.send_message(
                     chat_id=chat_id,
                     text=(
-                        f"🚨 *FRAUD WARNING — DO NOT RELEASE*\n\n"
-                        f"Order: `{order_id}`\n"
-                        f"👤 Buyer: *{buyer_name}*\n"
-                        f"{match_label}: `{fraud['matched_name']}`\n"
-                        f"Similarity: `{fraud['similarity']:.0%}`\n\n"
-                        f"⛔ *Do NOT release coins to this buyer.*\n"
+                        f"🚨 <b>FRAUD WARNING — DO NOT RELEASE</b>\n\n"
+                        f"Order: <code>{order_id}</code>\n"
+                        f"👤 Buyer: <b>{buyer_name}</b>\n"
+                        f"{match_label}: <code>{fraud['matched_name']}</code>\n"
+                        f"Similarity: <code>{fraud['similarity']:.0%}</code>\n\n"
+                        f"⛔ <b>Do NOT release coins to this buyer.</b>\n"
                         f"Fraudulent / chargeback records found.\n\n"
                         f"👉 Open a dispute or request cancellation."
                     ),
-                    parse_mode="Markdown"
+                    parse_mode="HTML"
                 )
                 logger.warning(
                     f"[FraudCheck] 🚨 PAID-STAGE FLAGGED {order_id} | "
@@ -1938,12 +1979,12 @@ async def _handle_sell_paid(bot, chat_id, order_id):
                 await bot.send_message(
                     chat_id=chat_id,
                     text=(
-                        f"✅ *Buyer Verified — Not in fraud list*\n\n"
-                        f"👤 `{buyer_name}`\n"
+                        f"✅ <b>Buyer Verified — Not in fraud list</b>\n\n"
+                        f"👤 <code>{buyer_name}</code>\n"
                         f"_(Checked against {scammer_count} names)_\n\n"
                         f"Safe to release coins."
                     ),
-                    parse_mode="Markdown"
+                    parse_mode="HTML"
                 )
 
     except Exception as e:
@@ -2023,7 +2064,7 @@ async def auto_update_loop(bot, chat_id):
             new_p_str, err = calc_floating_price(sess.ad_data, float_pct, local_usdt_ref)
             if err:
                 await bot.send_message(chat_id=chat_id,
-                    text=f"⚠️ *Cycle {cycle} float error*\n`{err}`", parse_mode="Markdown")
+                    text=f"⚠️ <b>Cycle {cycle} float error</b>\n<code>{_esc(str(err))}</code>", parse_mode="HTML")
                 for _ in range(interval * 60):
                     if not sess.refresh_running: break
                     await asyncio.sleep(1)
@@ -2048,33 +2089,33 @@ async def auto_update_loop(bot, chat_id):
                         sess.current_price = Decimal(bybit_max)
                     await bot.send_message(chat_id=chat_id,
                         text=(
-                            f"✅ *Cycle {cycle}* `{now}`\n"
-                            f"⚠️ Original `{new_p_str}` was out of range\n"
-                            f"💲 Posted Bybit max: `{bybit_max}` ({mode.upper()})"
+                            f"✅ <b>Cycle {cycle}</b> <code>{now}</code>\n"
+                            f"⚠️ Original <code>{new_p_str}</code> was out of range\n"
+                            f"💲 Posted Bybit max: <code>{bybit_max}</code> ({mode.upper()})"
                         ),
-                        parse_mode="Markdown")
+                        parse_mode="HTML")
                 else:
                     await bot.send_message(chat_id=chat_id,
-                        text=f"❌ *Cycle {cycle} retry failed*\n`{retry_code}` — `{retry_msg}`",
-                        parse_mode="Markdown")
+                        text=f"❌ <b>Cycle {cycle} retry failed</b>\n<code>{retry_code}</code> — <code>{retry_msg}</code>",
+                        parse_mode="HTML")
             else:
                 await bot.send_message(chat_id=chat_id,
-                    text=f"❌ *Cycle {cycle} failed*\n`{ret_code}` — `{ret_msg}`",
-                    parse_mode="Markdown")
+                    text=f"❌ <b>Cycle {cycle} failed</b>\n<code>{ret_code}</code> — <code>{ret_msg}</code>",
+                    parse_mode="HTML")
 
         elif ret_code == 0:
             if mode == "fixed":
                 sess.current_price = new_p
             await bot.send_message(chat_id=chat_id,
-                text=f"✅ *Cycle {cycle}* `{now}`\n💲 `{new_p_str}` ({mode.upper()})",
-                parse_mode="Markdown")
+                text=f"✅ <b>Cycle {cycle}</b> <code>{now}</code>\n💲 <code>{new_p_str}</code> ({mode.upper()})",
+                parse_mode="HTML")
         else:
             _ecur = sess.ad_data.get("currencyId","").upper()
             extra = f"\n💱 Update {_ecur}/USDT ref if rate changed" \
                     if (currency_needs_ref(_ecur) or _ecur == "NGN") else ""
             await bot.send_message(chat_id=chat_id,
-                text=f"❌ *Cycle {cycle} failed*\n`{ret_code}` — `{ret_msg}`{extra}",
-                parse_mode="Markdown")
+                text=f"❌ <b>Cycle {cycle} failed</b>\n<code>{ret_code}</code> — <code>{ret_msg}</code>{extra}",
+                parse_mode="HTML")
 
         for _ in range(interval * 60):
             if not sess.refresh_running: break
@@ -2098,12 +2139,12 @@ async def send_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
             photo=BANNER_URL,
             caption=text,
             reply_markup=kb,
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
     except Exception as e:
         logger.warning(f"[Menu] Failed to send photo, falling back to text: {e}")
         await context.bot.send_message(
-            chat_id=chat_id, text=text, reply_markup=kb, parse_mode="Markdown"
+            chat_id=chat_id, text=text, reply_markup=kb, parse_mode="HTML"
         )
 
 
@@ -2112,21 +2153,47 @@ async def edit_menu(query, text: str, keyboard: InlineKeyboardMarkup):
     Tries caption first (photo messages), falls back to text, then sends new message."""
     # Try caption edit (for photo/banner messages)
     try:
-        await query.edit_message_caption(caption=text, reply_markup=keyboard, parse_mode="Markdown")
+        await query.edit_message_caption(caption=text, reply_markup=keyboard, parse_mode="HTML")
         return
     except Exception:
         pass
     # Try text edit (for plain text messages)
     try:
-        await query.edit_message_text(text=text, reply_markup=keyboard, parse_mode="Markdown")
+        await query.edit_message_text(text=text, reply_markup=keyboard, parse_mode="HTML")
         return
     except Exception as e:
         logger.warning(f"[edit_menu] edit failed: {e}")
     # Last resort — send as new message
     try:
-        await query.message.reply_text(text=text, reply_markup=keyboard, parse_mode="Markdown")
+        await query.message.reply_text(text=text, reply_markup=keyboard, parse_mode="HTML")
     except Exception as e:
         logger.error(f"[edit_menu] send fallback also failed: {e}")
+
+
+def _esc(value: str) -> str:
+    """HTML-escape a string so it is safe inside parse_mode='HTML' messages.
+    Escapes &, <, > which are the only three Telegram HTML mode cares about.
+    API keys often contain underscores, dashes, dots — none of those need escaping.
+    """
+    return (value or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+async def edit_menu_html(query, text: str, keyboard: InlineKeyboardMarkup):
+    """Like edit_menu but uses HTML parse mode — safe for raw API keys / UUIDs."""
+    try:
+        await query.edit_message_caption(caption=text, reply_markup=keyboard, parse_mode="HTML")
+        return
+    except Exception:
+        pass
+    try:
+        await query.edit_message_text(text=text, reply_markup=keyboard, parse_mode="HTML")
+        return
+    except Exception as e:
+        logger.warning(f"[edit_menu_html] edit failed: {e}")
+    try:
+        await query.message.reply_text(text=text, reply_markup=keyboard, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"[edit_menu_html] send fallback also failed: {e}")
 
 
 # ─────────────────────────────────────────
@@ -2171,7 +2238,7 @@ async def ping_bybit_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not is_admin(uid) and not creds.get("key"):
         await update.message.reply_text(
             "❌ *No Bybit API set.*\n\nGo to 🔑 *Set APIs* → Set Bybit Account 1 API first.",
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
         return
     slot = str(bybit._active_index + 1)
@@ -2190,29 +2257,35 @@ async def ping_bybit_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         ad_stat   = "✅ Can edit ads" if has_ads and not read_only else \
                     "⚠️ Read only"   if has_ads else "❌ No P2P permission"
         await update.message.reply_text(
-            f"✅ *Bybit Account {slot} API connected!*\n\n"
-            f"🔑 `...{info.get('apiKey','')[-6:]}`\n"
-            f"🔒 Read only: `{'Yes' if read_only else 'No'}`\n"
-            f"🌍 IPs: `{', '.join(ips) if ips else 'None'}`\n\n"
-            f"🔓 *Permissions:*\n" + "\n".join(plines) + f"\n\n🛒 *P2P: {ad_stat}*",
-            parse_mode="Markdown"
+            f"✅ <b>Bybit Account {slot} API connected!</b>\n\n"
+            f"🔑 <code>...{info.get('apiKey','')[-6:]}</code>\n"
+            f"🔒 Read only: <code>{'Yes' if read_only else 'No'}</code>\n"
+            f"🌍 IPs: <code>{', '.join(ips) if ips else 'None'}</code>\n\n"
+            f"🔓 <b>Permissions:</b>\n" + "\n".join(plines) + f"\n\n🛒 <b>P2P: {ad_stat}</b>",
+            parse_mode="HTML"
         )
     else:
         await update.message.reply_text(
-            f"❌ *API failed*\n`{result.get('retMsg','')}`", parse_mode="Markdown"
+            f"❌ <b>API failed</b>\n<code>{_esc(result.get('retMsg',''))}</code>", parse_mode="HTML"
         )
 
 
 async def ping_flutterwave_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Test Flutterwave API — uses the user's own saved FLW secret key from DB."""
-    uid       = update.effective_user.id
+    uid        = update.effective_user.id
     secret_key = db.get_api(uid, "flw_secret_key")
 
     if not secret_key:
         await update.message.reply_text(
-            "❌ *No Flutterwave API set.*\n\nGo to 🔑 *Set APIs* → Set Flutterwave API first.\n\n"
-            "You need to provide:\n`FLW_CLIENT_ID` → `FLW_CLIENT_SECRET` → `FLW_PUBLIC_KEY`",
-            parse_mode="Markdown"
+            "❌ <b>No Flutterwave API set.</b>\n\n"
+            "Go to 🔑 <b>Set APIs</b> → Set Flutterwave API first.\n\n"
+            "You need to provide all 5 credentials:\n"
+            "  FLW_CLIENT_ID\n"
+            "  FLW_CLIENT_SECRET\n"
+            "  FLW_PUBLIC_KEY\n"
+            "  FLW_SECRET_HASH\n"
+            "  FLW_SECRET_KEY",
+            parse_mode="HTML"
         )
         return
 
@@ -2221,26 +2294,31 @@ async def ping_flutterwave_command(update: Update, context: ContextTypes.DEFAULT
     result = await asyncio.get_event_loop().run_in_executor(None, ping_flutterwave, secret_key)
     if "error" in result:
         ip = await _get_current_ip()
+        err_text = _esc(result["error"][:300])
+        ip_safe  = _esc(ip)
         await update.message.reply_text(
-            f"❌ *Flutterwave connection failed*\n\n`{result['error'][:300]}`\n\n"
-            f"• Check your FLW Client Secret starts with `FLWSECK_`\n"
-            f"• Whitelist IP `{ip}` on Flutterwave → Settings → API → IP Whitelist",
-            parse_mode="Markdown"
+            f"❌ <b>Flutterwave connection failed</b>\n\n"
+            f"<code>{err_text}</code>\n\n"
+            f"• Ensure FLW_SECRET_KEY starts with <code>FLWSECK_</code>\n"
+            f"• Whitelist IP <code>{ip_safe}</code> on Flutterwave → Settings → API → IP Whitelist",
+            parse_mode="HTML"
         )
     else:
         banks = result.get("banks", [])
         if banks:
-            lines = [f"✅ *Flutterwave Connected!* `{len(banks)}` Nigerian banks:\n"]
+            lines = [f"✅ <b>Flutterwave Connected!</b> {len(banks)} Nigerian banks:\n"]
             for bank in banks[:60]:
-                lines.append(f"`{bank['code']}` — {bank['name']}")
+                code = _esc(bank.get("code", ""))
+                name = _esc(bank.get("name", ""))
+                lines.append(f"<code>{code}</code> — {name}")
             msg = "\n".join(lines)
             if len(msg) > 4000:
                 msg = msg[:4000] + "\n...(truncated)"
-            await update.message.reply_text(msg, parse_mode="Markdown")
+            await update.message.reply_text(msg, parse_mode="HTML")
         else:
             await update.message.reply_text(
-                "✅ *Flutterwave v3 Connected!*\nSecret key valid ✅\nDynamic bank matching active ✅",
-                parse_mode="Markdown"
+                "✅ <b>Flutterwave v3 Connected!</b>\nSecret key valid ✅\nDynamic bank matching active ✅",
+                parse_mode="HTML"
             )
 
 
@@ -2253,9 +2331,13 @@ async def ping_paga_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not (principal and credential and api_key):
         await update.message.reply_text(
-            "❌ *No Paga API set.*\n\nGo to 🔑 *Set APIs* → Set Paga API first.\n\n"
-            "You need to provide:\n`PAGA_API_KEY` → `PAGA_CREDENTIAL` → `PAGA_PRINCIPAL`",
-            parse_mode="Markdown"
+            "❌ <b>No Paga API set.</b>\n\n"
+            "Go to 🔑 <b>Set APIs</b> → Set Paga API first.\n\n"
+            "You need to provide:\n"
+            "  PAGA_API_KEY\n"
+            "  PAGA_CREDENTIAL\n"
+            "  PAGA_PRINCIPAL",
+            parse_mode="HTML"
         )
         return
 
@@ -2265,29 +2347,34 @@ async def ping_paga_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         None, partial(ping_paga, principal=principal, credential=credential, api_key=api_key)
     )
     if "error" in result:
-        ip = await _get_current_ip()
+        ip      = await _get_current_ip()
+        err_s   = _esc(result["error"][:300])
+        ip_safe = _esc(ip)
         await update.message.reply_text(
-            f"❌ *Paga connection failed*\n\n`{result['error'][:300]}`\n\n"
-            f"• `PAGA_PRINCIPAL` = Public Key / Principal\n"
-            f"• `PAGA_CREDENTIAL` = Live Primary Secret Key\n"
-            f"• `PAGA_API_KEY` = HMAC Hash Key\n"
-            f"• Whitelist IP `{ip}` on Paga dashboard → Settings → IP Whitelist",
-            parse_mode="Markdown"
+            f"❌ <b>Paga connection failed</b>\n\n"
+            f"<code>{err_s}</code>\n\n"
+            f"• <b>PAGA_PRINCIPAL</b> = Public Key / Principal\n"
+            f"• <b>PAGA_CREDENTIAL</b> = Live Primary Secret Key\n"
+            f"• <b>PAGA_API_KEY</b> = HMAC Hash Key\n"
+            f"• Whitelist IP <code>{ip_safe}</code> on Paga dashboard → Settings → IP Whitelist",
+            parse_mode="HTML"
         )
     else:
         banks = result.get("banks", [])
         if banks:
-            lines = [f"✅ *Paga Connected!* `{len(banks)}` banks available:\n"]
+            lines = [f"✅ <b>Paga Connected!</b> {len(banks)} banks available:\n"]
             for bank in banks[:50]:
-                lines.append(f"`{bank.get('uuid','?')[:8]}...` — {bank.get('name','')}")
+                uuid_safe = _esc(bank.get("uuid", "?")[:8])
+                name_safe = _esc(bank.get("name", ""))
+                lines.append(f"<code>{uuid_safe}...</code> — {name_safe}")
             msg = "\n".join(lines)
             if len(msg) > 4000:
                 msg = msg[:4000] + "\n...(truncated)"
-            await update.message.reply_text(msg, parse_mode="Markdown")
+            await update.message.reply_text(msg, parse_mode="HTML")
         else:
             await update.message.reply_text(
-                "✅ *Paga Connected!*\nCredentials valid ✅\nDynamic bank UUID matching active ✅",
-                parse_mode="Markdown"
+                "✅ <b>Paga Connected!</b>\nCredentials valid ✅\nDynamic bank UUID matching active ✅",
+                parse_mode="HTML"
             )
 
 
@@ -2398,7 +2485,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
     # ── 🌍 Get My IP ──
     elif data == "get_my_ip":
-        await query.edit_message_caption(caption="⏳ Fetching public IP...", parse_mode="Markdown") \
+        await query.edit_message_caption(caption="⏳ Fetching public IP...", parse_mode="HTML") \
             if query.message.photo else await query.edit_message_text("⏳ Fetching public IP...")
         import requests as _req
         ip = None
@@ -2409,13 +2496,13 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             except Exception:
                 continue
         txt = (
-            f"🌍 *Public IP Address*\n\n`{ip}`\n\n"
+            f"🌍 <b>Public IP Address</b>\n\n<code>{ip}</code>\n\n"
             "👉 Add this to your Bybit API whitelist if it changed."
         ) if ip else "❌ Could not fetch IP. Try again."
         try:
-            await query.edit_message_caption(caption=txt, reply_markup=InlineKeyboardMarkup(back_main()), parse_mode="Markdown")
+            await query.edit_message_caption(caption=txt, reply_markup=InlineKeyboardMarkup(back_main()), parse_mode="HTML")
         except Exception:
-            await query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(back_main()), parse_mode="Markdown")
+            await query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(back_main()), parse_mode="HTML")
 
     # ── 🔑 Switch Account ──
     elif data.startswith("switch_account_"):
@@ -2436,7 +2523,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             _s(tuser.id).settings[k] = v
         acct = accounts[idx]
         await edit_menu(query,
-            f"✅ *Switched to {acct['label']}*\n\nAll session data cleared.\n\n" + main_menu_text(tuser.id),
+            f"✅ <b>Switched to {acct['label']}</b>\n\nAll session data cleared.\n\n" + main_menu_text(tuser.id),
             main_menu_keyboard(tuser.id)
         )
 
@@ -2459,19 +2546,19 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         bp_s = f"🛡 ON ({_s(tuser.id).buyer_protection_mins}min)" if _s(tuser.id).buyer_protection_on else "🛡 OFF"
         nm_s = "🔍 ON" if _s(tuser.id).name_match_enabled else "🔍 OFF"
         txt = (
-            f"📡 *Bot Status*\n\n"
-            f"🔑 Active: *{get_active_account()['label']}*\n"
-            f"Setup: {bar} `{done}/{total}`\n\n"
+            f"📡 <b>Bot Status</b>\n\n"
+            f"🔑 Active: <b>{get_active_account()['label']}</b>\n"
+            f"Setup: {bar} <code>{done}/{total}</code>\n\n"
             f"📊 Price Bot: {r_status}\n"
             f"📦 Order Monitor: {o_status}\n"
             f"💳 Auto-Pay: {'ON' if _s(tuser.id).auto_pay_enabled else 'OFF'}\n"
             f"💸 FLW Pay: {'ON' if _s(tuser.id).flw_pay_enabled else 'OFF'}\n"
             f"{bp_s} | {nm_s}\n\n"
-            f"🆔 Ad: `{_s(tuser.id).settings.get('ad_id') or 'Not set'}`\n"
-            f"🔀 Mode: `{_s(tuser.id).settings.get('mode','fixed').upper()}`\n"
-            f"⏱ Interval: `{_s(tuser.id).settings.get('interval',2)} min`\n\n"
-            f"BUY seen: `{len(_s(tuser.id).seen_order_ids)}` | Paid: `{len(_s(tuser.id).paid_order_ids)}`\n"
-            f"SELL seen: `{len(_s(tuser.id).seen_sell_ids)}` | Released: `{len(_s(tuser.id).released_ids)}`"
+            f"🆔 Ad: <code>{_s(tuser.id).settings.get('ad_id') or 'Not set'}</code>\n"
+            f"🔀 Mode: <code>{_s(tuser.id).settings.get('mode','fixed').upper()}</code>\n"
+            f"⏱ Interval: <code>{_s(tuser.id).settings.get('interval',2)} min</code>\n\n"
+            f"BUY seen: <code>{len(_s(tuser.id).seen_order_ids)}</code> | Paid: <code>{len(_s(tuser.id).paid_order_ids)}</code>\n"
+            f"SELL seen: <code>{len(_s(tuser.id).seen_sell_ids)}</code> | Released: <code>{len(_s(tuser.id).released_ids)}</code>"
         )
         await edit_menu(query, txt, InlineKeyboardMarkup(back_main()))
 
@@ -2556,7 +2643,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         _s(tuser.id).buyer_protection_on = not _s(tuser.id).buyer_protection_on
         status = "✅ ON" if _s(tuser.id).buyer_protection_on else "❌ OFF"
         await edit_menu(query,
-            f"🛡 *Buyer Protection {status}*\n\nThreshold: `{_s(tuser.id).buyer_protection_mins} min`\n\n"
+            f"🛡 <b>Buyer Protection {status}</b>\n\nThreshold: <code>{_s(tuser.id).buyer_protection_mins} min</code>\n\n"
             + buyer_protection_menu_text(tuser.id),
             buyer_protection_menu_keyboard(tuser.id)
         )
@@ -2565,7 +2652,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         mins = int(data.split("_")[-1])
         _s(tuser.id).buyer_protection_mins = mins
         await edit_menu(query,
-            f"✅ *Buyer Protection threshold set to `{mins} min`*\n\n" + buyer_protection_menu_text(tuser.id),
+            f"✅ <b>Buyer Protection threshold set to <code>{mins} min</code></b>\n\n" + buyer_protection_menu_text(tuser.id),
             buyer_protection_menu_keyboard(tuser.id)
         )
 
@@ -2573,8 +2660,8 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         user_state["action"]       = "bp_custom_threshold"
         _btn_state["prev_section"] = "buyer_protection_menu"
         await edit_menu(query,
-            f"✏️ *Custom Buyer Protection Threshold*\n\n"
-            f"Current: `{_s(tuser.id).buyer_protection_mins} min`\n\n"
+            f"✏️ <b>Custom Buyer Protection Threshold</b>\n\n"
+            f"Current: <code>{_s(tuser.id).buyer_protection_mins} min</code>\n\n"
             "Send the number of minutes you want to use as the threshold.\n"
             "Example: `25`",
             InlineKeyboardMarkup(back_section("section_autopay"))
@@ -2585,7 +2672,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         _s(tuser.id).name_match_enabled = not _s(tuser.id).name_match_enabled
         status = "✅ ON" if _s(tuser.id).name_match_enabled else "❌ OFF"
         await edit_menu(query,
-            f"🔍 *Name Match {status}*\n\n"
+            f"🔍 <b>Name Match {status}</b>\n\n"
             + ("When enabled, if the bot detects no account name or account number "
                "on a BUY order, it will:\n\n"
                "  • Mark the order as paid on Bybit\n"
@@ -2609,11 +2696,14 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
     # ── 🟢 Toggle Flutterwave Pay ──
     elif data == "toggle_flw_pay":
         if not _s(tuser.id).flw_pay_enabled:
-            # All users (including admin) must have FLW key in DB
-            _flw_key = db.get_api(tuser.id, "flw_secret_key")
-            if not _flw_key:
+            # All users (including admin) must have all 5 FLW keys in DB
+            _flw_ready = all(db.get_api(tuser.id, k) for k in (
+                "flw_client_id", "flw_client_secret", "flw_public_key",
+                "flw_secret_hash", "flw_secret_key"
+            ))
+            if not _flw_ready:
                 await query.answer(
-                    "❌ No Flutterwave API saved. Go to 🔑 Set APIs → Set Flutterwave API first.",
+                    "❌ Flutterwave API incomplete. Go to 🔑 Set APIs → Set Flutterwave API and enter all 5 credentials.",
                     show_alert=True
                 )
                 return
@@ -2666,9 +2756,9 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         _btn_state["prev_section"] = "section_autopay"
         cur = _s(tuser.id).settings.get("sender_name", "Not set")
         await edit_menu(query,
-            f"✏️ *Set Your Sender Name*\n\nCurrent: `{cur}`\n\n"
+            f"✏️ <b>Set Your Sender Name</b>\n\nCurrent: <code>{cur}</code>\n\n"
             "This name appears in the Flutterwave transfer narration:\n"
-            f"`[Your Name] payment to [Receiver Name]`\n\n"
+            f"<code>[Your Name] payment to [Receiver Name]</code>\n\n"
             "Send your full name — e.g. `Akinrinade Akinniyi`",
             InlineKeyboardMarkup(back_section("section_autopay"))
         )
@@ -2687,9 +2777,9 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         lines = [f"📋 *Unpaid Orders ({len(_s(tuser.id).unpaid_log)}):*\n"]
         for i, entry in enumerate(_s(tuser.id).unpaid_log[-20:], 1):
             lines.append(
-                f"*{i}.* `{entry['order_id']}`\n"
-                f"  👤 `{entry.get('account_no','—')}` ({entry.get('bank','—')})\n"
-                f"  💵 `{entry.get('amount',0):,.2f} NGN`\n"
+                f"<b>{i}.</b> <code>{entry['order_id']}</code>\n"
+                f"  👤 <code>{entry.get('account_no','—')}</code> ({entry.get('bank','—')})\n"
+                f"  💵 <code>{entry.get('amount',0):,.2f} NGN</code>\n"
                 f"  ❌ {entry.get('reason','Unknown')}\n"
                 f"  🕐 {entry.get('timestamp','')}\n"
             )
@@ -2745,15 +2835,15 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         await context.bot.send_message(
             chat_id=chat_id,
             text=(
-                f"↩️ *Reply to {nick}*\n"
-                f"Order: `{order_id}`\n\n"
+                f"↩️ <b>Reply to {nick}</b>\n"
+                f"Order: <code>{order_id}</code>\n\n"
                 "Type your message and send it.\n"
                 "_Tap ❌ Cancel to cancel._"
             ),
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton("❌ Cancel Reply", callback_data="cancel_chat_reply")
             ]]),
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
 
     # ── ❌ Cancel Chat Reply ──
@@ -2820,7 +2910,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         _btn_state["prev_section"] = "section_orders"
         cur = _s(tuser.id).sell_custom_msg[:80] + "..." if len(_s(tuser.id).sell_custom_msg) > 80 else _s(tuser.id).sell_custom_msg
         await edit_menu(query,
-            f"✏️ *Set Sell Order Message*\n\nCurrent:\n_{cur}_\n\n"
+            f"✏️ <b>Set Sell Order Message</b>\n\nCurrent:\n_{cur}_\n\n"
             "Send your new custom message to send to buyers on SELL orders.",
             InlineKeyboardMarkup(back_section("section_orders"))
         )
@@ -2830,7 +2920,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         _btn_state["action"]       = "sell_msg_count"
         _btn_state["prev_section"] = "section_orders"
         await edit_menu(query,
-            f"🔢 *Set Message Count*\n\nCurrent: `{_s(tuser.id).sell_msg_count}x`\n\n"
+            f"🔢 <b>Set Message Count</b>\n\nCurrent: <code>{_s(tuser.id).sell_msg_count}x</code>\n\n"
             "How many times to send to buyer? (1–5)",
             InlineKeyboardMarkup(back_section("section_orders"))
         )
@@ -2841,7 +2931,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         _btn_state["prev_section"] = "section_ads"
         cur = _s(tuser.id).settings.get("ad_id","") or "Not set"
         await edit_menu(query,
-            f"🆔 *Set Ad ID*\n\nCurrent: `{cur}`\n\n"
+            f"🆔 <b>Set Ad ID</b>\n\nCurrent: <code>{cur}</code>\n\n"
             "Send your Bybit Ad ID.\n💡 Use 📃 My Ads List to find it.\n\n"
             "Example: `2040156088201854976`",
             InlineKeyboardMarkup(back_section("section_ads"))
@@ -2853,7 +2943,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         _btn_state["prev_section"] = "section_ads"
         cur = _s(tuser.id).settings.get("bybit_uid","") or "Not set"
         await edit_menu(query,
-            f"👤 *Set Bybit UID*\n\nCurrent: `{cur}`\n\n"
+            f"👤 <b>Set Bybit UID</b>\n\nCurrent: <code>{cur}</code>\n\n"
             "Bybit App → Profile → copy UID under your username.\n\n"
             "Example: `520097760`",
             InlineKeyboardMarkup(back_section("section_ads"))
@@ -2888,8 +2978,8 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 side  = "BUY" if str(item.get("side","")) == "0" else "SELL"
                 stat  = {10:"🟢",20:"🔴",30:"✅"}.get(item.get("status",0),"❓")
                 lines.append(
-                    f"{stat} *{side}* `{item.get('tokenId','')}/{item.get('currencyId','')}`"
-                    f" | 💲`{item.get('price','')}`\n🆔 `{item.get('id','')}`\n"
+                    f"{stat} <b>{side}</b> <code>{item.get('tokenId','')}/{item.get('currencyId','')}</code>"
+                    f" | 💲<code>{item.get('price','')}</code>\n🆔 <code>{item.get('id','')}</code>\n"
                 )
             if len(lines) == 1: lines.append("No ads match your UID.")
             lines.append("\n_Tap any ID to copy → use 🆔 Set Ad ID_")
@@ -2898,7 +2988,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             await edit_menu(query, msg, InlineKeyboardMarkup(back_section("section_ads")))
         else:
             await edit_menu(query,
-                f"❌ `{result.get('retMsg',result.get('ret_msg',''))}`",
+                f"❌ <code>{result.get('retMsg',result.get('ret_msg',''))}</code>",
                 InlineKeyboardMarkup(back_section("section_ads"))
             )
 
@@ -2927,17 +3017,17 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             max_pct  = get_max_float_pct(currency, token)
             ad_stat  = {10:"🟢 Online",20:"🔴 Offline",30:"✅ Done"}.get(_s(tuser.id).ad_data.get("status"),"?")
             await edit_menu(query,
-                f"✅ *Ad Loaded!*\n\n"
-                f"🆔 `{_s(tuser.id).settings['ad_id']}`\n"
-                f"💱 `{token}/{currency}` | 💲 `{_s(tuser.id).ad_data.get('price','')}`\n"
-                f"Min: `{_s(tuser.id).ad_data.get('minAmount','')}` | Max: `{_s(tuser.id).ad_data.get('maxAmount','')}` | Qty: `{_s(tuser.id).ad_data.get('lastQuantity','')}`\n"
-                f"Status: {ad_stat} | Max float: `{max_pct}%`\n\n"
+                f"✅ <b>Ad Loaded!</b>\n\n"
+                f"🆔 <code>{_s(tuser.id).settings['ad_id']}</code>\n"
+                f"💱 <code>{token}/{currency}</code> | 💲 <code>{_s(tuser.id).ad_data.get('price','')}</code>\n"
+                f"Min: <code>{_s(tuser.id).ad_data.get('minAmount','')}</code> | Max: <code>{_s(tuser.id).ad_data.get('maxAmount','')}</code> | Qty: <code>{_s(tuser.id).ad_data.get('lastQuantity','')}</code>\n"
+                f"Status: {ad_stat} | Max float: <code>{max_pct}%</code>\n\n"
                 f"_{next_setup_hint(tuser.id)}_",
                 InlineKeyboardMarkup(back_section("section_ads"))
             )
         else:
             await edit_menu(query,
-                f"❌ `{result.get('retMsg',result.get('ret_msg',''))}`",
+                f"❌ <code>{result.get('retMsg',result.get('ret_msg',''))}</code>",
                 InlineKeyboardMarkup(back_section("section_ads"))
             )
 
@@ -2947,7 +3037,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         _s(tuser.id).settings["mode"] = new_mode
         note = " (takes effect next cycle)" if _s(tuser.id).refresh_running else ""
         await edit_menu(query,
-            f"🔀 *Switched to {new_mode.upper()}{note}*\n\n_{next_setup_hint(tuser.id)}_",
+            f"🔀 <b>Switched to {new_mode.upper()}{note}</b>\n\n_{next_setup_hint(tuser.id)}_",
             InlineKeyboardMarkup(back_section("section_ads"))
         )
 
@@ -2956,7 +3046,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         _btn_state["action"]       = "increment"
         _btn_state["prev_section"] = "section_ads"
         await edit_menu(query,
-            f"➕ *Set Increment*\n\nCurrent: `+{_s(tuser.id).settings.get('increment','0.05')}` per cycle\n\n"
+            f"➕ <b>Set Increment</b>\n\nCurrent: <code>+{_s(tuser.id).settings.get('increment','0.05')}</code> per cycle\n\n"
             "Send the amount to add each cycle.\nExamples: `0.05` | `1` | `0.5`",
             InlineKeyboardMarkup(back_section("section_ads"))
         )
@@ -2975,14 +3065,14 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         _btn_state["prev_section"] = "section_ads"
         cur = _s(tuser.id).settings.get("float_pct","") or "Not set"
         formula = (
-            f"`{token}/USDT × {currency}/USDT ref × your% ÷ 100`"
+            f"<code>{token}/USDT × {currency}/USDT ref × your% ÷ 100</code>"
             if needs_ref else
-            f"`{token}/USDT × your% ÷ 100`"
+            f"<code>{token}/USDT × your% ÷ 100</code>"
         )
         await edit_menu(query,
-            f"📊 *Set Float %*\n\nPair: `{token}/{currency}` | Range: `{min_pct}%–{max_pct}%`\nCurrent: `{cur}`\n\n"
+            f"📊 <b>Set Float %</b>\n\nPair: <code>{token}/{currency}</code> | Range: <code>{min_pct}%–{max_pct}%</code>\nCurrent: <code>{cur}</code>\n\n"
             f"Formula: {formula}\n\n"
-            f"Send a value between `{min_pct}` and `{max_pct}`. Example: `105`",
+            f"Send a value between <code>{min_pct}</code> and <code>{max_pct}</code>. Example: <code>105</code>",
             InlineKeyboardMarkup(back_section("section_ads"))
         )
 
@@ -2993,9 +3083,9 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         _rcur = _s(tuser.id).ad_data.get("currencyId","NGN").upper() if _s(tuser.id).ad_data else "NGN"
         cur   = _s(tuser.id).settings.get("local_usdt_ref","") or "Not set"
         await edit_menu(query,
-            f"💱 *{_rcur}/USDT Reference Price*\n\nCurrent: `{cur}`\n\n"
+            f"💱 <b>{_rcur}/USDT Reference Price</b>\n\nCurrent: <code>{cur}</code>\n\n"
             f"Check Bybit P2P market for current {_rcur}/USDT rate.\n"
-            f"Example: `{'1580' if _rcur == 'NGN' else '1.25' if _rcur == 'EUR' else '100'}` ({_rcur} per 1 USDT)",
+            f"Example: <code>{'1580' if _rcur == 'NGN' else '1.25' if _rcur == 'EUR' else '100'}</code> ({_rcur} per 1 USDT)",
             InlineKeyboardMarkup(back_section("section_ads"))
         )
 
@@ -3004,7 +3094,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         _btn_state["action"]       = "interval"
         _btn_state["prev_section"] = "section_ads"
         await edit_menu(query,
-            f"⏱ *Set Interval*\n\nCurrent: every `{_s(tuser.id).settings.get('interval',2)}` min\n\n"
+            f"⏱ <b>Set Interval</b>\n\nCurrent: every <code>{_s(tuser.id).settings.get('interval',2)}</code> min\n\n"
             "Send minutes between each price update.\nExamples: `2` | `5` | `10`",
             InlineKeyboardMarkup(back_section("section_ads"))
         )
@@ -3043,7 +3133,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 price = bybit_max
         if rc == 0:
             await edit_menu(query,
-                f"✅ *Updated!* Price: `{price}` ({mode.upper()})\n\n_{next_setup_hint(tuser.id)}_",
+                f"✅ <b>Updated!</b> Price: <code>{price}</code> ({mode.upper()})\n\n_{next_setup_hint(tuser.id)}_",
                 InlineKeyboardMarkup(back_section("section_ads"))
             )
         else:
@@ -3061,12 +3151,12 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         else:
             loaded = "\n_No ad fetched yet._"
         await edit_menu(query,
-            f"📢 *Post / Remove Ad Manager*\n\n"
+            f"📢 <b>Post / Remove Ad Manager</b>\n\n"
             f"⚠️ Completely separate from Auto-Update.\n"
             f"Setting IDs here will NOT affect your auto-price bot.\n\n"
             f"{cur_id_line}{loaded}\n\n"
-            f"• *Post Ad* — brings a paused/offline ad back online (same ID)\n"
-            f"• *Remove Ad* — pauses/takes an online ad offline (same ID)",
+            f"• <b>Post Ad</b> — brings a paused/offline ad back online (same ID)\n"
+            f"• <b>Remove Ad</b> — pauses/takes an online ad offline (same ID)",
             InlineKeyboardMarkup([
                 [InlineKeyboardButton("🆔 Set Manage Ad ID",       callback_data="set_manage_ad_id")],
                 [InlineKeyboardButton("📋 Fetch Manage Ad",        callback_data="fetch_manage_ad")],
@@ -3082,11 +3172,11 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         cur     = _s(tuser.id).settings.get("manage_ad_id", "") or "Not set"
         auto_id = _s(tuser.id).settings.get("ad_id", "not set")
         await edit_menu(query,
-            f"🆔 *Set Manage Ad ID*\n\n"
-            f"Current Manage Ad ID: `{cur}`\n"
-            f"Auto-Update Ad ID: `{auto_id}` (unchanged)\n\n"
+            f"🆔 <b>Set Manage Ad ID</b>\n\n"
+            f"Current Manage Ad ID: <code>{cur}</code>\n"
+            f"Auto-Update Ad ID: <code>{auto_id}</code> (unchanged)\n\n"
             f"Send the Bybit Ad ID you want to post or remove.\n"
-            f"Example: `2040156088201854976`",
+            f"Example: <code>2040156088201854976</code>",
             InlineKeyboardMarkup(back_manager())
         )
 
@@ -3106,13 +3196,13 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             side_val = "BUY" if str(mdata.get("side", "1")) == "0" else "SELL"
             stat     = {10:"🟢 Online", 20:"🔴 Offline", 30:"✅ Done"}.get(mdata.get("status"), "?")
             await edit_menu(query,
-                f"✅ *Manage Ad Loaded!*\n\n"
-                f"🆔 `{manage_id}`\n"
-                f"💱 `{token}/{currency}` | Side: `{side_val}`\n"
-                f"💲 Price: `{mdata.get('price','—')}` | Qty: `{mdata.get('lastQuantity', mdata.get('quantity','—'))}`\n"
-                f"Min: `{mdata.get('minAmount','—')}` | Max: `{mdata.get('maxAmount','—')}`\n"
+                f"✅ <b>Manage Ad Loaded!</b>\n\n"
+                f"🆔 <code>{manage_id}</code>\n"
+                f"💱 <code>{token}/{currency}</code> | Side: <code>{side_val}</code>\n"
+                f"💲 Price: <code>{mdata.get('price','—')}</code> | Qty: <code>{mdata.get('lastQuantity', mdata.get('quantity','—'))}</code>\n"
+                f"Min: <code>{mdata.get('minAmount','—')}</code> | Max: <code>{mdata.get('maxAmount','—')}</code>\n"
                 f"Status: {stat}\n\n"
-                f"_Tap Post Ad if offline, or Remove Ad if online._",
+                f"<i>Tap Post Ad if offline, or Remove Ad if online.</i>",
                 InlineKeyboardMarkup([
                     [InlineKeyboardButton("🟢 Post Ad (go online)",    callback_data="post_ad_do")],
                     [InlineKeyboardButton("🔴 Remove Ad (go offline)", callback_data="remove_ad_confirm")],
@@ -3121,7 +3211,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             )
         else:
             await edit_menu(query,
-                f"❌ `{result.get('retMsg', result.get('ret_msg',''))}`",
+                f"❌ <code>{result.get('retMsg', result.get('ret_msg',''))}</code>",
                 InlineKeyboardMarkup(back_manager())
             )
 
@@ -3141,15 +3231,15 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             if fresh.get("retCode", -1) == 0:
                 _s(tuser.id).settings["manage_ad_data"] = fresh.get("result", mdata)
             await edit_menu(query,
-                f"✅ *Ad is now Online!*\n\n"
-                f"🆔 Ad ID: `{manage_id}` (same — unchanged)\n"
+                f"✅ <b>Ad is now Online!</b>\n\n"
+                f"🆔 Ad ID: <code>{manage_id}</code> (same — unchanged)\n"
                 f"Your ad is live on Bybit P2P.\n\n"
-                f"Auto-Update Ad ID: `{_s(tuser.id).settings.get('ad_id','not set')}` — unchanged.",
+                f"Auto-Update Ad ID: <code>{_s(tuser.id).settings.get('ad_id','not set')}</code> — unchanged.",
                 InlineKeyboardMarkup(back_manager())
             )
         else:
             await edit_menu(query,
-                f"❌ *Failed to post ad online*\n\nCode: `{rc}`\nMessage: `{rm}`",
+                f"❌ <b>Failed to post ad online</b>\n\nCode: <code>{rc}</code>\nMessage: <code>{rm}</code>",
                 InlineKeyboardMarkup(back_manager())
             )
 
@@ -3164,13 +3254,13 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             return
         auto_id   = _s(tuser.id).settings.get("ad_id", "")
         same_warn = (
-            f"\n\n⚠️ *This is also your Auto-Update Ad ID.*\n"
+            f"\n\n⚠️ <b>This is also your Auto-Update Ad ID.</b>\n"
             f"Stop auto-price update manually if needed."
         ) if manage_id == auto_id else ""
         await edit_menu(query,
-            f"🔴 *Remove Ad (go offline)?*\n\n"
-            f"Manage Ad ID: `{manage_id}`\n"
-            f"Auto-Update Ad ID: `{auto_id or 'not set'}` (unchanged)\n"
+            f"🔴 <b>Remove Ad (go offline)?</b>\n\n"
+            f"Manage Ad ID: <code>{manage_id}</code>\n"
+            f"Auto-Update Ad ID: <code>{auto_id or 'not set'}</code> (unchanged)\n"
             f"{same_warn}\n\n"
             f"Ad will be paused/taken offline. Same ID — not permanently deleted.\n"
             f"Bring it back online anytime with Post Ad.",
@@ -3195,15 +3285,15 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             if fresh.get("retCode", -1) == 0:
                 _s(tuser.id).settings["manage_ad_data"] = fresh.get("result", mdata)
             await edit_menu(query,
-                f"✅ *Ad is now Offline (Paused)!*\n\n"
-                f"🆔 Ad ID: `{manage_id}` (same — not deleted)\n"
+                f"✅ <b>Ad is now Offline (Paused)!</b>\n\n"
+                f"🆔 Ad ID: <code>{manage_id}</code> (same — not deleted)\n"
                 f"Bring it back online anytime using Post Ad.\n\n"
-                f"Auto-Update Ad ID: `{_s(tuser.id).settings.get('ad_id','not set')}` — unchanged.",
+                f"Auto-Update Ad ID: <code>{_s(tuser.id).settings.get('ad_id','not set')}</code> — unchanged.",
                 InlineKeyboardMarkup(back_manager())
             )
         else:
             await edit_menu(query,
-                f"❌ *Failed to take ad offline*\n\nCode: `{rc}`\nMessage: `{rm}`",
+                f"❌ <b>Failed to take ad offline</b>\n\nCode: <code>{rc}</code>\nMessage: <code>{rm}</code>",
                 InlineKeyboardMarkup(back_manager())
             )
 
@@ -3213,17 +3303,22 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         uid  = query.from_user.id
         bk1  = "✅" if db.get_api(uid, "bybit_key_1")    else "❌"
         bk2  = "✅" if db.get_api(uid, "bybit_key_2")    else "❌"
-        fk   = "✅" if db.get_api(uid, "flw_secret_key")  else "❌"
+        # FLW is fully configured only when all 5 keys are saved
+        flw_keys = all(db.get_api(uid, k) for k in (
+            "flw_client_id", "flw_client_secret", "flw_public_key",
+            "flw_secret_hash", "flw_secret_key"
+        ))
+        fk   = "✅" if flw_keys else "❌"
         pk   = "✅" if db.get_api(uid, "paga_principal") else "❌"
-        await edit_menu(query,
-            f"🔑 *API Setup*\n\n"
+        await edit_menu_html(query,
+            f"🔑 <b>API Setup</b>\n\n"
             f"Your API keys are stored securely on the server.\n\n"
             f"Bybit Account 1 API: {bk1}\n"
             f"Bybit Account 2 API: {bk2}\n"
-            f"Flutterwave API: {fk}\n"
+            f"Flutterwave API (5 keys): {fk}\n"
             f"Paga API: {pk}\n\n"
-            f"⚠️ Keys are encrypted per user and never shared.\n"
-            f"⚠️ Both FLW and Paga are shared across both Bybit accounts.",
+            f"⚠️ Keys are stored per user and never shared.\n"
+            f"⚠️ FLW and Paga work across both Bybit accounts.",
             InlineKeyboardMarkup([
                 [InlineKeyboardButton(f"🔑 {bk1} Set Bybit Account 1 API", callback_data="set_api_bybit_1")],
                 [InlineKeyboardButton(f"🔑 {bk2} Set Bybit Account 2 API", callback_data="set_api_bybit_2")],
@@ -3242,7 +3337,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         uid = query.from_user.id
         has = bool(db.get_api(uid, "bybit_key_1"))
         await edit_menu(query,
-            f"🔑 *Set Bybit Account 1 API Key*\n\n"
+            f"🔑 <b>Set Bybit Account 1 API Key</b>\n\n"
             f"Status: {'✅ Key saved — new key will replace it' if has else '❌ Not set'}\n\n"
             "Send your Bybit API Key for Account 1.",
             InlineKeyboardMarkup(back_section("section_apis"))
@@ -3255,7 +3350,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         uid = query.from_user.id
         has = bool(db.get_api(uid, "bybit_key_1"))
         await edit_menu(query,
-            f"🔑 *Set Bybit Account 1 API Key*\n\n"
+            f"🔑 <b>Set Bybit Account 1 API Key</b>\n\n"
             f"Status: {'✅ Key saved — new key will replace it' if has else '❌ Not set'}\n\n"
             "Send your Bybit API Key for Account 1.",
             InlineKeyboardMarkup(back_section("section_apis"))
@@ -3268,7 +3363,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         uid = query.from_user.id
         has = bool(db.get_api(uid, "bybit_key_2"))
         await edit_menu(query,
-            f"🔑 *Set Bybit Account 2 API Key*\n\n"
+            f"🔑 <b>Set Bybit Account 2 API Key</b>\n\n"
             f"Status: {'✅ Key saved — new key will replace it' if has else '❌ Not set'}\n\n"
             "Send your Bybit API Key for Account 2.",
             InlineKeyboardMarkup(back_section("section_apis"))
@@ -3279,10 +3374,18 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         _btn_state["prev_section"] = "section_apis"
         uid = query.from_user.id
         has = bool(db.get_api(uid, "flw_secret_key"))
-        await edit_menu(query,
-            f"🟢 *Set Flutterwave API*\n\n"
-            f"Status: {'✅ Already configured — new values will replace it' if has else '❌ Not set'}\n\n"
-            "Step 1 of 3: Send your *FLW_CLIENT_ID*\n_(from Flutterwave dashboard → API Keys)_",
+        status_line = "✅ Already configured — new values will replace existing ones" if has else "❌ Not yet configured"
+        await edit_menu_html(query,
+            f"🟢 <b>Set Flutterwave API</b>\n\n"
+            f"Status: {status_line}\n\n"
+            f"You will enter <b>5 credentials</b> one at a time:\n"
+            f"  1️⃣ FLW_CLIENT_ID\n"
+            f"  2️⃣ FLW_CLIENT_SECRET\n"
+            f"  3️⃣ FLW_PUBLIC_KEY\n"
+            f"  4️⃣ FLW_SECRET_HASH\n"
+            f"  5️⃣ FLW_SECRET_KEY\n\n"
+            f"<b>Step 1 of 5:</b> Send your <b>FLW_CLIENT_ID</b>\n"
+            f"<i>(Flutterwave dashboard → Settings → API)</i>",
             InlineKeyboardMarkup(back_section("section_apis"))
         )
 
@@ -3292,7 +3395,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         uid = query.from_user.id
         has = bool(db.get_api(uid, "paga_principal"))
         await edit_menu(query,
-            f"🟡 *Set Paga API*\n\n"
+            f"🟡 <b>Set Paga API</b>\n\n"
             f"Status: {'✅ Already configured — new values will replace it' if has else '❌ Not set'}\n\n"
             "Step 1 of 3: Send your *PAGA_API_KEY*\n_(HMAC Hash Key from Paga dashboard)_",
             InlineKeyboardMarkup(back_section("section_apis"))
@@ -3305,7 +3408,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         fk  = "✅" if db.get_api(uid_d, "flw_secret_key")  else "—"
         pk  = "✅" if db.get_api(uid_d, "paga_principal") else "—"
         await edit_menu(query,
-            f"🗑 *Delete API Keys*\n\n"
+            f"🗑 <b>Delete API Keys</b>\n\n"
             f"Choose which keys to delete. This cannot be undone.\n\n"
             f"Bybit Account 1: {bk1}\n"
             f"Bybit Account 2: {bk2}\n"
@@ -3336,7 +3439,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         uid_d = query.from_user.id
         has   = bool(db.get_api(uid_d, "bybit_key_1"))
         await edit_menu(query,
-            f"🔑 *Delete Bybit Account 1 API?*\n\n"
+            f"🔑 <b>Delete Bybit Account 1 API?</b>\n\n"
             f"Status: {'✅ Saved' if has else '❌ Already empty'}\n\n"
             "This permanently removes your Account 1 API key and secret.",
             InlineKeyboardMarkup([
@@ -3361,7 +3464,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         uid_d = query.from_user.id
         has   = bool(db.get_api(uid_d, "bybit_key_2"))
         await edit_menu(query,
-            f"🔑 *Delete Bybit Account 2 API?*\n\n"
+            f"🔑 <b>Delete Bybit Account 2 API?</b>\n\n"
             f"Status: {'✅ Saved' if has else '❌ Already empty'}\n\n"
             "This permanently removes your Account 2 API key and secret.",
             InlineKeyboardMarkup([
@@ -3385,10 +3488,12 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
     elif data == "delete_flw_apis":
         uid_d = query.from_user.id
         has   = bool(db.get_api(uid_d, "flw_secret_key"))
-        await edit_menu(query,
-            f"🟢 *Delete Flutterwave API?*\n\n"
-            f"Status: {'✅ Saved' if has else '❌ Already empty'}\n\n"
-            "This permanently removes your FLW Client ID, Client Secret and Public Key.",
+        status_str = "✅ Saved" if has else "❌ Already empty"
+        await edit_menu_html(query,
+            f"🟢 <b>Delete Flutterwave API?</b>\n\n"
+            f"Status: {status_str}\n\n"
+            "This permanently removes all 5 FLW credentials:\n"
+            "FLW_CLIENT_ID, FLW_CLIENT_SECRET, FLW_PUBLIC_KEY, FLW_SECRET_HASH, FLW_SECRET_KEY",
             InlineKeyboardMarkup([
                 [InlineKeyboardButton("✅ Yes, Delete", callback_data="delete_flw_confirm")],
                 [InlineKeyboardButton("❌ Cancel",       callback_data="delete_apis")],
@@ -3397,11 +3502,13 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
     elif data == "delete_flw_confirm":
         uid_del = query.from_user.id
-        for k in ("flw_client_id", "flw_client_secret", "flw_secret_key", "flw_public_key"):
+        for k in ("flw_client_id", "flw_client_secret", "flw_public_key",
+                  "flw_secret_hash", "flw_secret_key"):
             db.save_api(uid_del, k, "")
-        logger.info(f"[APIs] FLW keys deleted for user {uid_del}")
-        await edit_menu(query,
-            "✅ *Flutterwave API deleted.*\n\nYou can re-add it anytime via 🔑 Set APIs.",
+        logger.info(f"[APIs] All FLW keys deleted for user {uid_del}")
+        await edit_menu_html(query,
+            "✅ <b>Flutterwave API deleted.</b>\n\nAll 5 credentials removed.\n"
+            "You can re-add them anytime via 🔑 Set APIs.",
             InlineKeyboardMarkup([*back_section("section_apis")])
         )
 
@@ -3409,7 +3516,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         uid_d = query.from_user.id
         has   = bool(db.get_api(uid_d, "paga_principal"))
         await edit_menu(query,
-            f"🟡 *Delete Paga API?*\n\n"
+            f"🟡 <b>Delete Paga API?</b>\n\n"
             f"Status: {'✅ Saved' if has else '❌ Already empty'}\n\n"
             "This permanently removes your Paga Principal, Credential and API Key.",
             InlineKeyboardMarkup([
@@ -3437,7 +3544,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         pend  = user_rec.get("upgrade_pending", False) if user_rec else False
         if db.is_pro(uid):
             await edit_menu(query,
-                f"💎 *You are already on Pro!*\n\n{exp}\n\nAll features are unlocked.",
+                f"💎 <b>You are already on Pro!</b>\n\n{exp}\n\nAll features are unlocked.",
                 InlineKeyboardMarkup(back_main())
             )
             return
@@ -3450,7 +3557,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             )
             return
         await edit_menu(query,
-            f"⬆️ *Upgrade to Pro Plan*\n\n"
+            f"⬆️ <b>Upgrade to Pro Plan</b>\n\n"
             f"Current: {badge}\n\n"
             f"Pro unlocks:\n"
             f"  ✅ Auto Price Update bot\n"
@@ -3458,7 +3565,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             f"  ✅ Auto-Pay (Bybit, FLW, Paga)\n"
             f"  ✅ Buyer Protection & Name Match\n"
             f"  ✅ All ad management features\n\n"
-            f"Tap *Request Upgrade* to send a request to the admin.",
+            f"Tap <b>Request Upgrade</b> to send a request to the admin.",
             InlineKeyboardMarkup([
                 [InlineKeyboardButton("✅ Request Upgrade", callback_data="upgrade_request_yes")],
                 [InlineKeyboardButton("❌ Cancel",          callback_data="main_menu")],
@@ -3490,18 +3597,18 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         # ── Step 3: Notify admin(s) directly — in try/except so any Telegram
         # API error is logged but CANNOT propagate and crash the bot. ──
         _admin_msg = (
-            f"🔔 *New Upgrade Request!*\n\n"
-            f"👤 User ID: `{uid}`\n"
+            f"🔔 <b>New Upgrade Request!</b>\n\n"
+            f"👤 User ID: <code>{uid}</code>\n"
             f"Username: @{uname if uname else 'None'}\n"
             f"Name: {dname}\n\n"
-            f"Approve: `/upgrade {uid} 30`"
+            f"Approve: <code>/upgrade {uid} 30</code>"
         )
         for _admin_id in list(_admin_chat_ids):
             try:
                 await context.bot.send_message(
                     chat_id=_admin_id,
                     text=_admin_msg,
-                    parse_mode="Markdown"
+                    parse_mode="HTML"
                 )
                 logger.info(f"[Upgrade] Admin {_admin_id} notified for uid={uid}")
             except Exception as _notify_err:
@@ -3531,7 +3638,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             interval = _s(tuser.id).settings.get("interval",2)
             _s(tuser.id).refresh_task = asyncio.create_task(auto_update_loop(context.bot, chat_id))
             await edit_menu(query,
-                f"🟢 *Price update started!*\n🔀 `{mode.upper()}` | ⏱ every `{interval}` min\n\n"
+                f"🟢 <b>Price update started!</b>\n🔀 <code>{mode.upper()}</code> | ⏱ every <code>{interval}</code> min\n\n"
                 + ads_section_text(tuser.id),
                 ads_section_keyboard(tuser.id)
             )
@@ -3540,11 +3647,11 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
     elif data.startswith("pay_") and not data.startswith("paywarn_"):
         order_id = data[4:]
         await context.bot.send_message(chat_id=chat_id,
-            text=f"⏳ Marking order `{order_id}` as paid...", parse_mode="Markdown")
+            text=f"⏳ Marking order <code>{_esc(order_id)}</code> as paid...", parse_mode="HTML")
         det = await asyncio.get_event_loop().run_in_executor(None, partial(get_order_detail, order_id, creds=get_user_creds(tuser.id)))
         if det.get("retCode",-1) != 0:
             await context.bot.send_message(chat_id=chat_id,
-                text=f"❌ Could not fetch order\n`{det.get('retMsg','')}`", parse_mode="Markdown")
+                text=f"❌ Could not fetch order\n<code>{_esc(det.get('retMsg',''))}</code>", parse_mode="HTML")
             return
         order_detail = det.get("result",{})
         pay_term     = order_detail.get("confirmedPayTerm",{}) or {}
@@ -3555,7 +3662,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         payment_id   = str(pay_term.get("id",""))
         if not payment_type or not payment_id:
             await context.bot.send_message(chat_id=chat_id,
-                text="❌ No payment info found. Buyer may not have selected payment yet.", parse_mode="Markdown")
+                text="❌ No payment info found. Buyer may not have selected payment yet.", parse_mode="HTML")
             return
         result = await asyncio.get_event_loop().run_in_executor(
             None, mark_order_paid, order_id, payment_type, payment_id
@@ -3568,20 +3675,20 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             except Exception:
                 pass
             await context.bot.send_message(chat_id=chat_id,
-                text=f"✅ *Order marked as paid!*\n`{order_id}`", parse_mode="Markdown")
+                text=f"✅ <b>Order marked as paid!</b>\n<code>{_esc(order_id)}</code>", parse_mode="HTML")
         else:
             await context.bot.send_message(chat_id=chat_id,
-                text=f"❌ Failed\n`{result.get('retMsg','')}`", parse_mode="Markdown")
+                text=f"❌ Failed\n<code>{_esc(result.get('retMsg',''))}</code>", parse_mode="HTML")
 
     # ── ⚠️ Mark Paid + Warn ──
     elif data.startswith("paywarn_"):
         order_id = data[8:]
         await context.bot.send_message(chat_id=chat_id,
-            text=f"⏳ Marking paid + sending warning for `{order_id}`...", parse_mode="Markdown")
+            text=f"⏳ Marking paid + sending warning for <code>{_esc(order_id)}</code>...", parse_mode="HTML")
         det = await asyncio.get_event_loop().run_in_executor(None, partial(get_order_detail, order_id, creds=get_user_creds(tuser.id)))
         if det.get("retCode",-1) != 0:
             await context.bot.send_message(chat_id=chat_id,
-                text=f"❌ `{det.get('retMsg','')}`", parse_mode="Markdown")
+                text=f"❌ <code>{_esc(det.get('retMsg',''))}</code>", parse_mode="HTML")
             return
         order_detail = det.get("result",{})
         pay_term     = order_detail.get("confirmedPayTerm",{}) or {}
@@ -3592,7 +3699,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         payment_id   = str(pay_term.get("id",""))
         if not payment_type or not payment_id:
             await context.bot.send_message(chat_id=chat_id,
-                text="❌ No payment info found.", parse_mode="Markdown")
+                text="❌ No payment info found.", parse_mode="HTML")
             return
         pr = await asyncio.get_event_loop().run_in_executor(
             None, mark_order_paid, order_id, payment_type, payment_id
@@ -3604,23 +3711,23 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             )
             warn = "✅ Warning sent to seller" \
                    if mr.get("retCode", mr.get("ret_code",-1)) == 0 \
-                   else f"⚠️ Warning failed: `{mr.get('retMsg','')}`"
+                   else f"⚠️ Warning failed: <code>{_esc(mr.get('retMsg',''))}</code>"
             # Remove the pay buttons from the original message
             try:
                 await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([]))
             except Exception:
                 pass
             await context.bot.send_message(chat_id=chat_id,
-                text=f"✅ *Order paid!* `{order_id}`\n{warn}", parse_mode="Markdown")
+                text=f"✅ <b>Order paid!</b> <code>{_esc(order_id)}</code>\n{_esc(warn)}", parse_mode="HTML")
         else:
             await context.bot.send_message(chat_id=chat_id,
-                text=f"❌ Failed\n`{pr.get('retMsg','')}`", parse_mode="Markdown")
+                text=f"❌ Failed\n<code>{_esc(pr.get('retMsg',''))}</code>", parse_mode="HTML")
 
     # ── 🪙 Release Coin ──
     elif data.startswith("release_"):
         order_id = data[8:]
         await context.bot.send_message(chat_id=chat_id,
-            text=f"⏳ Releasing coins for order `{order_id}`...", parse_mode="Markdown")
+            text=f"⏳ Releasing coins for order <code>{_esc(order_id)}</code>...", parse_mode="HTML")
         result   = await asyncio.get_event_loop().run_in_executor(None, partial(release_assets, order_id, creds=get_user_creds(tuser.id)))
         ret_code = result.get("retCode", result.get("ret_code", -1))
         ret_msg  = result.get("retMsg",  result.get("ret_msg",  ""))
@@ -3632,12 +3739,12 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             except Exception:
                 pass
             await context.bot.send_message(chat_id=chat_id,
-                text=f"🪙 *Coins released!*\n\nOrder: `{order_id}`\nBuyer has received their coins. ✅",
-                parse_mode="Markdown")
+                text=f"🪙 <b>Coins released!</b>\n\nOrder: <code>{order_id}</code>\nBuyer has received their coins. ✅",
+                parse_mode="HTML")
         else:
             await context.bot.send_message(chat_id=chat_id,
-                text=f"❌ *Release failed*\nCode: `{ret_code}`\nMessage: `{ret_msg}`",
-                parse_mode="Markdown")
+                text=f"❌ <b>Release failed</b>\nCode: <code>{ret_code}</code>\nMessage: <code>{ret_msg}</code>",
+                parse_mode="HTML")
 
 
 # ─────────────────────────────────────────
@@ -3667,7 +3774,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     async def reply_with_back(msg: str):
         """Reply with success message + back-to-previous button."""
-        await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=back_prev(prev))
+        await update.message.reply_text(msg, parse_mode="HTML", reply_markup=back_prev(prev))
 
     # ── Bybit API — slot-aware (Account 1 or Account 2) ──
     if action in ("api_bybit_key", "api_bybit_key_1", "api_bybit_key_2"):
@@ -3680,8 +3787,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _state["_api_bybit_slot"]     = slot
         await update.message.reply_text(
             f"✅ Account {slot} API Key received.\n\n"
-            f"Step 2 of 2: Send your Bybit Account {slot} *API Secret*.",
-            parse_mode="Markdown"
+            f"Step 2 of 2: Send your Bybit Account {slot} <b>API Secret</b>.",
+            parse_mode="HTML"
         )
         return
 
@@ -3695,85 +3802,182 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _state["action"] = None
         _save_settings(uid)
         await update.message.reply_text(
-            f"✅ *Bybit Account {slot} API saved!*\n\n"
+            f"✅ <b>Bybit Account {slot} API saved!</b>\n\n"
             f"Key and Secret stored securely.\n"
             f"The bot uses Account {slot} keys when Account {slot} is active.",
-            parse_mode="Markdown",
+            parse_mode="HTML",
             reply_markup=back_prev("section_apis")
         )
         return
 
     elif action == "api_flw_client_id":
+        val = text.strip()
+        if not val:
+            await update.message.reply_text(
+                "❌ FLW_CLIENT_ID cannot be empty. Please send the value.",
+                parse_mode="HTML"
+            )
+            return
         _state["action"]                  = "api_flw_client_secret"
-        _state["_api_flw_client_id_temp"] = text.strip()
+        _state["_api_flw_client_id_temp"] = val
         await update.message.reply_text(
-            "✅ *FLW_CLIENT_ID received.*\n\n"
-            "Step 2 of 3: Send your *FLW_CLIENT_SECRET*\n_(starts with `FLWSECK_`)_",
-            parse_mode="Markdown"
+            "✅ <b>FLW_CLIENT_ID received.</b>\n\n"
+            "<b>Step 2 of 5:</b> Send your <b>FLW_CLIENT_SECRET</b>\n"
+            "<i>(starts with FLWSECK_ — found on Flutterwave dashboard → Settings → API)</i>",
+            parse_mode="HTML"
         )
         return
 
     elif action == "api_flw_client_secret":
+        val = text.strip()
+        if not val:
+            await update.message.reply_text(
+                "❌ FLW_CLIENT_SECRET cannot be empty. Please send the value.",
+                parse_mode="HTML"
+            )
+            return
         _state["action"]                      = "api_flw_public_key"
-        _state["_api_flw_client_secret_temp"] = text.strip()
+        _state["_api_flw_client_secret_temp"] = val
         await update.message.reply_text(
-            "✅ *FLW_CLIENT_SECRET received.*\n\n"
-            "Step 3 of 3: Send your *FLW_PUBLIC_KEY*\n_(starts with `FLWPUBK_`)_",
-            parse_mode="Markdown"
+            "✅ <b>FLW_CLIENT_SECRET received.</b>\n\n"
+            "<b>Step 3 of 5:</b> Send your <b>FLW_PUBLIC_KEY</b>\n"
+            "<i>(starts with FLWPUBK_ — found on Flutterwave dashboard → Settings → API)</i>",
+            parse_mode="HTML"
         )
         return
 
     elif action == "api_flw_public_key":
+        val = text.strip()
+        if not val:
+            await update.message.reply_text(
+                "❌ FLW_PUBLIC_KEY cannot be empty. Please send the value.",
+                parse_mode="HTML"
+            )
+            return
+        _state["action"]                    = "api_flw_secret_hash"
+        _state["_api_flw_public_key_temp"]  = val
+        await update.message.reply_text(
+            "✅ <b>FLW_PUBLIC_KEY received.</b>\n\n"
+            "<b>Step 4 of 5:</b> Send your <b>FLW_SECRET_HASH</b>\n"
+            "<i>(Webhook secret hash — set on Flutterwave dashboard → Webhooks)</i>",
+            parse_mode="HTML"
+        )
+        return
+
+    elif action == "api_flw_secret_hash":
+        val = text.strip()
+        if not val:
+            await update.message.reply_text(
+                "❌ FLW_SECRET_HASH cannot be empty. Please send the value.",
+                parse_mode="HTML"
+            )
+            return
+        _state["action"]                     = "api_flw_secret_key"
+        _state["_api_flw_secret_hash_temp"]  = val
+        await update.message.reply_text(
+            "✅ <b>FLW_SECRET_HASH received.</b>\n\n"
+            "<b>Step 5 of 5:</b> Send your <b>FLW_SECRET_KEY</b>\n"
+            "<i>(Live secret key — starts with FLWSECK_ — used for transfers and payouts)</i>",
+            parse_mode="HTML"
+        )
+        return
+
+    elif action == "api_flw_secret_key":
         uid = update.effective_user.id
-        client_id     = _state.pop("_api_flw_client_id_temp", "")
+        val = text.strip()
+        if not val:
+            await update.message.reply_text(
+                "❌ FLW_SECRET_KEY cannot be empty. Please send the value.",
+                parse_mode="HTML"
+            )
+            return
+        # Pull all collected values
+        client_id     = _state.pop("_api_flw_client_id_temp",     "")
         client_secret = _state.pop("_api_flw_client_secret_temp", "")
+        public_key    = _state.pop("_api_flw_public_key_temp",    "")
+        secret_hash   = _state.pop("_api_flw_secret_hash_temp",   "")
+        secret_key    = val  # FLW_SECRET_KEY — used for all API auth calls
+
         db.save_api(uid, "flw_client_id",     client_id)
-        db.save_api(uid, "flw_client_secret",  client_secret)
-        db.save_api(uid, "flw_secret_key",     client_secret)   # used for all API calls
-        db.save_api(uid, "flw_public_key",    text.strip())
+        db.save_api(uid, "flw_client_secret", client_secret)
+        db.save_api(uid, "flw_public_key",    public_key)
+        db.save_api(uid, "flw_secret_hash",   secret_hash)
+        db.save_api(uid, "flw_secret_key",    secret_key)   # primary key used for API calls
+
         _state["action"] = None
         _save_settings(uid)
         await update.message.reply_text(
-            "✅ *Flutterwave API saved!*\n\n"
-            "Client ID, Client Secret and Public Key stored securely.\n"
+            "✅ <b>Flutterwave API saved!</b>\n\n"
+            "All 5 credentials stored securely per your account:\n"
+            "  ✔ FLW_CLIENT_ID\n"
+            "  ✔ FLW_CLIENT_SECRET\n"
+            "  ✔ FLW_PUBLIC_KEY\n"
+            "  ✔ FLW_SECRET_HASH\n"
+            "  ✔ FLW_SECRET_KEY\n\n"
             "Use /pingflutterwave to test the connection.",
-            parse_mode="Markdown",
+            parse_mode="HTML",
             reply_markup=back_prev("section_apis")
         )
         return
 
     elif action == "api_paga_api_key":
+        val = text.strip()
+        if not val:
+            await update.message.reply_text(
+                "❌ PAGA_API_KEY cannot be empty. Please send the value.",
+                parse_mode="HTML"
+            )
+            return
         _state["action"]                 = "api_paga_credential"
-        _state["_api_paga_api_key_temp"] = text.strip()
+        _state["_api_paga_api_key_temp"] = val
         await update.message.reply_text(
-            "✅ *PAGA_API_KEY received.*\n\n"
-            "Step 2 of 3: Send your *PAGA_CREDENTIAL*\n_(Live Primary Secret Key from Paga dashboard)_",
-            parse_mode="Markdown"
+            "✅ <b>PAGA_API_KEY received.</b>\n\n"
+            "<b>Step 2 of 3:</b> Send your <b>PAGA_CREDENTIAL</b>\n"
+            "<i>(Live Primary Secret Key from Paga dashboard)</i>",
+            parse_mode="HTML"
         )
         return
 
     elif action == "api_paga_credential":
+        val = text.strip()
+        if not val:
+            await update.message.reply_text(
+                "❌ PAGA_CREDENTIAL cannot be empty. Please send the value.",
+                parse_mode="HTML"
+            )
+            return
         _state["action"]                     = "api_paga_principal"
-        _state["_api_paga_credential_temp"]  = text.strip()
+        _state["_api_paga_credential_temp"]  = val
         await update.message.reply_text(
-            "✅ *PAGA_CREDENTIAL received.*\n\n"
-            "Step 3 of 3: Send your *PAGA_PRINCIPAL*\n_(Your Public Key / Principal from Paga dashboard)_",
-            parse_mode="Markdown"
+            "✅ <b>PAGA_CREDENTIAL received.</b>\n\n"
+            "<b>Step 3 of 3:</b> Send your <b>PAGA_PRINCIPAL</b>\n"
+            "<i>(Your Public Key / Principal from Paga dashboard)</i>",
+            parse_mode="HTML"
         )
         return
 
     elif action == "api_paga_principal":
+        val = text.strip()
+        if not val:
+            await update.message.reply_text(
+                "❌ PAGA_PRINCIPAL cannot be empty. Please send the value.",
+                parse_mode="HTML"
+            )
+            return
         uid = update.effective_user.id
         db.save_api(uid, "paga_api_key",    _state.pop("_api_paga_api_key_temp", ""))
         db.save_api(uid, "paga_credential", _state.pop("_api_paga_credential_temp", ""))
-        db.save_api(uid, "paga_principal",  text.strip())
+        db.save_api(uid, "paga_principal",  val)
         _state["action"] = None
         _save_settings(uid)
         await update.message.reply_text(
-            "✅ *Paga API saved!*\n\n"
-            "API Key, Credential and Principal stored securely.\n"
+            "✅ <b>Paga API saved!</b>\n\n"
+            "All 3 credentials stored securely per your account:\n"
+            "  ✔ PAGA_API_KEY\n"
+            "  ✔ PAGA_CREDENTIAL\n"
+            "  ✔ PAGA_PRINCIPAL\n\n"
             "Use /pingpaga to test the connection.",
-            parse_mode="Markdown",
+            parse_mode="HTML",
             reply_markup=back_prev("section_apis")
         )
         return
@@ -3784,10 +3988,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _state["action"] = None
         auto_id = _s(uid).settings.get("ad_id", "not set")
         await reply_with_back(
-            f"✅ *Manage Ad ID saved!*\n\n"
-            f"Manage Ad ID: `{text.strip()}`\n"
-            f"Auto-Update Ad ID: `{auto_id}` (unchanged)\n\n"
-            f"Now tap *📢 Post/Remove Ad* → *📋 Fetch Manage Ad* to load its details."
+            f"✅ <b>Manage Ad ID saved!</b>\n\n"
+            f"Manage Ad ID: <code>{text.strip()}</code>\n"
+            f"Auto-Update Ad ID: <code>{auto_id}</code> (unchanged)\n\n"
+            f"Now tap <b>📢 Post/Remove Ad</b> → <b>📋 Fetch Manage Ad</b> to load its details."
         )
         return
 
@@ -3805,14 +4009,14 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rc = result.get("retCode", result.get("ret_code", -1))
         if rc == 0:
             await update.message.reply_text(
-                f"✅ *Message sent to {nick}*\n\nOrder: `{order_id}`\n💬 _{text[:200]}_",
-                parse_mode="Markdown"
+                f"✅ <b>Message sent to {nick}</b>\n\nOrder: <code>{order_id}</code>\n💬 <i>{text[:200]}</i>",
+                parse_mode="HTML"
             )
             logger.info(f"[ChatReply] Sent to order {order_id}: {text[:100]}")
         else:
             await update.message.reply_text(
-                f"❌ Failed to send message\n`{result.get('retMsg', result.get('ret_msg',''))}`",
-                parse_mode="Markdown"
+                f"❌ Failed to send message\n<code>{result.get('retMsg', result.get('ret_msg',''))}</code>",
+                parse_mode="HTML"
             )
         return
 
@@ -3833,9 +4037,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if val <= 0: raise ValueError
             _s(uid).settings["increment"] = text
             _state["action"] = None
-            await reply_with_back(f"✅ *Increment saved!*\n\n`+{text}` per cycle\n\n_{next_setup_hint(uid)}_")
+            await reply_with_back(f"✅ <b>Increment saved!</b>\n\n<code>+{_esc(text)}</code> per cycle\n\n<i>{_esc(next_setup_hint(uid))}</i>")
         except Exception:
-            await update.message.reply_text("❌ Send a positive number like `0.05`", parse_mode="Markdown")
+            await update.message.reply_text("❌ Send a positive number like `0.05`", parse_mode="HTML")
 
     elif action == "float_pct":
         try:
@@ -3847,26 +4051,26 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             min_pct  = get_min_float_pct(currency, token)
             if val > max_pct:
                 await update.message.reply_text(
-                    f"❌ `{val}%` exceeds max for {token}/{currency}\n"
-                    f"Range: `{min_pct}%` – `{max_pct}%`",
-                    parse_mode="Markdown"
+                    f"❌ <code>{val}%</code> exceeds max for {token}/{currency}\n"
+                    f"Range: <code>{min_pct}%</code> – <code>{max_pct}%</code>",
+                    parse_mode="HTML"
                 )
                 return
             if min_pct > 0 and val < min_pct:
                 await update.message.reply_text(
-                    f"❌ `{val}%` is below min for {token}/{currency}\n"
-                    f"Range: `{min_pct}%` – `{max_pct}%`",
-                    parse_mode="Markdown"
+                    f"❌ <code>{val}%</code> is below min for {token}/{currency}\n"
+                    f"Range: <code>{min_pct}%</code> – <code>{max_pct}%</code>",
+                    parse_mode="HTML"
                 )
                 return
             _s(uid).settings["float_pct"] = text
             _state["action"] = None
             await reply_with_back(
-                f"✅ *Float % saved!*\n\n`{text}%` for `{token}/{currency}`\n\n"
+                f"✅ <b>Float % saved!</b>\n\n<code>{text}%</code> for <code>{token}/{currency}</code>\n\n"
                 f"_{next_setup_hint(uid)}_"
             )
         except Exception:
-            await update.message.reply_text("❌ Send a number like `105`", parse_mode="Markdown")
+            await update.message.reply_text("❌ Send a number like `105`", parse_mode="HTML")
 
     elif action == "ngn_usdt_ref":
         try:
@@ -3875,9 +4079,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _s(uid).settings["local_usdt_ref"] = text
             _scur = _s(uid).ad_data.get("currencyId","NGN").upper() if _s(uid).ad_data else "NGN"
             _state["action"] = None
-            await reply_with_back(f"✅ *{_scur}/USDT ref saved!*\n\n`{text}`\n\n_{next_setup_hint(uid)}_")
+            await reply_with_back(f"✅ <b>{_esc(_scur)}/USDT ref saved!</b>\n\n<code>{_esc(text)}</code>\n\n<i>{_esc(next_setup_hint(uid))}</i>")
         except Exception:
-            await update.message.reply_text("❌ Send a number like `1580`", parse_mode="Markdown")
+            await update.message.reply_text("❌ Send a number like `1580`", parse_mode="HTML")
 
     elif action == "interval":
         try:
@@ -3885,16 +4089,16 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if val < 1: raise ValueError
             _s(uid).settings["interval"] = val
             _state["action"] = None
-            await reply_with_back(f"✅ *Interval saved!*\n\nEvery `{val}` min\n\n_{next_setup_hint(uid)}_")
+            await reply_with_back(f"✅ <b>Interval saved!</b>\n\nEvery <code>{_esc(str(val))}</code> min\n\n<i>{_esc(next_setup_hint(uid))}</i>")
         except Exception:
-            await update.message.reply_text("❌ Send a whole number like `2`", parse_mode="Markdown")
+            await update.message.reply_text("❌ Send a whole number like `2`", parse_mode="HTML")
 
     elif action == "sender_name":
         _s(uid).settings["sender_name"] = text.strip()
         _state["action"] = None
         await reply_with_back(
-            f"✅ *Sender name saved!*\n\n`{text.strip()}`\n\n"
-            f"FLW narration: `{text.strip()} payment to [receiver]`"
+            f"✅ <b>Sender name saved!</b>\n\n<code>{text.strip()}</code>\n\n"
+            f"FLW narration: <code>{text.strip()} payment to [receiver]</code>"
         )
 
     elif action == "sell_custom_msg":
@@ -3902,8 +4106,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         _state["action"] = None
         preview = text[:80] + "..." if len(text) > 80 else text
         await reply_with_back(
-            f"✅ *Sell message saved!*\n\nPreview: _{preview}_\n\n"
-            f"Will be sent `{_s(uid).sell_msg_count}x` per sell order."
+            f"✅ <b>Sell message saved!</b>\n\nPreview: <i>{preview}</i>\n\n"
+            f"Will be sent <code>{_s(uid).sell_msg_count}x</code> per sell order."
         )
 
     elif action == "sell_msg_count":
@@ -3912,9 +4116,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if val < 1 or val > 5: raise ValueError
             _s(uid).sell_msg_count = val
             _state["action"] = None
-            await reply_with_back(f"✅ *Message count saved!*\n\nWill send `{val}x` per sell order.")
+            await reply_with_back(f"✅ <b>Message count saved!</b>\n\nWill send <code>{_esc(str(val))}x</code> per sell order.")
         except Exception:
-            await update.message.reply_text("❌ Send a number between `1` and `5`", parse_mode="Markdown")
+            await update.message.reply_text("❌ Send a number between `1` and `5`", parse_mode="HTML")
 
     elif action == "post_ad_qty":
         try:
@@ -3923,11 +4127,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _s(uid).settings["post_ad_qty"] = text
             _state["action"] = None
             await reply_with_back(
-                f"✅ *Custom quantity set:* `{text}`\n\n"
+                f"✅ <b>Custom quantity set:</b> <code>{text}</code>\n\n"
                 "Now tap *📢 Post Ad (clone)* → *Confirm Post* to post the ad."
             )
         except Exception:
-            await update.message.reply_text("❌ Send a positive number like `5000`", parse_mode="Markdown")
+            await update.message.reply_text("❌ Send a positive number like `5000`", parse_mode="HTML")
 
     elif action == "bp_custom_threshold":
         try:
@@ -3936,12 +4140,12 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _s(uid).buyer_protection_mins = val
             _state["action"] = None
             await reply_with_back(
-                f"✅ *Buyer Protection threshold set!*\n\n"
-                f"Threshold: `{val} min`\n\n"
+                f"✅ <b>Buyer Protection threshold set!</b>\n\n"
+                f"Threshold: <code>{val} min</code>\n\n"
                 f"Status: {'✅ ON' if _s(uid).buyer_protection_on else '❌ OFF (tap toggle to enable)'}"
             )
         except Exception:
-            await update.message.reply_text("❌ Send a whole number like `25`", parse_mode="Markdown")
+            await update.message.reply_text("❌ Send a whole number like `25`", parse_mode="HTML")
 
 
 # ─────────────────────────────────────────
@@ -3966,17 +4170,17 @@ async def _upgrade_notifier_loop(bot):
                 uname_r = req.get("username", "")
                 dname_r = req.get("display_name", "")
                 msg = (
-                    f"🔔 *New Upgrade Request!*\n\n"
-                    f"👤 User ID: `{uid_r}`\n"
+                    f"🔔 <b>New Upgrade Request!</b>\n\n"
+                    f"👤 User ID: <code>{uid_r}</code>\n"
                     f"Username: @{uname_r}\n"
                     f"Name: {dname_r}\n\n"
-                    f"Approve: `/upgrade {uid_r} 30`"
+                    f"Approve: <code>/upgrade {uid_r} 30</code>"
                 )
                 notified = False
                 for admin_id in list(_admin_chat_ids):
                     try:
                         await bot.send_message(
-                            chat_id=admin_id, text=msg, parse_mode="Markdown"
+                            chat_id=admin_id, text=msg, parse_mode="HTML"
                         )
                         notified = True
                         logger.info(f"[UpgradeNotifier] Notified admin {admin_id} about uid={uid_r}")
@@ -4043,17 +4247,17 @@ async def refresh_scammers_command(update: Update, context: ContextTypes.DEFAULT
     updated = get_last_updated()
     if count > 0:
         await update.message.reply_text(
-            f"✅ *Scammer list refreshed!*\n\n"
-            f"📋 `{count}` names loaded\n"
-            f"🕐 Updated: `{updated}`",
-            parse_mode="Markdown"
+            f"✅ <b>Scammer list refreshed!</b>\n\n"
+            f"📋 <code>{count}</code> names loaded\n"
+            f"🕐 Updated: <code>{updated}</code>",
+            parse_mode="HTML"
         )
     else:
         await update.message.reply_text(
             "❌ *Failed to load scammer list.*\n\n"
             "Check that `scammers.txt` exists in your GitHub repo\n"
             "and `SCAMMERS_FILE_URL` is set correctly.",
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
 
 
@@ -4065,7 +4269,7 @@ async def check_name_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not name:
         await update.message.reply_text(
             "Usage: `/checkname John Doe`\n\nChecks a name against your scammer list.",
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
         return
     fraud = await asyncio.get_event_loop().run_in_executor(None, check_buyer_name, name)
@@ -4077,18 +4281,18 @@ async def check_name_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "fuzzy":   "🟡 Similar name",
         }.get(fraud["match_type"], "⚠️ Match")
         await update.message.reply_text(
-            f"🚨 *FLAGGED!*\n\n"
-            f"Name: `{name}`\n"
-            f"{match_label}: `{fraud['matched_name']}`\n"
-            f"Similarity: `{fraud['similarity']:.0%}`\n\n"
-            f"_(Checked against {count} names)_",
-            parse_mode="Markdown"
+            f"🚨 <b>FLAGGED!</b>\n\n"
+            f"Name: <code>{name}</code>\n"
+            f"{match_label}: <code>{fraud['matched_name']}</code>\n"
+            f"Similarity: <code>{fraud['similarity']:.0%}</code>\n\n"
+            f"<i>(Checked against {count} names)</i>",
+            parse_mode="HTML"
         )
     else:
         await update.message.reply_text(
-            f"✅ *Not found* — `{name}` is not in your scammer list.\n\n"
-            f"_(Checked against {count} names)_",
-            parse_mode="Markdown"
+            f"✅ <b>Not found</b> — <code>{name}</code> is not in your scammer list.\n\n"
+            f"<i>(Checked against {count} names)</i>",
+            parse_mode="HTML"
         )
 def start_bot():
     global _paga_queue, _paga_worker_task
