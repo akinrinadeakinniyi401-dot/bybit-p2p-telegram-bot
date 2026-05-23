@@ -7,6 +7,15 @@ Commands:
   /requests                    — list pending upgrade requests
   /userdata                    — download all user data as Excel
   /listusers                   — list all users with plan status
+
+NOTE on /userdata:
+  cmd_userdata here is a thin stub that defers to the version defined in bot.py.
+  bot.py defines a full cmd_userdata that:
+    • builds the Excel directly (bypasses db.export_users_to_excel)
+    • reads total_buy_orders / total_sell_orders from DB
+    • merges live session counts via get_session(uid) per user
+    • takes max(db_total, live_total) so totals are never under-reported
+  The bot.py version is registered last in start_bot(), so it wins.
 """
 
 import asyncio
@@ -56,7 +65,6 @@ async def cmd_upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
     updated = db.upgrade_user(target_id, days)
     db.remove_upgrade_request(target_id)
 
-    # Notify the user
     try:
         exp_str = updated.get("plan_expires", "")
         await context.bot.send_message(
@@ -187,7 +195,12 @@ async def cmd_listusers(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─────────────────────────────────────────
 # /userdata — download Excel
 # ─────────────────────────────────────────
+# NOTE: The full implementation lives in bot.py as a local override.
+# bot.py defines cmd_userdata after importing this module, so the
+# bot.py version is what gets registered with CommandHandler("userdata", cmd_userdata).
+# This stub exists only so the import in bot.py does not fail.
 async def cmd_userdata(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Stub — overridden by bot.py's local cmd_userdata definition."""
     if not is_admin(update.effective_user.id):
         return
     await update.message.reply_text("⏳ Generating Excel report...")
