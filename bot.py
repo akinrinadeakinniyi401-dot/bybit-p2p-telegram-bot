@@ -67,6 +67,33 @@ _current_plan_badge = "⚪ Free"
 # These are ONLY read/written when is_admin(uid) is True.
 user_state: dict = {}   # admin input action state (non-admins use context.user_data)
 
+# ── FLW Transfer Registry ──────────────────────────────────────────────────────
+# Maps transfer_ref → {order_id, user_id, slot, amount, pay_term}
+# Written at transfer initiation; read by the webhook handler to reconnect the
+# webhook event back to the correct Telegram user and Bybit order.
+_flw_transfer_registry: dict = {}   # {transfer_ref: {order_id, user_id, slot, amount, pay_term}}
+
+# ── Order Final State Tracker ──────────────────────────────────────────────────
+# Prevents re-use of buttons after a terminal action.
+# States: "completed", "rejected", "warned", "failed", "expired", "skipped"
+_order_final_states: dict = {}      # {(chat_id, order_id): state_str}
+
+# ── Per-order Action Locks ─────────────────────────────────────────────────────
+# Prevents concurrent auto-pay + manual tap on the same order.
+_order_action_locks: dict = {}      # {(chat_id, order_id): asyncio.Lock}
+
+# ── FLW Transfer Registry ──
+# Maps transfer_ref → {order_id, user_id (chat_id), slot, amount, pay_term}
+# Populated when a transfer is initiated; consumed by the webhook handler on success.
+# This is the ONLY mechanism to reconnect a webhook event back to the correct user + order.
+_flw_transfer_registry: dict = {}
+
+# ── Order Final-State Tracker ──
+# Maps order_id → final state string: "completed", "rejected", "warned", "failed", "expired"
+# Once set, all button callbacks for that order are ignored to prevent duplicate actions.
+# Key: str order_id. Value: str state.
+_order_final_states: dict = {}
+
 def _s(uid: int) -> SessionState:
     """Shorthand: get the per-user session for uid."""
     sess = get_session(uid)
@@ -510,12 +537,12 @@ def autopay_section_text(uid: int = 0) -> str:
     flw_status   = "✅ ENABLED" if sess.flw_pay_enabled   else "❌ DISABLED"
     paga_status  = "✅ ENABLED" if sess.paga_pay_enabled  else "❌ DISABLED"
     # All API keys are per-user — stored in DB only
+    # FLW only needs: PUBLIC_KEY, SECRET_HASH, SECRET_KEY (3 keys)
     flw_fully_set = all(db.get_api(uid, k) for k in (
-        "flw_client_id", "flw_client_secret", "flw_public_key",
-        "flw_secret_hash", "flw_secret_key"
+        "flw_public_key", "flw_secret_hash", "flw_secret_key"
     ))
     paga_key  = db.get_api(uid, "paga_principal")
-    flw_configured  = "✅ Configured (5/5 keys)" if flw_fully_set else "❌ Not configured"
+    flw_configured  = "✅ Configured (3/3 keys)" if flw_fully_set else "❌ Not configured"
     paga_configured = "✅ Configured" if paga_key else "❌ Not configured"
     sender_name  = sess.settings.get("sender_name", "Not set")
     unpaid_count = len(sess.unpaid_log)
@@ -762,6 +789,11 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
     flw_secret_key = db.get_api(chat_id, "flw_secret_key")
     user_slot      = _get_user_slot_str(chat_id)
 
+    # ── Abort if this order was already finalized (manual pay, webhook, etc.) ──
+    if _is_order_finalized(chat_id, order_id):
+        logger.info(f"[FLW] Order {order_id} already finalized — skipping autopay")
+        return
+
     logger.info(
         f"[FLW] _flw_autopay START | user={chat_id} slot={user_slot} order={order_id}"
     )
@@ -883,6 +915,8 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
                 )
                 oid    = _esc(order_id)
                 thresh = _s(chat_id).buyer_protection_mins
+                # ── Update order message: remove buttons, show ⏭ Skipped badge ──
+                await _update_order_message_final(bot, chat_id, order_id, "BP Triggered", "skipped")
                 await bot.send_message(chat_id=chat_id,
                     text=(
                         f"🛡 <b>Buyer Protection Triggered</b> — Order <code>{oid}</code>\n\n"
@@ -1073,14 +1107,46 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
             return
 
         # ── result_data is guaranteed non-None from here ──
-        transfer_id = str(result_data.get("id") or "")
-        status      = str(result_data.get("status") or "NEW")
-        tid_safe    = _esc(transfer_id)
+        transfer_id  = str(result_data.get("id") or "")
+        status       = str(result_data.get("status") or "NEW")
+        tid_safe     = _esc(transfer_id)
+        # tx_ref is the reference we sent — used by webhook to look up this job
+        tx_ref       = str(result_data.get("reference") or ref)
+
+        # ── Register transfer so webhook can reconnect to user + order ──
+        if tx_ref:
+            _flw_transfer_registry[tx_ref] = {
+                "order_id":  order_id,
+                "user_id":   chat_id,
+                "slot":      user_slot,
+                "amount":    amount,
+                "currency":  currency,
+                "pay_term":  pay_term,
+            }
+            logger.info(
+                f"[FLW] Transfer registered | ref={tx_ref!r} transfer_id={transfer_id!r} "
+                f"user={chat_id} order={order_id}"
+            )
 
         logger.info(
             f"[FLW] Transfer initiated | user={chat_id} slot={user_slot} order={order_id} "
             f"transfer_id={transfer_id!r} initial_status={status!r}"
         )
+
+        # ── Register transfer in global registry for webhook reconnection ──
+        # This allows the /flw-webhook endpoint to find the right user + order
+        # when Flutterwave sends a status update callback, even if polling timed out.
+        _flw_transfer_registry[transfer_id] = {
+            "transfer_ref": transfer_id,
+            "order_id":     order_id,
+            "user_id":      chat_id,       # Telegram chat_id of the bot user
+            "slot":         user_slot,
+            "amount":       amount,
+            "currency":     currency,
+            "pay_term":     pay_term,
+            "verified_name": verified_name,
+        }
+        logger.info(f"[FLW] Registered transfer {transfer_id!r} in registry for order {order_id}")
 
         # ── Handle immediate FAILED status on creation ──
         if status == "FAILED":
@@ -1148,14 +1214,16 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
                     f"bybit_ok={bybit_ok} retCode={(pr or {}).get('retCode','?')}"
                 )
             _s(chat_id).paid_order_ids.add(order_id)
-            await _remove_order_buttons(bot, chat_id, order_id)
-            bybit_label = "✅ Marked paid" if bybit_ok else "⚠️ Mark manually on Bybit"
-            # ── STEP 7: Send confirmation ──
+            # ── Update order message: remove action buttons, show ✅ Completed badge ──
+            await _update_order_message_final(bot, chat_id, order_id, "Transfer Completed", "completed")
+            bybit_label = "✅ Marked paid on Bybit" if bybit_ok else "⚠️ Mark manually on Bybit"
+            # ── STEP 7: Send Telegram confirmation ──
             await bot.send_message(chat_id=chat_id,
                 text=(
-                    f"✅ <b>FLW Payment SUCCESS</b>\n\n"
+                    f"✅ <b>FLW Transfer Successful</b>\n\n"
+                    f"Amount: <b>₦{amount:,.2f}</b>\n"
+                    f"Recipient: <b>{vname_safe}</b>\n"
                     f"Order: <code>{oid}</code>\n"
-                    f"Amount: <b>{amount:,.2f} {currency}</b> → {vname_safe}\n"
                     f"Transfer ID: <code>{tid_safe}</code>\n"
                     f"Bybit: {bybit_label}"
                 ),
@@ -1178,6 +1246,8 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
                 "reason": complete_msg or "Transfer FAILED after polling",
                 "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             })
+            # ── Update order message to show ❌ Transfer Failed badge ──
+            await _update_order_message_final(bot, chat_id, order_id, "Transfer Failed", "failed")
             cmsg_safe = _esc(complete_msg)
             if "insufficient" in complete_msg.lower() or "funds" in complete_msg.lower():
                 fail_text = (
@@ -1205,14 +1275,18 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
                 f"[FLW] Transfer still pending after polling | user={chat_id} order={order_id} "
                 f"transfer_id={transfer_id!r} status={final_status!r}"
             )
+            await _update_order_message_final(
+                context.bot if hasattr(bot, "bot") else bot,
+                chat_id, order_id, "Transfer Pending", "skipped"
+            )
             await bot.send_message(chat_id=chat_id,
                 text=(
                     f"⏳ <b>FLW Transfer Pending</b>\n\n"
                     f"Order: <code>{oid}</code>\n"
                     f"Transfer ID: <code>{tid_safe}</code> | Status: <code>{fstatus_safe}</code>\n\n"
                     f"Order has NOT been marked paid yet.\n"
-                    f"Flutterwave webhook will confirm when complete.\n"
-                    f"Check /pingflutterwave or mark manually if needed."
+                    f"Flutterwave webhook will confirm and auto-mark when complete.\n"
+                    f"Transfer ID is registered — webhook will reconnect automatically."
                 ),
                 parse_mode="HTML")
 
@@ -1321,11 +1395,110 @@ def _enqueue_paga_order(bot, chat_id, order_id, order_detail):
     return pos
 
 
-async def _remove_order_buttons(bot, chat_id: int, order_id: str):
+def _is_order_final(order_id: str) -> bool:
+    """Return True if this order has already reached a final state (prevents duplicate actions)."""
+    return order_id in _order_final_states
+
+
+def _set_order_final(order_id: str, state: str):
+    """Mark an order as final. state ∈ {'completed','rejected','warned','failed','expired'}."""
+    _order_final_states[order_id] = state
+
+
+async def _update_order_message(bot, chat_id: int, order_id: str,
+                                 status_text: str, *, keep_buttons: bool = False):
     """
-    Remove the pay buttons from the BUY order notification message.
-    Called by auto-pay after success — no query object available.
+    Edit the original BUY order Telegram message to:
+      1. Append a status line at the end
+      2. Remove all inline keyboard buttons (unless keep_buttons=True)
+
+    Falls back silently if the message is no longer editable (e.g. too old).
     """
+    msg_id = _s(chat_id).order_msg_ids.get(order_id)
+    if not msg_id:
+        return
+    try:
+        # Fetch the current message text if possible, then append status
+        try:
+            current = await bot.get_message_text(chat_id=chat_id, message_id=msg_id)
+        except Exception:
+            current = None
+
+        new_markup = InlineKeyboardMarkup([]) if not keep_buttons else None
+
+        if current:
+            new_text = current + f"\n\n{status_text}"
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=msg_id,
+                    text=new_text,
+                    reply_markup=new_markup,
+                    parse_mode="HTML"
+                )
+                return
+            except Exception:
+                pass
+        # If we can't edit the text, at minimum remove the buttons
+        await bot.edit_message_reply_markup(
+            chat_id=chat_id,
+            message_id=msg_id,
+            reply_markup=InlineKeyboardMarkup([])
+        )
+    except Exception as e:
+        logger.debug(f"[AutoPay] Could not update message for order {order_id}: {e}")
+
+
+# ─────────────────────────────────────────
+# 🔒 ORDER LOCK + STATE HELPERS
+# ─────────────────────────────────────────
+
+def _get_order_lock(chat_id: int, order_id: str) -> asyncio.Lock:
+    """Return (and create if needed) the asyncio.Lock for (chat_id, order_id).
+    Prevents concurrent auto-pay and manual button taps on the same order."""
+    key = (chat_id, order_id)
+    if key not in _order_action_locks:
+        _order_action_locks[key] = asyncio.Lock()
+    return _order_action_locks[key]
+
+
+def _is_order_finalized(chat_id: int, order_id: str) -> bool:
+    """Return True if this order has already reached a terminal state.
+    All further callbacks for this order are silently ignored."""
+    return (chat_id, order_id) in _order_final_states
+
+
+def _set_order_final_state(chat_id: int, order_id: str, state: str):
+    """Mark an order as having reached a terminal state.
+    Valid states: 'completed', 'rejected', 'warned', 'failed', 'expired', 'skipped'"""
+    _order_final_states[(chat_id, order_id)] = state
+    logger.info(f"[OrderState] ({chat_id}, {order_id}) → {state}")
+
+
+async def _update_order_message_final(
+    bot, chat_id: int, order_id: str,
+    status_text: str, state: str
+):
+    """Edit the original BUY order Telegram message to show a final status badge
+    and remove all action buttons so users cannot re-press them.
+
+    state: one of 'completed', 'rejected', 'warned', 'failed', 'skipped', 'expired'
+    """
+    _set_order_final_state(chat_id, order_id, state)
+
+    badge_map = {
+        "completed": "✅ Completed",
+        "rejected":  "❌ Rejected",
+        "warned":    "⚠️ Warning Sent",
+        "failed":    "❌ Transfer Failed",
+        "skipped":   "⏭ Skipped",
+        "expired":   "⏰ Expired",
+    }
+    badge_label = badge_map.get(state, f"ℹ️ {state.title()}")
+    status_keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(badge_label, callback_data=f"order_status_noop_{order_id}")]
+    ])
+
     msg_id = _s(chat_id).order_msg_ids.get(order_id)
     if not msg_id:
         return
@@ -1333,11 +1506,190 @@ async def _remove_order_buttons(bot, chat_id: int, order_id: str):
         await bot.edit_message_reply_markup(
             chat_id=chat_id,
             message_id=msg_id,
-            reply_markup=InlineKeyboardMarkup([])
+            reply_markup=status_keyboard
         )
-        logger.info(f"[AutoPay] Removed buttons from order notification {order_id}")
+        logger.info(f"[OrderMsg] Updated order message for {order_id} → state={state}")
     except Exception as e:
-        logger.debug(f"[AutoPay] Could not remove buttons for {order_id}: {e}")
+        logger.debug(f"[OrderMsg] Could not update order message for {order_id}: {e}")
+
+
+async def _remove_order_buttons(bot, chat_id: int, order_id: str):
+    """Remove pay buttons from the BUY order notification message after auto-pay success.
+    Delegates to _update_order_message_final with 'completed' state."""
+    await _update_order_message_final(bot, chat_id, order_id, "Completed", "completed")
+
+
+# ─────────────────────────────────────────
+# 🔔 FLW WEBHOOK PROCESSOR
+# Called by the web server (server.py / main.py) when Flutterwave POSTs a webhook.
+# STEP 1: Verify signature using FLW_SECRET_HASH per user
+# STEP 2: Check transfer status == SUCCESSFUL
+# STEP 3: Look up order via _flw_transfer_registry
+# STEP 4: Mark Bybit order paid
+# STEP 5: Notify Telegram user
+# STEP 6: Remove/update buttons
+# ─────────────────────────────────────────
+async def handle_flw_webhook(bot, payload: dict, signature_header: str | None):
+    """
+    Process an incoming Flutterwave webhook event.
+
+    Args:
+        bot: Telegram Bot instance
+        payload: Parsed JSON body from Flutterwave
+        signature_header: Value of the 'verif-hash' (or 'X-Flw-Signature') HTTP header
+
+    Returns:
+        (ok: bool, reason: str)
+    """
+    import hmac, hashlib
+
+    logger.info(f"[FLW Webhook] Received | event={payload.get('event','?')} "
+                f"has_signature={'yes' if signature_header else 'no'}")
+
+    # ── STEP 1: Verify signature ──
+    # The FLW_SECRET_HASH is stored per user. We must find which user owns this transfer
+    # first, then verify the signature against their secret hash.
+    # However, we can do a fast pre-check: look up the transfer ref in the registry first.
+
+    data       = payload.get("data", {}) or {}
+    event_type = payload.get("event", "")
+
+    # Flutterwave sends transfer events as "transfer.completed"
+    if "transfer" not in event_type.lower() and "transfer" not in str(payload.get("event_type", "")).lower():
+        logger.info(f"[FLW Webhook] Non-transfer event: {event_type!r} — ignoring")
+        return True, "not_transfer"
+
+    ref    = str(data.get("reference") or data.get("narration", "")).strip()
+    status = str(data.get("status", "")).upper()
+
+    logger.info(f"[FLW Webhook] Transfer event | ref={ref!r} status={status!r}")
+
+    if not ref:
+        logger.warning("[FLW Webhook] No reference in payload — cannot identify transfer")
+        return False, "no_reference"
+
+    # ── Look up registry ──
+    entry = _flw_transfer_registry.get(ref)
+    if not entry:
+        logger.warning(f"[FLW Webhook] ref={ref!r} not in registry — may be from a different session or manual transfer")
+        return False, "unknown_ref"
+
+    chat_id  = entry["user_id"]
+    order_id = entry["order_id"]
+    amount   = entry["amount"]
+    currency = entry.get("currency", "NGN")
+    pay_term = entry.get("pay_term", {})
+
+    # ── STEP 1b: Verify signature against this user's FLW_SECRET_HASH ──
+    secret_hash = db.get_api(chat_id, "flw_secret_hash")
+    if not signature_header:
+        logger.warning(f"[FLW Webhook] ⚠️ No signature header — rejecting for security | ref={ref!r} user={chat_id}")
+        return False, "no_signature"
+
+    if secret_hash:
+        if signature_header != secret_hash:
+            logger.warning(
+                f"[FLW Webhook] 🔒 Signature MISMATCH — rejecting | "
+                f"ref={ref!r} user={chat_id} expected={secret_hash[:6]}... got={signature_header[:6]}..."
+            )
+            return False, "invalid_signature"
+        logger.info(f"[FLW Webhook] ✅ Signature verified | ref={ref!r} user={chat_id}")
+    else:
+        logger.warning(f"[FLW Webhook] No FLW_SECRET_HASH configured for user={chat_id} — skipping verification")
+
+    # ── STEP 2: Check status ──
+    if status != "SUCCESSFUL":
+        reason_map = {
+            "FAILED":    "Transfer failed",
+            "REVERSED":  "Transfer reversed",
+            "CANCELLED": "Transfer cancelled",
+            "PENDING":   "Transfer still pending",
+        }
+        reason_msg = reason_map.get(status, f"Transfer status: {status}")
+        logger.warning(f"[FLW Webhook] Non-success status={status!r} | ref={ref!r} user={chat_id} order={order_id}")
+
+        if status in ("FAILED", "REVERSED", "CANCELLED"):
+            # Notify user of failure
+            oid = _esc(order_id)
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"❌ <b>FLW Transfer {status}</b>\n\n"
+                        f"Order: <code>{oid}</code>\n"
+                        f"Amount: <b>{amount:,.2f} {currency}</b>\n"
+                        f"Reason: {_esc(reason_msg)}\n\n"
+                        f"Order has <b>NOT</b> been marked paid. Mark manually."
+                    ),
+                    parse_mode="HTML"
+                )
+            except Exception as _notify_err:
+                logger.error(f"[FLW Webhook] Could not notify user {chat_id}: {_notify_err}")
+            # Remove buttons since transfer is definitively done (failed)
+            _set_order_final(order_id, "failed")
+            await _remove_order_buttons(bot, chat_id, order_id)
+        return False, f"status_{status.lower()}"
+
+    # ── STEP 3: Guard against duplicate webhook processing ──
+    if order_id in _s(chat_id).paid_order_ids:
+        logger.info(f"[FLW Webhook] Order {order_id} already marked paid — ignoring duplicate")
+        return True, "already_paid"
+
+    # ── STEP 4: Mark Bybit order paid ──
+    pay_type   = str(pay_term.get("paymentType", ""))
+    payment_id = str(pay_term.get("id", ""))
+    bybit_ok   = False
+    if pay_type and payment_id:
+        try:
+            pr = await asyncio.get_event_loop().run_in_executor(
+                None, partial(mark_order_paid, order_id, pay_type, payment_id,
+                              creds=get_user_creds(chat_id))
+            )
+            bybit_ok = (pr or {}).get("retCode", -1) == 0
+            logger.info(
+                f"[FLW Webhook] Bybit mark-paid | user={chat_id} order={order_id} "
+                f"bybit_ok={bybit_ok} retCode={(pr or {}).get('retCode','?')}"
+            )
+        except Exception as _bp_err:
+            logger.error(f"[FLW Webhook] Bybit mark-paid error | user={chat_id} order={order_id}: {_bp_err}")
+    else:
+        logger.warning(f"[FLW Webhook] Missing pay_type or payment_id — cannot mark Bybit paid | order={order_id}")
+
+    _s(chat_id).paid_order_ids.add(order_id)
+    _set_order_final(order_id, "completed")
+
+    # ── STEP 5: Remove buttons + update message ──
+    await _remove_order_buttons(bot, chat_id, order_id)
+
+    # ── STEP 6: Notify user ──
+    recipient_name = str(data.get("beneficiary_name") or data.get("full_name") or "Recipient")
+    transfer_id    = str(data.get("id") or "")
+    oid        = _esc(order_id)
+    tid_safe   = _esc(transfer_id)
+    rname_safe = _esc(recipient_name)
+    bybit_line = "✅ Bybit order marked as paid." if bybit_ok else "⚠️ Could not auto-mark on Bybit — please mark manually."
+
+    try:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"✅ <b>Flutterwave Transfer Successful</b>\n\n"
+                f"Amount: <b>₦{amount:,.0f}</b>\n"
+                f"Recipient: <b>{rname_safe}</b>\n"
+                f"Order: <code>{oid}</code>\n"
+                f"Transfer ID: <code>{tid_safe}</code>\n\n"
+                f"{bybit_line}"
+            ),
+            parse_mode="HTML"
+        )
+        logger.info(f"[FLW Webhook] ✅ Webhook processed successfully | ref={ref!r} user={chat_id} order={order_id} bybit_ok={bybit_ok}")
+    except Exception as _notify_err:
+        logger.error(f"[FLW Webhook] Could not send success notification to user {chat_id}: {_notify_err}")
+
+    # Clean up registry to free memory
+    _flw_transfer_registry.pop(ref, None)
+
+    return True, "success"
 
 
 # ─────────────────────────────────────────
@@ -2651,9 +3003,7 @@ async def ping_flutterwave_command(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_text(
             "❌ <b>No Flutterwave API set.</b>\n\n"
             "Go to 🔑 <b>Set APIs</b> → Set Flutterwave API first.\n\n"
-            "You need to provide all 5 credentials:\n"
-            "  FLW_CLIENT_ID\n"
-            "  FLW_CLIENT_SECRET\n"
+            "You need to provide 3 credentials:\n"
             "  FLW_PUBLIC_KEY\n"
             "  FLW_SECRET_HASH\n"
             "  FLW_SECRET_KEY",
@@ -3077,14 +3427,13 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
     # ── 🟢 Toggle Flutterwave Pay ──
     elif data == "toggle_flw_pay":
         if not _s(tuser.id).flw_pay_enabled:
-            # All users (including admin) must have all 5 FLW keys in DB
+            # All users (including admin) must have all 3 FLW keys in DB
             _flw_ready = all(db.get_api(tuser.id, k) for k in (
-                "flw_client_id", "flw_client_secret", "flw_public_key",
-                "flw_secret_hash", "flw_secret_key"
+                "flw_public_key", "flw_secret_hash", "flw_secret_key"
             ))
             if not _flw_ready:
                 await query.answer(
-                    "❌ Flutterwave API incomplete. Go to 🔑 Set APIs → Set Flutterwave API and enter all 5 credentials.",
+                    "❌ Flutterwave API incomplete. Go to 🔑 Set APIs → Set Flutterwave API and enter all 3 credentials.",
                     show_alert=True
                 )
                 return
@@ -3696,10 +4045,9 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         uid  = query.from_user.id
         bk1  = "✅" if db.get_api(uid, "bybit_key_1")    else "❌"
         bk2  = "✅" if db.get_api(uid, "bybit_key_2")    else "❌"
-        # FLW is fully configured only when all 5 keys are saved
+        # FLW is fully configured only when all 3 keys are saved
         flw_keys = all(db.get_api(uid, k) for k in (
-            "flw_client_id", "flw_client_secret", "flw_public_key",
-            "flw_secret_hash", "flw_secret_key"
+            "flw_public_key", "flw_secret_hash", "flw_secret_key"
         ))
         fk   = "✅" if flw_keys else "❌"
         pk   = "✅" if db.get_api(uid, "paga_principal") else "❌"
@@ -3708,7 +4056,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             f"Your API keys are stored securely on the server.\n\n"
             f"Bybit Account 1 API: {bk1}\n"
             f"Bybit Account 2 API: {bk2}\n"
-            f"Flutterwave API (5 keys): {fk}\n"
+            f"Flutterwave API (3 keys): {fk}\n"
             f"Paga API: {pk}\n\n"
             f"⚠️ Keys are stored per user and never shared.\n"
             f"⚠️ FLW and Paga work across both Bybit accounts.",
@@ -3763,7 +4111,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         )
 
     elif data == "set_api_flw":
-        _btn_state["action"]       = "api_flw_client_id"
+        _btn_state["action"]       = "api_flw_public_key"
         _btn_state["prev_section"] = "section_apis"
         uid = query.from_user.id
         has = bool(db.get_api(uid, "flw_secret_key"))
@@ -3771,14 +4119,12 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         await edit_menu_html(query,
             f"🟢 <b>Set Flutterwave API</b>\n\n"
             f"Status: {status_line}\n\n"
-            f"You will enter <b>5 credentials</b> one at a time:\n"
-            f"  1️⃣ FLW_CLIENT_ID\n"
-            f"  2️⃣ FLW_CLIENT_SECRET\n"
-            f"  3️⃣ FLW_PUBLIC_KEY\n"
-            f"  4️⃣ FLW_SECRET_HASH\n"
-            f"  5️⃣ FLW_SECRET_KEY\n\n"
-            f"<b>Step 1 of 5:</b> Send your <b>FLW_CLIENT_ID</b>\n"
-            f"<i>(Flutterwave dashboard → Settings → API)</i>",
+            f"You will enter <b>3 credentials</b> one at a time:\n"
+            f"  1️⃣ FLW_PUBLIC_KEY\n"
+            f"  2️⃣ FLW_SECRET_HASH\n"
+            f"  3️⃣ FLW_SECRET_KEY\n\n"
+            f"<b>Step 1 of 3:</b> Send your <b>FLW_PUBLIC_KEY</b>\n"
+            f"<i>(starts with FLWPUBK_ — Flutterwave dashboard → Settings → API)</i>",
             InlineKeyboardMarkup(back_section("section_apis"))
         )
 
@@ -3886,8 +4232,8 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         await edit_menu_html(query,
             f"🟢 <b>Delete Flutterwave API?</b>\n\n"
             f"Status: {status_str}\n\n"
-            "This permanently removes all 5 FLW credentials:\n"
-            "FLW_CLIENT_ID, FLW_CLIENT_SECRET, FLW_PUBLIC_KEY, FLW_SECRET_HASH, FLW_SECRET_KEY",
+            "This permanently removes all 3 FLW credentials:\n"
+            "FLW_PUBLIC_KEY, FLW_SECRET_HASH, FLW_SECRET_KEY",
             InlineKeyboardMarkup([
                 [InlineKeyboardButton("✅ Yes, Delete", callback_data="delete_flw_confirm")],
                 [InlineKeyboardButton("❌ Cancel",       callback_data="delete_apis")],
@@ -3896,12 +4242,11 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
     elif data == "delete_flw_confirm":
         uid_del = query.from_user.id
-        for k in ("flw_client_id", "flw_client_secret", "flw_public_key",
-                  "flw_secret_hash", "flw_secret_key"):
+        for k in ("flw_public_key", "flw_secret_hash", "flw_secret_key"):
             db.save_api(uid_del, k, "")
         logger.info(f"[APIs] All FLW keys deleted for user {uid_del}")
         await edit_menu_html(query,
-            "✅ <b>Flutterwave API deleted.</b>\n\nAll 5 credentials removed.\n"
+            "✅ <b>Flutterwave API deleted.</b>\n\nAll 3 credentials removed.\n"
             "You can re-add them anytime via 🔑 Set APIs.",
             InlineKeyboardMarkup([*back_section("section_apis")])
         )
@@ -4040,83 +4385,98 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
     # ── ✅ Mark as Paid ──
     elif data.startswith("pay_") and not data.startswith("paywarn_"):
         order_id = data[4:]
-        await context.bot.send_message(chat_id=chat_id,
-            text=f"⏳ Marking order <code>{_esc(order_id)}</code> as paid...", parse_mode="HTML")
-        det = await asyncio.get_event_loop().run_in_executor(None, partial(get_order_detail, order_id, creds=get_user_creds(tuser.id)))
-        if det.get("retCode",-1) != 0:
-            await context.bot.send_message(chat_id=chat_id,
-                text=f"❌ Could not fetch order\n<code>{_esc(det.get('retMsg',''))}</code>", parse_mode="HTML")
+        # ── Duplicate action guard ──
+        if _is_order_finalized(chat_id, order_id):
+            await query.answer("✅ Already processed — no action needed.", show_alert=True)
             return
-        order_detail = det.get("result",{})
-        pay_term     = order_detail.get("confirmedPayTerm",{}) or {}
-        if not pay_term:
-            terms    = order_detail.get("paymentTermList",[])
-            pay_term = terms[0] if terms else {}
-        payment_type = str(pay_term.get("paymentType",""))
-        payment_id   = str(pay_term.get("id",""))
-        if not payment_type or not payment_id:
+        async with _get_order_lock(chat_id, order_id):
+            if _is_order_finalized(chat_id, order_id):
+                await query.answer("✅ Already processed.", show_alert=True)
+                return
             await context.bot.send_message(chat_id=chat_id,
-                text="❌ No payment info found. Buyer may not have selected payment yet.", parse_mode="HTML")
-            return
-        result = await asyncio.get_event_loop().run_in_executor(
-            None, partial(mark_order_paid, order_id, payment_type, payment_id, creds=get_user_creds(chat_id))
-        )
-        if result.get("retCode", result.get("ret_code",-1)) == 0:
-            _s(tuser.id).paid_order_ids.add(order_id)
-            # Remove the pay buttons from the original message
-            try:
-                await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([]))
-            except Exception:
-                pass
-            await context.bot.send_message(chat_id=chat_id,
-                text=f"✅ <b>Order marked as paid!</b>\n<code>{_esc(order_id)}</code>", parse_mode="HTML")
-        else:
-            await context.bot.send_message(chat_id=chat_id,
-                text=f"❌ Failed\n<code>{_esc(result.get('retMsg',''))}</code>", parse_mode="HTML")
+                text=f"⏳ Marking order <code>{_esc(order_id)}</code> as paid...", parse_mode="HTML")
+            det = await asyncio.get_event_loop().run_in_executor(None, partial(get_order_detail, order_id, creds=get_user_creds(tuser.id)))
+            if det.get("retCode",-1) != 0:
+                await context.bot.send_message(chat_id=chat_id,
+                    text=f"❌ Could not fetch order\n<code>{_esc(det.get('retMsg',''))}</code>", parse_mode="HTML")
+                return
+            order_detail = det.get("result",{})
+            pay_term     = order_detail.get("confirmedPayTerm",{}) or {}
+            if not pay_term:
+                terms    = order_detail.get("paymentTermList",[])
+                pay_term = terms[0] if terms else {}
+            payment_type = str(pay_term.get("paymentType",""))
+            payment_id   = str(pay_term.get("id",""))
+            if not payment_type or not payment_id:
+                await context.bot.send_message(chat_id=chat_id,
+                    text="❌ No payment info found. Buyer may not have selected payment yet.", parse_mode="HTML")
+                return
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, partial(mark_order_paid, order_id, payment_type, payment_id, creds=get_user_creds(chat_id))
+            )
+            if result.get("retCode", result.get("ret_code",-1)) == 0:
+                _s(tuser.id).paid_order_ids.add(order_id)
+                # ── Edit original message: remove buttons, show status badge ──
+                await _update_order_message_final(context.bot, chat_id, order_id, "Completed", "completed")
+                await context.bot.send_message(chat_id=chat_id,
+                    text=f"✅ <b>Order marked as paid!</b>\n<code>{_esc(order_id)}</code>", parse_mode="HTML")
+            else:
+                await context.bot.send_message(chat_id=chat_id,
+                    text=f"❌ Failed\n<code>{_esc(result.get('retMsg',''))}</code>", parse_mode="HTML")
 
     # ── ⚠️ Mark Paid + Warn ──
     elif data.startswith("paywarn_"):
         order_id = data[8:]
-        await context.bot.send_message(chat_id=chat_id,
-            text=f"⏳ Marking paid + sending warning for <code>{_esc(order_id)}</code>...", parse_mode="HTML")
-        det = await asyncio.get_event_loop().run_in_executor(None, partial(get_order_detail, order_id, creds=get_user_creds(tuser.id)))
-        if det.get("retCode",-1) != 0:
-            await context.bot.send_message(chat_id=chat_id,
-                text=f"❌ <code>{_esc(det.get('retMsg',''))}</code>", parse_mode="HTML")
+        # ── Duplicate action guard ──
+        if _is_order_finalized(chat_id, order_id):
+            await query.answer("✅ Already processed — no action needed.", show_alert=True)
             return
-        order_detail = det.get("result",{})
-        pay_term     = order_detail.get("confirmedPayTerm",{}) or {}
-        if not pay_term:
-            terms    = order_detail.get("paymentTermList",[])
-            pay_term = terms[0] if terms else {}
-        payment_type = str(pay_term.get("paymentType",""))
-        payment_id   = str(pay_term.get("id",""))
-        if not payment_type or not payment_id:
+        async with _get_order_lock(chat_id, order_id):
+            if _is_order_finalized(chat_id, order_id):
+                await query.answer("✅ Already processed.", show_alert=True)
+                return
             await context.bot.send_message(chat_id=chat_id,
-                text="❌ No payment info found.", parse_mode="HTML")
-            return
-        pr = await asyncio.get_event_loop().run_in_executor(
-            None, partial(mark_order_paid, order_id, payment_type, payment_id, creds=get_user_creds(chat_id))
-        )
-        if pr.get("retCode", pr.get("ret_code",-1)) == 0:
-            _s(tuser.id).paid_order_ids.add(order_id)
-            mr = await asyncio.get_event_loop().run_in_executor(
-                None, partial(send_chat_message, order_id, SELLER_WARN_MSG,
-                                  creds=get_user_creds(chat_id))
+                text=f"⏳ Marking paid + sending warning for <code>{_esc(order_id)}</code>...", parse_mode="HTML")
+            det = await asyncio.get_event_loop().run_in_executor(None, partial(get_order_detail, order_id, creds=get_user_creds(tuser.id)))
+            if det.get("retCode",-1) != 0:
+                await context.bot.send_message(chat_id=chat_id,
+                    text=f"❌ <code>{_esc(det.get('retMsg',''))}</code>", parse_mode="HTML")
+                return
+            order_detail = det.get("result",{})
+            pay_term     = order_detail.get("confirmedPayTerm",{}) or {}
+            if not pay_term:
+                terms    = order_detail.get("paymentTermList",[])
+                pay_term = terms[0] if terms else {}
+            payment_type = str(pay_term.get("paymentType",""))
+            payment_id   = str(pay_term.get("id",""))
+            if not payment_type or not payment_id:
+                await context.bot.send_message(chat_id=chat_id,
+                    text="❌ No payment info found.", parse_mode="HTML")
+                return
+            pr = await asyncio.get_event_loop().run_in_executor(
+                None, partial(mark_order_paid, order_id, payment_type, payment_id, creds=get_user_creds(chat_id))
             )
-            warn = "✅ Warning sent to seller" \
-                   if mr.get("retCode", mr.get("ret_code",-1)) == 0 \
-                   else f"⚠️ Warning failed: <code>{_esc(mr.get('retMsg',''))}</code>"
-            # Remove the pay buttons from the original message
-            try:
-                await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([]))
-            except Exception:
-                pass
-            await context.bot.send_message(chat_id=chat_id,
-                text=f"✅ <b>Order paid!</b> <code>{_esc(order_id)}</code>\n{_esc(warn)}", parse_mode="HTML")
-        else:
-            await context.bot.send_message(chat_id=chat_id,
-                text=f"❌ Failed\n<code>{_esc(pr.get('retMsg',''))}</code>", parse_mode="HTML")
+            if pr.get("retCode", pr.get("ret_code",-1)) == 0:
+                _s(tuser.id).paid_order_ids.add(order_id)
+                mr = await asyncio.get_event_loop().run_in_executor(
+                    None, partial(send_chat_message, order_id, SELLER_WARN_MSG,
+                                      creds=get_user_creds(chat_id))
+                )
+                warn_ok = mr.get("retCode", mr.get("ret_code",-1)) == 0
+                warn_label = "✅ Warning sent to seller" if warn_ok else f"⚠️ Warning failed: <code>{_esc(mr.get('retMsg',''))}</code>"
+                # ── Edit original message: remove buttons, show status badge ──
+                final_state = "warned" if warn_ok else "completed"
+                await _update_order_message_final(context.bot, chat_id, order_id, "Warning Sent", final_state)
+                await context.bot.send_message(chat_id=chat_id,
+                    text=f"✅ <b>Order paid!</b> <code>{_esc(order_id)}</code>\n{warn_label}", parse_mode="HTML")
+            else:
+                await context.bot.send_message(chat_id=chat_id,
+                    text=f"❌ Failed\n<code>{_esc(pr.get('retMsg',''))}</code>", parse_mode="HTML")
+
+    # ── 🔕 Order Status Badge (noop — already finalized) ──
+    elif data.startswith("order_status_noop_"):
+        await query.answer("This order has already been processed.", show_alert=False)
+        return
 
     # ── 🪙 Release Coin ──
     elif data.startswith("release_"):
@@ -4205,41 +4565,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    elif action == "api_flw_client_id":
-        val = text.strip()
-        if not val:
-            await update.message.reply_text(
-                "❌ FLW_CLIENT_ID cannot be empty. Please send the value.",
-                parse_mode="HTML"
-            )
-            return
-        _state["action"]                  = "api_flw_client_secret"
-        _state["_api_flw_client_id_temp"] = val
-        await update.message.reply_text(
-            "✅ <b>FLW_CLIENT_ID received.</b>\n\n"
-            "<b>Step 2 of 5:</b> Send your <b>FLW_CLIENT_SECRET</b>\n"
-            "<i>(starts with FLWSECK_ — found on Flutterwave dashboard → Settings → API)</i>",
-            parse_mode="HTML"
-        )
-        return
-
-    elif action == "api_flw_client_secret":
-        val = text.strip()
-        if not val:
-            await update.message.reply_text(
-                "❌ FLW_CLIENT_SECRET cannot be empty. Please send the value.",
-                parse_mode="HTML"
-            )
-            return
-        _state["action"]                      = "api_flw_public_key"
-        _state["_api_flw_client_secret_temp"] = val
-        await update.message.reply_text(
-            "✅ <b>FLW_CLIENT_SECRET received.</b>\n\n"
-            "<b>Step 3 of 5:</b> Send your <b>FLW_PUBLIC_KEY</b>\n"
-            "<i>(starts with FLWPUBK_ — found on Flutterwave dashboard → Settings → API)</i>",
-            parse_mode="HTML"
-        )
-        return
+    # ── Flutterwave 3-step credential input ──
+    # Only FLW_PUBLIC_KEY, FLW_SECRET_HASH, FLW_SECRET_KEY are required.
+    # FLW_CLIENT_ID and FLW_CLIENT_SECRET are NOT used by the transfer/webhook system.
 
     elif action == "api_flw_public_key":
         val = text.strip()
@@ -4249,11 +4577,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="HTML"
             )
             return
-        _state["action"]                    = "api_flw_secret_hash"
-        _state["_api_flw_public_key_temp"]  = val
+        _state["action"]                   = "api_flw_secret_hash"
+        _state["_api_flw_public_key_temp"] = val
         await update.message.reply_text(
             "✅ <b>FLW_PUBLIC_KEY received.</b>\n\n"
-            "<b>Step 4 of 5:</b> Send your <b>FLW_SECRET_HASH</b>\n"
+            "<b>Step 2 of 3:</b> Send your <b>FLW_SECRET_HASH</b>\n"
             "<i>(Webhook secret hash — set on Flutterwave dashboard → Webhooks)</i>",
             parse_mode="HTML"
         )
@@ -4267,11 +4595,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="HTML"
             )
             return
-        _state["action"]                     = "api_flw_secret_key"
-        _state["_api_flw_secret_hash_temp"]  = val
+        _state["action"]                    = "api_flw_secret_key"
+        _state["_api_flw_secret_hash_temp"] = val
         await update.message.reply_text(
             "✅ <b>FLW_SECRET_HASH received.</b>\n\n"
-            "<b>Step 5 of 5:</b> Send your <b>FLW_SECRET_KEY</b>\n"
+            "<b>Step 3 of 3:</b> Send your <b>FLW_SECRET_KEY</b>\n"
             "<i>(Live secret key — starts with FLWSECK_ — used for transfers and payouts)</i>",
             parse_mode="HTML"
         )
@@ -4286,26 +4614,19 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="HTML"
             )
             return
-        # Pull all collected values
-        client_id     = _state.pop("_api_flw_client_id_temp",     "")
-        client_secret = _state.pop("_api_flw_client_secret_temp", "")
-        public_key    = _state.pop("_api_flw_public_key_temp",    "")
-        secret_hash   = _state.pop("_api_flw_secret_hash_temp",   "")
-        secret_key    = val  # FLW_SECRET_KEY — used for all API auth calls
+        public_key  = _state.pop("_api_flw_public_key_temp",  "")
+        secret_hash = _state.pop("_api_flw_secret_hash_temp", "")
+        secret_key  = val  # primary key used for all API auth and transfers
 
-        db.save_api(uid, "flw_client_id",     client_id)
-        db.save_api(uid, "flw_client_secret", client_secret)
-        db.save_api(uid, "flw_public_key",    public_key)
-        db.save_api(uid, "flw_secret_hash",   secret_hash)
-        db.save_api(uid, "flw_secret_key",    secret_key)   # primary key used for API calls
+        db.save_api(uid, "flw_public_key",  public_key)
+        db.save_api(uid, "flw_secret_hash", secret_hash)
+        db.save_api(uid, "flw_secret_key",  secret_key)
 
         _state["action"] = None
         _save_settings(uid)
         await update.message.reply_text(
             "✅ <b>Flutterwave API saved!</b>\n\n"
-            "All 5 credentials stored securely per your account:\n"
-            "  ✔ FLW_CLIENT_ID\n"
-            "  ✔ FLW_CLIENT_SECRET\n"
+            "All 3 credentials stored securely per your account:\n"
             "  ✔ FLW_PUBLIC_KEY\n"
             "  ✔ FLW_SECRET_HASH\n"
             "  ✔ FLW_SECRET_KEY\n\n"
