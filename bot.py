@@ -126,6 +126,9 @@ def _load_settings_from_disk(uid: int):
     Also back-populates slot-keyed keys from generic keys (and vice versa)
     so that both ad_id_1/bybit_uid_1 and ad_id/bybit_uid are always in sync.
     This ensures UID and Ad ID survive /start, restarts, and slot switches.
+
+    AD BOT settings (mode, increment, float_pct, local_usdt_ref, interval) are
+    also stored per-slot and restored here for the user's active slot.
     """
     saved = db.load_settings(uid)
     if saved:
@@ -145,9 +148,25 @@ def _load_settings_from_disk(uid: int):
                 slot1_val = sess.settings.get(f"{field}_1", "")
                 if slot1_val:
                     sess.settings[field] = slot1_val
+
+        # ── Restore active slot's AD BOT settings into generic keys ──
+        # This ensures the correct slot's config is active after /start or restart.
+        # Ensure selected_slot is set first (default to 0)
+        if not hasattr(sess, "selected_slot"):
+            sess.selected_slot = 0
+        active_slot_str = str(sess.selected_slot + 1)
+        for field, default in [("mode", "fixed"), ("increment", "0.05"),
+                                ("float_pct", ""), ("local_usdt_ref", ""), ("interval", 2)]:
+            slot_val = sess.settings.get(f"{field}_{active_slot_str}")
+            if slot_val is not None and slot_val != "":
+                sess.settings[field] = slot_val
+            elif not sess.settings.get(field):
+                sess.settings[field] = default
+
         logger.debug(f"[Settings] Loaded for user={uid}: ad_id={sess.settings.get('ad_id')!r} "
                      f"bybit_uid={sess.settings.get('bybit_uid')!r} "
-                     f"ad_id_1={sess.settings.get('ad_id_1')!r} bybit_uid_1={sess.settings.get('bybit_uid_1')!r}")
+                     f"ad_id_1={sess.settings.get('ad_id_1')!r} bybit_uid_1={sess.settings.get('bybit_uid_1')!r} "
+                     f"mode={sess.settings.get('mode')!r} slot={active_slot_str}")
 
 SELLER_WARN_MSG = (
     "Dear seller, your average release time is too long, I can't proceed with the payment. "
@@ -369,6 +388,7 @@ def ads_section_keyboard(uid: int = 0):
         [
             InlineKeyboardButton("🆔 Set Ad ID",    callback_data="set_ad_id"),
             InlineKeyboardButton("👤 Set UID",      callback_data="set_uid"),
+            InlineKeyboardButton("🗑 Del UID",      callback_data="delete_uid"),
         ],
         [
             InlineKeyboardButton("📋 Fetch Ad Details", callback_data="fetch_ad"),
@@ -3240,15 +3260,32 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         # ── PER-USER slot switch — does NOT affect any other user ──
         # NEVER call set_active_account() here — that modifies the global
         # bybit._active_index which is shared across ALL users.
-        _s(tuser.id).selected_slot = idx   # only this user changes
 
-        # Clear this user's session data (other users are untouched)
+        # ── Save current slot's AD BOT settings before switching ──
+        old_slot_str = _get_user_slot_str(tuser.id)
+        _s(tuser.id).settings[f"mode_{old_slot_str}"]          = _s(tuser.id).settings.get("mode", "fixed")
+        _s(tuser.id).settings[f"increment_{old_slot_str}"]     = _s(tuser.id).settings.get("increment", "0.05")
+        _s(tuser.id).settings[f"float_pct_{old_slot_str}"]     = _s(tuser.id).settings.get("float_pct", "")
+        _s(tuser.id).settings[f"local_usdt_ref_{old_slot_str}"]= _s(tuser.id).settings.get("local_usdt_ref", "")
+        _s(tuser.id).settings[f"interval_{old_slot_str}"]      = _s(tuser.id).settings.get("interval", 2)
+        _save_settings(tuser.id)   # persist before slot change
+
+        _s(tuser.id).selected_slot = idx   # only this user changes
+        new_slot_str = _get_user_slot_str(tuser.id)
+
+        # Clear volatile order/ad data (other users are untouched)
         _s(tuser.id).ad_data.clear()
         _s(tuser.id).seen_order_ids.clear(); _s(tuser.id).paid_order_ids.clear()
         _s(tuser.id).seen_sell_ids.clear();  _s(tuser.id).released_ids.clear()
-        for k, v in [("ad_id",""),("bybit_uid",""),("mode","fixed"),
-                     ("increment","0.05"),("float_pct",""),("local_usdt_ref",""),("interval",2)]:
-            _s(tuser.id).settings[k] = v
+
+        # ── Restore new slot's saved AD BOT settings (do NOT overwrite with defaults) ──
+        _s(tuser.id).settings["ad_id"]          = _s(tuser.id).settings.get(f"ad_id_{new_slot_str}", "")
+        _s(tuser.id).settings["bybit_uid"]      = _s(tuser.id).settings.get(f"bybit_uid_{new_slot_str}", "")
+        _s(tuser.id).settings["mode"]           = _s(tuser.id).settings.get(f"mode_{new_slot_str}", "fixed")
+        _s(tuser.id).settings["increment"]      = _s(tuser.id).settings.get(f"increment_{new_slot_str}", "0.05")
+        _s(tuser.id).settings["float_pct"]      = _s(tuser.id).settings.get(f"float_pct_{new_slot_str}", "")
+        _s(tuser.id).settings["local_usdt_ref"] = _s(tuser.id).settings.get(f"local_usdt_ref_{new_slot_str}", "")
+        _s(tuser.id).settings["interval"]       = _s(tuser.id).settings.get(f"interval_{new_slot_str}", 2)
 
         acct = accounts[idx]
         logger.info(f"[Slot] User {tuser.id} switched to slot {idx+1} ({acct['label']}) — other users unaffected")
@@ -3691,6 +3728,42 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             InlineKeyboardMarkup(back_section("section_ads"))
         )
 
+    # ── 🗑 Delete UID ──
+    elif data == "delete_uid":
+        slot_str = _get_user_slot_str(tuser.id)
+        cur = (
+            _s(tuser.id).settings.get(f"bybit_uid_{slot_str}", "")
+            or _s(tuser.id).settings.get("bybit_uid", "")
+            or "Not set"
+        )
+        await edit_menu(query,
+            f"🗑 <b>Delete UID — Account {slot_str}</b>\n\n"
+            f"Current UID: <code>{_esc(cur)}</code>\n\n"
+            f"This removes the UID for Account {slot_str} only.\n"
+            f"Other accounts and users are not affected.\n\n"
+            f"Tap confirm to delete.",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Yes, Delete UID", callback_data="delete_uid_confirm")],
+                [InlineKeyboardButton("❌ Cancel",          callback_data="set_uid")],
+            ])
+        )
+
+    elif data == "delete_uid_confirm":
+        slot_str = _get_user_slot_str(tuser.id)
+        _s(tuser.id).settings[f"bybit_uid_{slot_str}"] = ""
+        # Clear generic key only if it was pointing at this slot's value
+        if _s(tuser.id).settings.get("bybit_uid") == _s(tuser.id).settings.get(f"bybit_uid_{slot_str}", ""):
+            _s(tuser.id).settings["bybit_uid"] = ""
+        # In all cases, sync generic key from slot key (which is now "")
+        _s(tuser.id).settings["bybit_uid"] = ""
+        _save_settings(tuser.id)
+        logger.info(f"[UID] Deleted bybit_uid for user={tuser.id} slot={slot_str}")
+        await edit_menu(query,
+            f"✅ <b>UID deleted for Account {slot_str}.</b>\n\n"
+            f"Tap 👤 Set UID to enter a new one.",
+            InlineKeyboardMarkup(back_section("section_ads"))
+        )
+
     # ── 📃 My Ads ──
     elif data == "fetch_my_ads":
         uid   = tuser.id
@@ -3776,7 +3849,10 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
     # ── 🔀 Switch Mode ──
     elif data == "switch_mode":
         new_mode = "floating" if _s(tuser.id).settings.get("mode") == "fixed" else "fixed"
-        _s(tuser.id).settings["mode"] = new_mode
+        slot_str = _get_user_slot_str(tuser.id)
+        _s(tuser.id).settings["mode"]              = new_mode
+        _s(tuser.id).settings[f"mode_{slot_str}"]  = new_mode
+        _save_settings(tuser.id)
         note = " (takes effect next cycle)" if _s(tuser.id).refresh_running else ""
         await edit_menu(query,
             f"🔀 <b>Switched to {new_mode.upper()}{note}</b>\n\n_{next_setup_hint(tuser.id)}_",
@@ -4756,11 +4832,13 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif action == "bybit_uid":
-        # Save under BOTH the slot-keyed key (what ads_section_text reads first)
-        # AND the generic fallback key, so it works regardless of how it is read.
+        # Save under the slot-keyed key ONLY.
+        # The generic "bybit_uid" key is synced from the ACTIVE slot's value so it
+        # always reflects the current slot without leaking into other slots.
         slot_str = _get_user_slot_str(uid)
         _s(uid).settings[f"bybit_uid_{slot_str}"] = text.strip()
-        _s(uid).settings["bybit_uid"]              = text.strip()
+        # Keep generic key in sync with current slot (used by chat monitor etc.)
+        _s(uid).settings["bybit_uid"] = text.strip()
         _state["action"] = None
         # Persist to disk immediately so it survives /start, restarts, slot switches
         _save_settings(uid)
@@ -4786,8 +4864,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             val = Decimal(text)
             if val <= 0: raise ValueError
-            _s(uid).settings["increment"] = text
+            slot_str = _get_user_slot_str(uid)
+            _s(uid).settings["increment"]               = text
+            _s(uid).settings[f"increment_{slot_str}"]   = text
             _state["action"] = None
+            _save_settings(uid)
             await reply_with_back(f"✅ <b>Increment saved!</b>\n\n<code>+{_esc(text)}</code> per cycle\n\n<i>{_esc(next_setup_hint(uid))}</i>")
         except Exception:
             await update.message.reply_text("❌ Send a positive number like `0.05`", parse_mode="HTML")
@@ -4814,8 +4895,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="HTML"
                 )
                 return
-            _s(uid).settings["float_pct"] = text
+            slot_str = _get_user_slot_str(uid)
+            _s(uid).settings["float_pct"]              = text
+            _s(uid).settings[f"float_pct_{slot_str}"]  = text
             _state["action"] = None
+            _save_settings(uid)
             await reply_with_back(
                 f"✅ <b>Float % saved!</b>\n\n<code>{text}%</code> for <code>{token}/{currency}</code>\n\n"
                 f"_{next_setup_hint(uid)}_"
@@ -4827,9 +4911,12 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             val = float(text)
             if val <= 0: raise ValueError
-            _s(uid).settings["local_usdt_ref"] = text
+            slot_str = _get_user_slot_str(uid)
+            _s(uid).settings["local_usdt_ref"]                 = text
+            _s(uid).settings[f"local_usdt_ref_{slot_str}"]     = text
             _scur = _s(uid).ad_data.get("currencyId","NGN").upper() if _s(uid).ad_data else "NGN"
             _state["action"] = None
+            _save_settings(uid)
             await reply_with_back(f"✅ <b>{_esc(_scur)}/USDT ref saved!</b>\n\n<code>{_esc(text)}</code>\n\n<i>{_esc(next_setup_hint(uid))}</i>")
         except Exception:
             await update.message.reply_text("❌ Send a number like `1580`", parse_mode="HTML")
@@ -4838,8 +4925,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             val = int(text)
             if val < 1: raise ValueError
-            _s(uid).settings["interval"] = val
+            slot_str = _get_user_slot_str(uid)
+            _s(uid).settings["interval"]               = val
+            _s(uid).settings[f"interval_{slot_str}"]   = val
             _state["action"] = None
+            _save_settings(uid)
             await reply_with_back(f"✅ <b>Interval saved!</b>\n\nEvery <code>{_esc(str(val))}</code> min\n\n<i>{_esc(next_setup_hint(uid))}</i>")
         except Exception:
             await update.message.reply_text("❌ Send a whole number like `2`", parse_mode="HTML")
