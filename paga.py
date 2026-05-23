@@ -1,14 +1,21 @@
 """
 paga.py — Paga Business API wrapper using the official paga-business-client library.
 
-Render environment variables required:
-    PAGA_PRINCIPAL   → Your Paga Business Public Key / Principal (publicId)
-    PAGA_CREDENTIAL  → Your Paga Business Live Primary Secret Key (password)
-    PAGA_API_KEY     → Your Paga HMAC Hash Key / API Key
+MULTI-USER ARCHITECTURE:
+    All public functions accept (principal, credential, api_key) as the LAST
+    three positional arguments so each user's own credentials are used per call.
 
-Correct init (all positional):
-    BusinessClientCore(principal, credential, test, api_key)
-    test = False → Live server
+    There is NO global singleton client — a fresh BusinessClientCore is built
+    for every call using the caller's credentials.
+
+    Callers (bot.py) load credentials from DB:
+        principal  = db.get_api(user_id, "paga_principal")
+        credential = db.get_api(user_id, "paga_credential")
+        api_key    = db.get_api(user_id, "paga_api_key")
+
+    Then pass them to every paga function:
+        result = validate_account(account_no, bank_uuid, amount,
+                                  principal, credential, api_key)
 
 Add to requirements.txt:
     paga-business-client
@@ -16,45 +23,41 @@ Add to requirements.txt:
 
 import uuid
 import logging
-from config import PAGA_PRINCIPAL, PAGA_CREDENTIAL, PAGA_API_KEY
 
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────
-# 🏦 Bank UUID cache
+# 🏦 Bank UUID cache (keyed by principal so each user gets their own cache)
 # ─────────────────────────────────────────
-_banks_cache: list = []
-
-# ─────────────────────────────────────────
-# 🔌 Paga client — lazily initialised
-# ─────────────────────────────────────────
-_client = None
-
-
-def _get_client():
-    global _client
-    if _client is None:
-        from paga_business_client import BusinessClientCore
-        # Strictly positional — library does NOT accept keyword args
-        # (principal, credential, test, api_key)
-        _client = BusinessClientCore(
-            PAGA_PRINCIPAL,   # publicId
-            PAGA_CREDENTIAL,  # password / secret key
-            False,            # test=False → Live server
-            PAGA_API_KEY      # HMAC hash key
-        )
-        logger.info("[Paga] BusinessClientCore initialised — Live server")
-    return _client
+_banks_cache: dict[str, list] = {}   # {principal: [banks]}
 
 
 def _ref() -> str:
     return str(uuid.uuid4())
 
 
+def _make_client(principal: str, credential: str, api_key: str):
+    """
+    Build a fresh BusinessClientCore for the given credentials.
+    Strictly positional — library does NOT accept keyword args.
+    (principal, credential, test, api_key)
+    test = False → Live server
+    """
+    from paga_business_client import BusinessClientCore
+    client = BusinessClientCore(
+        principal,   # publicId
+        credential,  # password / secret key
+        False,       # test=False → Live server
+        api_key      # HMAC hash key
+    )
+    logger.debug(f"[Paga] Client built for principal={principal[:8]}...")
+    return client
+
+
 def _parse(response) -> dict:
     """
     The paga-business-client library returns a JSON string, not a parsed dict.
-    This normalises every response to a dict before we call .get() on it.
+    Normalises every response to a dict before we call .get() on it.
     """
     import json
     if isinstance(response, dict):
@@ -70,11 +73,7 @@ def _parse(response) -> dict:
 
 
 def _log_full(label: str, response) -> None:
-    """
-    Log the COMPLETE raw response from every Paga call.
-    This lets us see the exact field names in Render logs
-    without guessing — no more 'wrong field name' errors.
-    """
+    """Log the COMPLETE raw response for every Paga call (visible in Render logs)."""
     logger.info(f"[Paga] ═══ {label} FULL RESPONSE ═══")
     logger.info(f"[Paga] type={type(response)}")
     try:
@@ -89,10 +88,7 @@ def _log_full(label: str, response) -> None:
 
 
 def _rc(response: dict) -> int:
-    """
-    Safely extract responseCode from Paga response.
-    Handles int 0, string '0', and alternate field name response_code.
-    """
+    """Safely extract responseCode. Handles int 0, string '0', alternate field names."""
     rc = response.get("responseCode", response.get("response_code", -1))
     try:
         return int(rc)
@@ -102,18 +98,17 @@ def _rc(response: dict) -> int:
 
 # ─────────────────────────────────────────
 # 🏦 Get Banks
-# Positional args: (reference_number, locale)
 # ─────────────────────────────────────────
-def fetch_banks() -> list:
+def fetch_banks(principal: str, credential: str, api_key: str) -> list:
+    """Fetch the full bank list from Paga for the given user credentials."""
     global _banks_cache
-    logger.info("[Paga] Fetching bank list...")
+    logger.info(f"[Paga] Fetching bank list for principal={principal[:8]}...")
     try:
-        # Both args positional — library version requires locale as 2nd positional arg
-        response = _parse(_get_client().get_banks(_ref(), "en"))
+        client   = _make_client(principal, credential, api_key)
+        response = _parse(client.get_banks(_ref(), "en"))
         _log_full("GET_BANKS", response)
 
         if _rc(response) == 0:
-            # Try every known field name Paga uses for the bank list
             banks = (
                 response.get("banks")
                 or response.get("bank")
@@ -121,8 +116,8 @@ def fetch_banks() -> list:
                 or response.get("bank_list")
                 or []
             )
-            _banks_cache = banks
-            logger.info(f"[Paga] ✅ Fetched {len(banks)} banks")
+            _banks_cache[principal] = banks
+            logger.info(f"[Paga] ✅ Fetched {len(banks)} banks for principal={principal[:8]}...")
             return banks
 
         logger.error(
@@ -136,10 +131,11 @@ def fetch_banks() -> list:
         return []
 
 
-def get_banks() -> list:
-    if not _banks_cache:
-        fetch_banks()
-    return _banks_cache
+def get_banks(principal: str, credential: str, api_key: str) -> list:
+    """Return cached bank list for this principal, or fetch if not cached."""
+    if principal not in _banks_cache or not _banks_cache[principal]:
+        fetch_banks(principal, credential, api_key)
+    return _banks_cache.get(principal, [])
 
 
 # ─────────────────────────────────────────
@@ -168,8 +164,19 @@ KNOWN_UUIDS = {
 }
 
 
-def match_bank_uuid(bank_name: str, payment_name: str = "") -> str | None:
-    banks = get_banks()
+def match_bank_uuid(
+    bank_name: str,
+    payment_name: str = "",
+    principal: str = "",
+    credential: str = "",
+    api_key: str = "",
+) -> str | None:
+    """
+    Resolve a bank name to its Paga UUID.
+    Uses the live bank list for the given user credentials,
+    falling back to KNOWN_UUIDS if the live list is unavailable.
+    """
+    banks = get_banks(principal, credential, api_key) if principal else []
     for search in [bank_name, payment_name]:
         if not search:
             continue
@@ -203,13 +210,20 @@ def match_bank_uuid(bank_name: str, payment_name: str = "") -> str | None:
 
 # ─────────────────────────────────────────
 # ✅ Validate Account (pre-transfer check)
-# Positional args: (ref, amount, currency, bank_uuid, account_no, recipient_name, locale)
-# Logs FULL response so we can see the exact account name field
 # ─────────────────────────────────────────
-def validate_account(account_number: str, bank_uuid: str, amount: float = 100) -> dict:
+def validate_account(
+    account_number: str,
+    bank_uuid: str,
+    amount: float = 100,
+    principal: str = "",
+    credential: str = "",
+    api_key: str = "",
+) -> dict:
+    """Validate a bank account before transferring. Uses the caller's credentials."""
     logger.info(f"[Paga] Validating account {account_number} @ bank_uuid={bank_uuid}")
     try:
-        response = _parse(_get_client().validate_deposit_to_bank(
+        client   = _make_client(principal, credential, api_key)
+        response = _parse(client.validate_deposit_to_bank(
             _ref(),         # reference_number
             str(amount),    # amount
             "NGN",          # currency
@@ -223,8 +237,6 @@ def validate_account(account_number: str, bank_uuid: str, amount: float = 100) -
         ))
         _log_full("VALIDATE_DEPOSIT_TO_BANK", response)
 
-        # Try every known field name Paga may use for account holder name
-        # We log all of them so we can confirm the real one from Render logs
         for field in [
             "destinationAccountHolderNameAtBank",
             "destinationAccountName",
@@ -239,7 +251,7 @@ def validate_account(account_number: str, bank_uuid: str, amount: float = 100) -
                 logger.info(f"[Paga] Account name found in field '{field}': {val}")
                 break
         else:
-            logger.warning("[Paga] Could not find account name field in validate response — check FULL RESPONSE above")
+            logger.warning("[Paga] Could not find account name field — check FULL RESPONSE above")
 
         return response
 
@@ -249,10 +261,7 @@ def validate_account(account_number: str, bank_uuid: str, amount: float = 100) -
 
 
 def _extract_account_name(response: dict, fallback: str = "") -> str:
-    """
-    Extract account holder name from validate response.
-    Tries all known field names — the correct one will be clear from Render logs.
-    """
+    """Extract account holder name from validate response."""
     for field in [
         "destinationAccountHolderNameAtBank",
         "destinationAccountName",
@@ -269,7 +278,7 @@ def _extract_account_name(response: dict, fallback: str = "") -> str:
 
 
 def _extract_fee(response: dict) -> float:
-    """Extract transfer fee from validate response — handles multiple field names."""
+    """Extract transfer fee from validate response."""
     for field in ["fee", "transactionFee", "transaction_fee", "chargeFee", "charge_fee"]:
         val = response.get(field)
         if val is not None:
@@ -282,7 +291,6 @@ def _extract_fee(response: dict) -> float:
 
 # ─────────────────────────────────────────
 # 💸 Deposit to Bank (actual NGN transfer)
-# Positional args: (ref, amount, currency, bank_uuid, account_no, phone, recipient_name)
 # ─────────────────────────────────────────
 def deposit_to_bank(
     account_number: str,
@@ -292,14 +300,19 @@ def deposit_to_bank(
     recipient_phone: str = "",
     remarks: str = "P2P",
     callback_url: str = "",
-    reference: str = None
+    reference: str = None,
+    principal: str = "",
+    credential: str = "",
+    api_key: str = "",
 ) -> dict:
+    """Transfer NGN to a bank account using the caller's credentials."""
     ref = reference or _ref()
     logger.info(
         f"[Paga] Transfer {amount} NGN → {account_number} @ {bank_uuid} | ref={ref}"
     )
     try:
-        response = _parse(_get_client().deposit_to_bank(
+        client   = _make_client(principal, credential, api_key)
+        response = _parse(client.deposit_to_bank(
             ref,                         # reference_number
             str(amount),                 # amount
             "NGN",                       # currency
@@ -323,10 +336,17 @@ def deposit_to_bank(
 # ─────────────────────────────────────────
 # 🔍 Check Transfer Status
 # ─────────────────────────────────────────
-def check_status(reference: str) -> dict:
+def check_status(
+    reference: str,
+    principal: str = "",
+    credential: str = "",
+    api_key: str = "",
+) -> dict:
+    """Poll transfer status using the caller's credentials."""
     logger.info(f"[Paga] Status poll: {reference}")
     try:
-        response = _parse(_get_client().get_operation_status(reference))
+        client   = _make_client(principal, credential, api_key)
+        response = _parse(client.get_operation_status(reference))
         _log_full("GET_OPERATION_STATUS", response)
         return response
     except Exception as e:
@@ -337,21 +357,29 @@ def check_status(reference: str) -> dict:
 # ─────────────────────────────────────────
 # 🏓 Ping — validate credentials + warm bank cache
 # ─────────────────────────────────────────
-def ping_paga() -> dict:
-    if not PAGA_PRINCIPAL or not PAGA_CREDENTIAL or not PAGA_API_KEY:
+def ping_paga(principal: str, credential: str, api_key: str) -> dict:
+    """
+    Test a specific user's Paga credentials.
+    Accepts per-user credentials explicitly — no global config used.
+    """
+    if not principal or not credential or not api_key:
         return {
             "error": (
-                "Paga credentials not fully configured.\n"
-                "Set PAGA_PRINCIPAL, PAGA_CREDENTIAL, PAGA_API_KEY in Render environment."
+                "Paga credentials incomplete.\n"
+                "Provide PAGA_PRINCIPAL, PAGA_CREDENTIAL and PAGA_API_KEY."
             )
         }
-    banks = fetch_banks()
-    if not banks:
-        return {
-            "error": (
-                "Could not fetch banks from Paga.\n"
-                "• Verify PAGA_PRINCIPAL and PAGA_CREDENTIAL are correct\n"
-                "• Whitelist your Render IP on Paga dashboard → Settings → IP Whitelist"
-            )
-        }
-    return {"status": "ok", "message": "Connected", "banks": banks}
+    try:
+        banks = fetch_banks(principal, credential, api_key)
+        if not banks:
+            return {
+                "error": (
+                    "Could not fetch banks from Paga.\n"
+                    "• Verify your PAGA_PRINCIPAL and PAGA_CREDENTIAL are correct\n"
+                    "• Whitelist your Render IP on Paga dashboard → Settings → IP Whitelist"
+                )
+            }
+        return {"status": "ok", "message": "Connected", "banks": banks}
+    except Exception as e:
+        logger.error(f"[Paga] ping_paga error: {e}")
+        return {"error": str(e)}
