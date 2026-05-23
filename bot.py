@@ -1844,7 +1844,7 @@ async def _paga_autopay(bot, chat_id, order_id, order_detail):
             return
 
         bank_uuid = match_bank_uuid(bank_name, pay_type_name,
-                                    api_key=paga_api_key, credential=paga_credential, principal=paga_principal)
+                                    paga_principal, paga_credential, paga_api_key)
         if not bank_uuid:
             oid  = _esc(order_id)
             bank = _esc(bank_name or pay_type_name)
@@ -1900,7 +1900,7 @@ async def _paga_autopay(bot, chat_id, order_id, order_detail):
 
         validate = await asyncio.get_event_loop().run_in_executor(
             None, validate_account, account_no, bank_uuid, amount,
-            paga_api_key, paga_credential, paga_principal
+            paga_principal, paga_credential, paga_api_key
         )
 
         if validate.get("responseCode") != 0 or "error" in validate:
@@ -1948,7 +1948,7 @@ async def _paga_autopay(bot, chat_id, order_id, order_detail):
             account_no, bank_uuid, amount,
             verified_name, "",          # recipient_name, recipient_phone
             narration, callback_url, ref,
-            paga_api_key, paga_credential, paga_principal
+            paga_principal, paga_credential, paga_api_key
         )
 
         if "error" in result:
@@ -2012,7 +2012,7 @@ async def _paga_autopay(bot, chat_id, order_id, order_detail):
                 await asyncio.sleep(10)
                 poll = await asyncio.get_event_loop().run_in_executor(
                     None, check_status, ref,
-                    paga_api_key, paga_credential, paga_principal
+                    paga_principal, paga_credential, paga_api_key
                 )
                 final_code = poll.get("responseCode", -1)
                 final_msg  = poll.get("message", "") or ""
@@ -3086,7 +3086,7 @@ async def ping_paga_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ Testing Paga Business API...")
     from paga import ping_paga
     result = await asyncio.get_event_loop().run_in_executor(
-        None, partial(ping_paga, principal=principal, credential=credential, api_key=api_key)
+        None, ping_paga, principal, credential, api_key
     )
     if "error" in result:
         ip      = await _get_current_ip()
@@ -5135,6 +5135,128 @@ async def check_name_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"<i>(Checked against {count} names)</i>",
             parse_mode="HTML"
         )
+
+# ─────────────────────────────────────────
+# 📊 /userdata — Admin export (overrides admin_commands import)
+# Includes total_buy_orders + total_sell_orders from DB and live session.
+# ─────────────────────────────────────────
+async def cmd_userdata(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Download all user data as Excel. Admin only.
+
+    Buy/sell totals:
+      • DB value  — persisted by order monitor each time a new order is seen
+      • Live session — get_session(uid).seen_order_ids / seen_sell_ids set sizes
+      • Whichever is HIGHER wins, so totals are never under-reported.
+    Totals reset naturally when a session clears — no permanent analytics added.
+    """
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("❌ Admin only.")
+        return
+
+    try:
+        import io
+        import openpyxl
+        from openpyxl.styles import Font, PatternFill, Alignment
+    except ImportError:
+        await update.message.reply_text(
+            "❌ <b>openpyxl not installed.</b>\n\nRun: <code>pip install openpyxl</code>",
+            parse_mode="HTML"
+        )
+        return
+
+    await update.message.reply_text("⏳ Building user data export...")
+
+    try:
+        users = db.get_all_users() or []
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Users"
+
+        headers = [
+            "User ID", "Username", "Display Name", "Plan", "Plan Expires",
+            "Upgrade Pending", "Created At", "Last Active",
+            "Total BUY Orders", "Total SELL Orders",
+        ]
+        header_font = Font(bold=True, color="FFFFFF")
+        header_fill = PatternFill("solid", fgColor="1F4E79")
+
+        for col, h in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col, value=h)
+            cell.font      = header_font
+            cell.fill      = header_fill
+            cell.alignment = Alignment(horizontal="center")
+
+        for row_idx, user in enumerate(users, 2):
+            uid = int(user.get("user_id") or user.get("id") or 0)
+
+            # ── DB totals (persisted cumulatively by order monitor) ──
+            db_buy  = int(user.get("total_buy_orders",  0) or 0)
+            db_sell = int(user.get("total_sell_orders", 0) or 0)
+
+            # ── Live session totals (in-memory, current session only) ──
+            # get_session(uid) is safe to call for any uid — returns empty session
+            # if the user has no active session (sets will be empty → 0 counts).
+            try:
+                sess      = get_session(uid)
+                live_buy  = len(getattr(sess, "seen_order_ids", None) or set())
+                live_sell = len(getattr(sess, "seen_sell_ids",  None) or set())
+            except Exception:
+                live_buy  = 0
+                live_sell = 0
+
+            # Take whichever is higher — DB may lag if session hasn't flushed yet,
+            # live session resets to 0 after cleanup, so max() covers both cases.
+            total_buy  = max(db_buy,  live_buy)
+            total_sell = max(db_sell, live_sell)
+
+            row_data = [
+                uid,
+                user.get("username",        ""),
+                user.get("display_name",    "") or user.get("full_name", ""),
+                user.get("plan",            "free"),
+                user.get("plan_expires",    "") or user.get("plan_expiry", ""),
+                user.get("upgrade_pending", False),
+                user.get("created_at",      ""),
+                user.get("last_active",     "") or user.get("last_seen", ""),
+                total_buy,
+                total_sell,
+            ]
+            for col, val in enumerate(row_data, 1):
+                ws.cell(row=row_idx, column=col, value=val)
+
+        # Auto-width columns
+        for col in ws.columns:
+            max_len = max((len(str(c.value or "")) for c in col), default=10)
+            ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 40)
+
+        buf = io.BytesIO()
+        wb.save(buf)
+        buf.seek(0)
+
+        from datetime import datetime as _dt
+        fname = f"userdata_{_dt.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        await update.message.reply_document(
+            document=buf,
+            filename=fname,
+            caption=(
+                f"📊 <b>User Data Export</b>\n\n"
+                f"👥 {len(users)} users\n"
+                f"🕐 Generated: <code>{_dt.now().strftime('%Y-%m-%d %H:%M:%S')}</code>\n\n"
+                f"BUY/SELL totals: DB cumulative + live session (max of both)."
+            ),
+            parse_mode="HTML"
+        )
+
+    except Exception as _ude:
+        import traceback
+        logger.error(f"[userdata] Export error: {_ude}\n{traceback.format_exc()}")
+        await update.message.reply_text(
+            f"❌ <b>Export failed</b>\n\n<code>{_esc(str(_ude)[:300])}</code>",
+            parse_mode="HTML"
+        )
+
+
 def start_bot():
     global _paga_queue, _paga_worker_task
 
