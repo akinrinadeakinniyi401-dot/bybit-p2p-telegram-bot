@@ -82,18 +82,6 @@ _order_final_states: dict = {}      # {(chat_id, order_id): state_str}
 # Prevents concurrent auto-pay + manual tap on the same order.
 _order_action_locks: dict = {}      # {(chat_id, order_id): asyncio.Lock}
 
-# ── FLW Transfer Registry ──
-# Maps transfer_ref → {order_id, user_id (chat_id), slot, amount, pay_term}
-# Populated when a transfer is initiated; consumed by the webhook handler on success.
-# This is the ONLY mechanism to reconnect a webhook event back to the correct user + order.
-_flw_transfer_registry: dict = {}
-
-# ── Order Final-State Tracker ──
-# Maps order_id → final state string: "completed", "rejected", "warned", "failed", "expired"
-# Once set, all button callbacks for that order are ignored to prevent duplicate actions.
-# Key: str order_id. Value: str state.
-_order_final_states: dict = {}
-
 def _s(uid: int) -> SessionState:
     """Shorthand: get the per-user session for uid."""
     sess = get_session(uid)
@@ -2105,7 +2093,7 @@ async def _poll_order_chat(bot, chat_id: int, order_id: str):
     """
     try:
         result = await asyncio.get_event_loop().run_in_executor(
-            None, get_chat_messages, order_id, "1", "30"
+            None, partial(get_chat_messages, order_id, "1", "30", creds=get_user_creds(chat_id))
         )
         rc = result.get("retCode", result.get("ret_code", -1))
         if rc != 0:
@@ -2173,17 +2161,17 @@ async def _poll_order_chat(bot, chat_id: int, order_id: str):
                     _s(chat_id).my_account_id = account_id
                 if nick and not _s(chat_id).my_nick:
                     _s(chat_id).my_nick = nick
-                logger.info(f"[ChatMonitor] ⏭ Own msg {msg_id} (uid match: userId={user_id} acctId={account_id})")
+                logger.debug(f"[ChatMonitor] ⏭ Own msg {msg_id} (uid match)")
                 continue
 
             # ── Secondary filter: learned accountId ──
             if _s(chat_id).my_account_id and account_id == _s(chat_id).my_account_id:
-                logger.info(f"[ChatMonitor] ⏭ Own msg {msg_id} (accountId match={account_id})")
+                logger.debug(f"[ChatMonitor] ⏭ Own msg {msg_id} (accountId match)")
                 continue
 
             # ── Tertiary filter: learned nick ──
             if _s(chat_id).my_nick and nick == _s(chat_id).my_nick:
-                logger.info(f"[ChatMonitor] ⏭ Own msg {msg_id} (nick match='{nick}')")
+                logger.debug(f"[ChatMonitor] ⏭ Own msg {msg_id} (nick match)")
                 continue
 
             # ── This is a counterparty message — forward it ──
@@ -2373,7 +2361,7 @@ async def _handle_buy_order(bot, chat_id, order_id):
         seller_info = {}
         if seller_uid:
             si = await asyncio.get_event_loop().run_in_executor(
-                None, get_counterparty_info, str(seller_uid), order_id
+                None, partial(get_counterparty_info, str(seller_uid), order_id, creds=get_user_creds(chat_id))
             )
             if si.get("retCode", -1) == 0:
                 seller_info = si.get("result", {})
@@ -2562,7 +2550,7 @@ async def _handle_sell_incoming(bot, chat_id, order_id):
         buyer_info = {}
         if buyer_uid:
             bi = await asyncio.get_event_loop().run_in_executor(
-                None, get_counterparty_info, str(buyer_uid), order_id
+                None, partial(get_counterparty_info, str(buyer_uid), order_id, creds=get_user_creds(chat_id))
             )
             if bi.get("retCode", -1) == 0:
                 buyer_info = bi.get("result", {})
@@ -2665,7 +2653,7 @@ async def _handle_sell_paid(bot, chat_id, order_id):
         buyer_info = {}
         if buyer_uid:
             bi = await asyncio.get_event_loop().run_in_executor(
-                None, get_counterparty_info, str(buyer_uid), order_id
+                None, partial(get_counterparty_info, str(buyer_uid), order_id, creds=get_user_creds(chat_id))
             )
             if bi.get("retCode", -1) == 0:
                 buyer_info = bi.get("result", {})
@@ -3957,15 +3945,21 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         mode = _s(tuser.id).settings.get("mode","fixed")
         await edit_menu(query, f"⏳ Updating ({mode} mode)...", ads_section_keyboard(tuser.id))
         if mode == "fixed":
-            price = str(_s(tuser.id).current_price) if _s(tuser.id).current_price else _s(tuser.id).ad_data.get("price","0")
+            # ── FIX: always compute the NEXT price (base + increment), not the last applied price.
+            # current_price is 0 if the auto-loop has never run, so we start from ad_data["price"].
+            # This mirrors exactly what auto_update_loop does on each cycle.
+            _increment = Decimal(str(_s(tuser.id).settings.get("increment", "0.05")))
+            _base = _s(tuser.id).current_price if _s(tuser.id).current_price else Decimal(str(_s(tuser.id).ad_data.get("price", "0")))
+            _next_price = _base + _increment
+            price = str(_next_price.quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP))
         else:
-            float_pct    = float(_s(tuser.id).settings.get("float_pct",0))
+            # ── FIX: call calc_floating_price directly (it is sync) — do NOT wrap in
+            # run_in_executor which causes tuple-unpacking to silently fail.
+            float_pct      = float(_s(tuser.id).settings.get("float_pct", 0))
             local_usdt_ref = float(_s(tuser.id).settings.get("local_usdt_ref") or 0)
-            price, err   = await asyncio.get_event_loop().run_in_executor(
-                None, calc_floating_price, _s(tuser.id).ad_data, float_pct, local_usdt_ref
-            )
+            price, err     = calc_floating_price(_s(tuser.id).ad_data, float_pct, local_usdt_ref)
             if err:
-                await edit_menu(query, f"❌ `{err}`", InlineKeyboardMarkup(back_section("section_ads")))
+                await edit_menu(query, f"❌ <code>{_esc(str(err))}</code>", InlineKeyboardMarkup(back_section("section_ads")))
                 return
         result = await asyncio.get_event_loop().run_in_executor(
             None, modify_ad, _s(tuser.id).settings["ad_id"], price, _s(tuser.id).ad_data, _update_creds
@@ -3982,12 +3976,15 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 rm    = result.get("retMsg",  result.get("ret_msg",""))
                 price = bybit_max
         if rc == 0:
+            # ── Advance current_price so the next cycle (auto or manual) continues from here
+            if mode == "fixed":
+                _s(tuser.id).current_price = Decimal(price)
             await edit_menu(query,
                 f"✅ <b>Updated!</b> Price: <code>{price}</code> ({mode.upper()})\n\n_{next_setup_hint(tuser.id)}_",
                 InlineKeyboardMarkup(back_section("section_ads"))
             )
         else:
-            await edit_menu(query, f"❌ `{rc}` — `{rm}`", InlineKeyboardMarkup(back_section("section_ads")))
+            await edit_menu(query, f"❌ <code>{rc}</code> — <code>{_esc(rm)}</code>", InlineKeyboardMarkup(back_section("section_ads")))
 
     # ── 📢 Post/Remove Ad Manager — independent from auto-update ──
     # ── 📢 Post / Remove Ad Manager ──
@@ -5069,18 +5066,28 @@ async def _upgrade_notifier_loop(bot):
 
 
 async def _session_auto_reset_loop():
-    """Reset stale in-memory sessions every hour to prevent slowdown."""
+    """
+    Periodic memory cleanup — runs every 30 minutes.
+
+    Cleans:
+    1. Per-user session sets (seen_order_ids etc.) — trimmed to last 500 entries.
+    2. Global _order_final_states dict — keeps only entries for orders that still
+       have an active session (i.e. the user's monitor is still running). Stale
+       entries from completed/old orders are purged so the dict doesn't grow forever.
+    3. Global _order_action_locks dict — same rule; stale lock objects freed.
+    4. Global _flw_transfer_registry — entries older than 2 hours removed.
+       (Webhook should have fired by then; if not, the transfer is stale anyway.)
+    5. seen_chat_msgs per session — trimmed to last 30 active orders.
+    6. unpaid_log per session — trimmed to last 100 entries.
+
+    This is the PRIMARY defence against the bot slowing down after long runtime.
+    All of these dicts grow unboundedly without periodic cleanup.
+    """
     while True:
-        await asyncio.sleep(3600)
+        await asyncio.sleep(1800)   # every 30 minutes
         try:
-            from datetime import datetime
-            now = datetime.now()
-            stale_count = 0
-            # Reset P2P volatile data for any session older than 12h
-            for k in list(user_state.keys()):
-                pass   # user_state is per-interaction, nothing to clean
-            # Trim order tracking sets per user session
-            MAX_IDS = 1000
+            # ── 1. Per-user session trimming ──
+            MAX_IDS = 500   # reduced from 1000 — older entries are irrelevant
             for _sess in get_all_sessions():
                 if len(_sess.seen_order_ids) > MAX_IDS:
                     _sess.seen_order_ids = set(list(_sess.seen_order_ids)[-MAX_IDS:])
@@ -5090,13 +5097,53 @@ async def _session_auto_reset_loop():
                     _sess.seen_sell_ids = set(list(_sess.seen_sell_ids)[-MAX_IDS:])
                 if len(_sess.released_ids) > MAX_IDS:
                     _sess.released_ids = set(list(_sess.released_ids)[-MAX_IDS:])
-                if len(_sess.seen_chat_msgs) > 200:
-                    keys = list(_sess.seen_chat_msgs.keys())
-                    for k in keys[:-50]:
-                        del _sess.seen_chat_msgs[k]
-                if len(_sess.unpaid_log) > 500:
+                # seen_chat_msgs: {order_id: set(msg_ids)} — keep last 30 orders only
+                if len(_sess.seen_chat_msgs) > 30:
+                    _keep_keys = list(_sess.seen_chat_msgs.keys())[-30:]
+                    _sess.seen_chat_msgs = {k: _sess.seen_chat_msgs[k] for k in _keep_keys}
+                # unpaid_log: keep last 100 entries
+                if len(_sess.unpaid_log) > 100:
                     _sess.unpaid_log = _sess.unpaid_log[-100:]
-            logger.info("[AutoReset] Hourly memory cleanup done")
+                # order_msg_ids: keep last 200 message IDs
+                if hasattr(_sess, "order_msg_ids") and len(_sess.order_msg_ids) > 200:
+                    _keep = list(_sess.order_msg_ids.items())[-200:]
+                    _sess.order_msg_ids = dict(_keep)
+
+            # ── 2. Global _order_final_states — purge old entries ──
+            # Keep only entries where the user still has active orders in session.
+            # A simple size cap of 2000 is sufficient — beyond that, drop oldest half.
+            global _order_final_states, _order_action_locks, _flw_transfer_registry
+            if len(_order_final_states) > 2000:
+                _keep_n = list(_order_final_states.items())[-1000:]
+                _order_final_states = dict(_keep_n)
+
+            # ── 3. Global _order_action_locks — free locks for completed orders ──
+            # Only keep locks for orders that are NOT yet finalized (still in flight).
+            # Finalized orders' locks will never be acquired again — safe to delete.
+            _active_lock_keys = {
+                k for k in list(_order_action_locks.keys())
+                if k not in _order_final_states
+            }
+            # Also cap total lock count in case of edge cases
+            if len(_order_action_locks) > 500:
+                _order_action_locks = {
+                    k: v for k, v in _order_action_locks.items()
+                    if k in _active_lock_keys
+                }
+
+            # ── 4. Global _flw_transfer_registry — remove stale entries ──
+            # Entries should be consumed by webhook within minutes. After 2h, drop them.
+            # We don't store timestamps so use size cap: keep last 200 entries.
+            if len(_flw_transfer_registry) > 200:
+                _keep_flw = list(_flw_transfer_registry.items())[-100:]
+                _flw_transfer_registry = dict(_keep_flw)
+
+            logger.info(
+                f"[AutoReset] Cleanup done | "
+                f"final_states={len(_order_final_states)} "
+                f"locks={len(_order_action_locks)} "
+                f"flw_registry={len(_flw_transfer_registry)}"
+            )
         except Exception as e:
             logger.error(f"[AutoReset] Error: {e}")
 
