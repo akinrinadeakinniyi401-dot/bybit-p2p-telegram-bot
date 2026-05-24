@@ -152,20 +152,30 @@ def _get_headers(api_key: str, api_secret: str, payload: str = "") -> dict:
 
 
 def parse_response(response, label=""):
-    logger.info(f"[Bybit]{label} HTTP {response.status_code} | {response.text[:500]}")
-    if not response.text.strip():
+    status = response.status_code
+    text   = response.text or ""
+    if not text.strip():
+        logger.debug(f"[Bybit]{label} HTTP {status} | empty response")
         return {"retCode": -1, "retMsg": "Empty response — check IP whitelist"}
-    if response.status_code == 404:
+    if status == 404:
+        logger.warning(f"[Bybit]{label} HTTP 404 — endpoint not found")
         return {"retCode": -1, "retMsg": "404 — endpoint not found"}
-    if response.text.strip().startswith("<"):
-        return {"retCode": -1, "retMsg": f"CDN block — HTTP {response.status_code}"}
+    if text.strip().startswith("<"):
+        logger.warning(f"[Bybit]{label} HTTP {status} | CDN block")
+        return {"retCode": -1, "retMsg": f"CDN block — HTTP {status}"}
     try:
         data = response.json()
         if "ret_code" in data and "retCode" not in data:
             data["retCode"] = data["ret_code"]
             data["retMsg"]  = data.get("ret_msg", "")
+        ret_code = data.get("retCode", data.get("ret_code", -1))
+        if ret_code != 0:
+            logger.info(f"[Bybit]{label} HTTP {status} | retCode={ret_code} msg={data.get('retMsg','')!r}")
+        else:
+            logger.debug(f"[Bybit]{label} HTTP {status} | SUCCESS")
         return data
     except Exception as e:
+        logger.error(f"[Bybit]{label} JSON parse error: {e} | body={text[:200]!r}")
         return {"retCode": -1, "retMsg": f"JSON error: {e}"}
 
 
