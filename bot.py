@@ -3327,7 +3327,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         nm_s = "🔍 ON" if _s(tuser.id).name_match_enabled else "🔍 OFF"
         txt = (
             f"📡 <b>Bot Status</b>\n\n"
-            f"🔑 Active: <b>{(get_all_accounts()[_s(tuser.id).selected_slot] if get_all_accounts() and _s(tuser.id).selected_slot < len(get_all_accounts()) else (get_all_accounts()[0] if get_all_accounts() else {'label': 'User API Key'}))['label']}</b>\n"
+            f"🔑 Active: <b>{(get_all_accounts()[_s(tuser.id).selected_slot] if get_all_accounts() and _s(tuser.id).selected_slot < len(get_all_accounts()) else (get_all_accounts()[0] if get_all_accounts() else {'label': f'Account {_s(tuser.id).selected_slot + 1}'}))['label']}</b>\n"
             f"Setup: {bar} <code>{done}/{total}</code>\n\n"
             f"📊 Price Bot: {r_status}\n"
             f"📦 Order Monitor: {o_status}\n"
