@@ -244,27 +244,24 @@ def next_setup_hint(uid: int) -> str:
 # ─────────────────────────────────────────
 def get_user_creds(user_id: int, slot: int | None = None) -> dict | None:
     """
-    Load Bybit credentials for a user using THEIR OWN per-user slot.
+    Load Bybit credentials for a user using THEIR OWN per-user slot from DB.
 
     CRITICAL: Uses _s(user_id).selected_slot — NOT the global bybit._active_index.
     This ensures User A switching slots never affects User B.
+
+    ALL users — including admins — now load from DB first.
+    Admins fall back to env account ONLY if no DB key is saved for their slot,
+    so the bot works with or without Render env keys.
 
     Args:
         user_id: Telegram user ID
         slot: Optional override (0-based index). If None, uses user's own selected_slot.
 
     Return values:
-      - Admin        → None  (bybit._resolve_creds(None) uses the active env account)
-      - User w/ key  → {"key": ..., "secret": ...}
-      - User no key  → {"key": "", "secret": ""}   ← SENTINEL: caller must gate on this
-
-    The SENTINEL distinguishes "no key saved" from "admin using env".
-    Callers check:  if not creds or not creds.get("key"): show "No API set" error.
+      - User/admin w/ DB key  → {"key": ..., "secret": ...}
+      - Admin w/ no DB key    → None  (bybit._resolve_creds(None) uses env account if set)
+      - Non-admin no DB key   → {"key": "", "secret": ""}  ← SENTINEL: no key saved
     """
-    if is_admin(user_id):
-        return None  # admin always uses env account — no restriction
-
-    # ── Per-user slot — NEVER reads global bybit._active_index ──
     user_slot = slot if slot is not None else _get_user_slot(user_id)
     slot_str  = str(user_slot + 1)   # "1" or "2"
 
@@ -274,7 +271,13 @@ def get_user_creds(user_id: int, slot: int | None = None) -> dict | None:
         logger.debug(f"[Creds] User {user_id} slot {slot_str} — DB key found")
         return {"key": key, "secret": secret}
 
-    # No key saved for this user/slot — return sentinel (empty strings)
+    # No DB key for this user/slot
+    if is_admin(user_id):
+        # Admin fallback: use env account (may also be empty if no env keys set)
+        logger.info(f"[Creds] Admin {user_id} slot {slot_str} — no DB key, falling back to env account")
+        return None   # bybit._resolve_creds(None) uses BYBIT_ACCOUNTS[_active_index] if available
+
+    # Non-admin: return sentinel (empty strings) — callers show "No API set" error
     logger.info(f"[Creds] User {user_id} slot {slot_str} — NO API KEY SAVED")
     return {"key": "", "secret": ""}
 
@@ -323,7 +326,12 @@ def main_menu_text(uid: int = 0) -> str:
     # Per-user active account — NOT global
     _uid_slot = _s(uid).selected_slot
     _all_ac   = get_all_accounts()
-    acct      = _all_ac[_uid_slot] if _uid_slot < len(_all_ac) else _all_ac[0]
+    if _all_ac and _uid_slot < len(_all_ac):
+        acct = _all_ac[_uid_slot]
+    elif _all_ac:
+        acct = _all_ac[0]
+    else:
+        acct = {"label": f"Account {_uid_slot + 1}"}
     bp_status = f"🛡 ON ({sess.buyer_protection_mins}min)" if sess.buyer_protection_on else "🛡 OFF"
     nm_status = "🔍 ON"     if sess.name_match_enabled     else "🔍 OFF"
     badge     = sub.plan_badge(uid) if uid else _current_plan_badge
@@ -2792,6 +2800,20 @@ async def auto_update_loop(bot, chat_id):
     if s.get("mode") == "fixed":
         sess.current_price = Decimal(str(sess.ad_data.get("price","0")))
 
+    # ── Load this user's credentials ONCE at loop start ──
+    # Re-read from DB so any key updates take effect on next loop restart.
+    creds = get_user_creds(chat_id)
+    if not creds or not creds.get("key"):
+        await bot.send_message(chat_id=chat_id,
+            text=(
+                "❌ <b>Auto-Update stopped</b>\n\n"
+                "No Bybit API key found for your account.\n"
+                "Go to 🔑 <b>Set APIs</b> → <b>Set Bybit API</b> first."
+            ),
+            parse_mode="HTML")
+        sess.refresh_running = False
+        return
+
     cycle = 0
     while sess.refresh_running:
         cycle += 1
@@ -2814,7 +2836,7 @@ async def auto_update_loop(bot, chat_id):
                 continue
 
         result   = await asyncio.get_event_loop().run_in_executor(
-            None, modify_ad, s["ad_id"], new_p_str, sess.ad_data
+            None, modify_ad, s["ad_id"], new_p_str, sess.ad_data, creds
         )
         ret_code = result.get("retCode", result.get("ret_code",-1))
         ret_msg  = result.get("retMsg",  result.get("ret_msg","Unknown"))
@@ -2823,7 +2845,7 @@ async def auto_update_loop(bot, chat_id):
             bybit_max = _extract_bybit_max(ret_msg)
             if bybit_max:
                 retry_result = await asyncio.get_event_loop().run_in_executor(
-                    None, modify_ad, s["ad_id"], bybit_max, sess.ad_data
+                    None, modify_ad, s["ad_id"], bybit_max, sess.ad_data, creds
                 )
                 retry_code = retry_result.get("retCode", retry_result.get("ret_code",-1))
                 retry_msg  = retry_result.get("retMsg",  retry_result.get("ret_msg","Unknown"))
@@ -3922,6 +3944,13 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         if not _s(tuser.id).ad_data or not _s(tuser.id).settings.get("ad_id"):
             await edit_menu(query, "❌ Load ad details first.", InlineKeyboardMarkup(back_section("section_ads")))
             return
+        # Load per-user creds — MUST be done before modify_ad
+        _update_creds = get_user_creds(tuser.id)
+        if not _update_creds or not _update_creds.get("key"):
+            await edit_menu(query,
+                "❌ <b>No Bybit API key found.</b>\n\nGo to 🔑 Set APIs → Set Bybit API first.",
+                InlineKeyboardMarkup(back_section("section_ads")))
+            return
         mode = _s(tuser.id).settings.get("mode","fixed")
         await edit_menu(query, f"⏳ Updating ({mode} mode)...", ads_section_keyboard(tuser.id))
         if mode == "fixed":
@@ -3936,7 +3965,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 await edit_menu(query, f"❌ `{err}`", InlineKeyboardMarkup(back_section("section_ads")))
                 return
         result = await asyncio.get_event_loop().run_in_executor(
-            None, modify_ad, _s(tuser.id).settings["ad_id"], price, _s(tuser.id).ad_data
+            None, modify_ad, _s(tuser.id).settings["ad_id"], price, _s(tuser.id).ad_data, _update_creds
         )
         rc = result.get("retCode", result.get("ret_code",-1))
         rm = result.get("retMsg",  result.get("ret_msg",""))
@@ -3944,7 +3973,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             bybit_max = _extract_bybit_max(rm)
             if bybit_max:
                 result = await asyncio.get_event_loop().run_in_executor(
-                    None, modify_ad, _s(tuser.id).settings["ad_id"], bybit_max, _s(tuser.id).ad_data
+                    None, modify_ad, _s(tuser.id).settings["ad_id"], bybit_max, _s(tuser.id).ad_data, _update_creds
                 )
                 rc    = result.get("retCode", result.get("ret_code",-1))
                 rm    = result.get("retMsg",  result.get("ret_msg",""))
