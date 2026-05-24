@@ -33,9 +33,15 @@ if not BYBIT_ACCOUNTS:
         })
 
 if not BYBIT_ACCOUNTS:
-    raise ValueError(
-        "No Bybit API keys found. "
-        "Add BYBIT_API_KEY_1 and BYBIT_API_SECRET_1 to Render environment."
+    # Do NOT crash on startup — multi-user bot loads Bybit credentials dynamically
+    # from DB per user/slot. Env keys are optional (admin convenience only).
+    # If no env keys are set, admin-mode API calls will fail gracefully with an error
+    # rather than crashing the entire bot at startup.
+    import logging as _logging
+    _logging.getLogger(__name__).warning(
+        "No Bybit API keys found in environment. "
+        "This is fine for multi-user mode — users supply their own keys via bot setup. "
+        "Set BYBIT_API_KEY_1 / BYBIT_API_SECRET_1 in Render only if you need admin-mode Bybit access."
     )
 
 # ── Multiple admin Telegram IDs ──
