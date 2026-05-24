@@ -38,17 +38,19 @@ _active_index = 0
 def set_active_account(index: int):
     """Switch the active ENV account (admin only). Does NOT affect user creds."""
     global _active_index
-    if 0 <= index < len(BYBIT_ACCOUNTS):
+    if BYBIT_ACCOUNTS and 0 <= index < len(BYBIT_ACCOUNTS):
         _active_index = index
         logger.info(f"[Bybit] Env active account → {BYBIT_ACCOUNTS[index]['label']}")
 
 
 def get_active_account() -> dict:
+    if not BYBIT_ACCOUNTS:
+        return {"label": "No env account", "key": "", "secret": ""}
     return BYBIT_ACCOUNTS[_active_index]
 
 
 def get_all_accounts() -> list:
-    return BYBIT_ACCOUNTS
+    return BYBIT_ACCOUNTS  # may be empty — callers must handle []
 
 
 def _resolve_creds(creds: dict | None) -> tuple[str, str]:
@@ -56,11 +58,17 @@ def _resolve_creds(creds: dict | None) -> tuple[str, str]:
     Return (api_key, api_secret) for a call.
     - If creds dict provided and non-empty → use it (per-user DB keys).
     - Otherwise → use active env account (admin/fallback).
+    - If env account is also missing → return ("", "") so the API call
+      fails with an auth error rather than a crash. The error will be
+      surfaced to the user as a retCode != 0 response.
     """
     if creds and creds.get("key") and creds.get("secret"):
         return creds["key"].strip(), creds["secret"].strip()
-    env = BYBIT_ACCOUNTS[_active_index]
-    return env["key"], env["secret"]
+    if BYBIT_ACCOUNTS:
+        env = BYBIT_ACCOUNTS[_active_index]
+        return env["key"], env["secret"]
+    logger.warning("[Bybit] _resolve_creds: no creds supplied and no env account configured")
+    return "", ""
 
 
 # ─────────────────────────────────────────
