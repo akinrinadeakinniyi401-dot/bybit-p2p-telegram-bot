@@ -292,16 +292,18 @@ def main_menu_keyboard(uid: int = 0):
     r_icon = "🟢" if (sess and sess.refresh_running) else "📊"
     all_ac = get_all_accounts()
 
-    kb = []
-    if len(all_ac) > 1:
-        _user_slot_idx = _s(uid).selected_slot if uid else 0
-        kb.append([
-            InlineKeyboardButton(
-                f"{'✅ ' if i == _user_slot_idx else ''}{ac['label']}",
-                callback_data=f"switch_account_{i}"
-            )
-            for i, ac in enumerate(all_ac)
-        ])
+    # ── Account slot buttons ──
+    # Always show 2 slots regardless of whether env keys are set.
+    # Labels come from BYBIT_ACCOUNTS if available; otherwise use "Account N" fallback.
+    # This ensures the switcher is visible even in pure multi-user (no env keys) mode.
+    _user_slot_idx = _s(uid).selected_slot if uid else 0
+    _num_slots = max(len(all_ac), 2)   # always at least 2 slots
+    _slot_row = []
+    for i in range(_num_slots):
+        label = all_ac[i]["label"] if i < len(all_ac) else f"Account {i + 1}"
+        tick  = "✅ " if i == _user_slot_idx else ""
+        _slot_row.append(InlineKeyboardButton(f"{tick}{label}", callback_data=f"switch_account_{i}"))
+    kb = [_slot_row]
 
     kb += [
         [InlineKeyboardButton(f"{r_icon} AD PRICE BOT",  callback_data="section_ads")],
@@ -3272,7 +3274,8 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
     elif data.startswith("switch_account_"):
         idx      = int(data.split("_")[-1])
         accounts = get_all_accounts()
-        if idx >= len(accounts):
+        # Allow up to 2 slots regardless of env keys — credentials come from DB
+        if idx >= max(len(accounts), 2):
             await query.answer("Invalid account", show_alert=True)
             return
         if _s(tuser.id).refresh_running or _s(tuser.id).order_monitor_running:
@@ -3309,10 +3312,10 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         _s(tuser.id).settings["local_usdt_ref"] = _s(tuser.id).settings.get(f"local_usdt_ref_{new_slot_str}", "")
         _s(tuser.id).settings["interval"]       = _s(tuser.id).settings.get(f"interval_{new_slot_str}", 2)
 
-        acct = accounts[idx]
-        logger.info(f"[Slot] User {tuser.id} switched to slot {idx+1} ({acct['label']}) — other users unaffected")
+        acct_label = accounts[idx]["label"] if idx < len(accounts) else f"Account {idx + 1}"
+        logger.info(f"[Slot] User {tuser.id} switched to slot {idx+1} ({acct_label}) — other users unaffected")
         await edit_menu(query,
-            f"✅ <b>Switched to {acct['label']}</b>\n\nYour session cleared.\n\n" + main_menu_text(tuser.id),
+            f"✅ <b>Switched to {acct_label}</b>\n\nYour session cleared.\n\n" + main_menu_text(tuser.id),
             main_menu_keyboard(tuser.id)
         )
 
