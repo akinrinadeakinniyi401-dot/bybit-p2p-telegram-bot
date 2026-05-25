@@ -2209,7 +2209,13 @@ async def _poll_order_chat(bot, chat_id: int, order_id: str):
 
 
 async def chat_monitor_loop(bot, chat_id: int):
-    """Background loop — polls all active order chats every 12 seconds."""
+    """Background loop — polls all active order chats every 8 seconds.
+
+    Rate-limit fix: orders are polled SEQUENTIALLY with a 1.5 s gap between each,
+    instead of all at once via asyncio.gather.  With up to ~5 active orders this
+    keeps us comfortably below Bybit's 10 read-req/s per-UID limit even when the
+    order monitor is also running in parallel.
+    """
     # Note: chat_monitor_enabled is set to True by the toggle handler BEFORE
     # this task is created, so the UI reflects the change immediately.
     logger.info("💬 CHAT MONITOR STARTED")
@@ -2217,15 +2223,16 @@ async def chat_monitor_loop(bot, chat_id: int):
     while _s(chat_id).chat_monitor_enabled:
         try:
             active_ids = _get_active_order_ids(chat_id)
-            if active_ids:
-                tasks = [
-                    asyncio.create_task(_poll_order_chat(bot, chat_id, oid))
-                    for oid in active_ids
-                ]
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                for r in results:
-                    if isinstance(r, Exception):
-                        logger.error(f"[ChatMonitor] Task error: {r}")
+            for oid in active_ids:
+                # Stop mid-loop immediately if monitor was disabled
+                if not _s(chat_id).chat_monitor_enabled:
+                    break
+                try:
+                    await _poll_order_chat(bot, chat_id, oid)
+                except Exception as e:
+                    logger.error(f"[ChatMonitor] Poll error for order {oid}: {e}")
+                # 1.5 s gap between each order poll — prevents burst spikes
+                await asyncio.sleep(1.5)
         except Exception as e:
             logger.error(f"[ChatMonitor] Loop error: {e}")
 
@@ -2312,31 +2319,44 @@ async def order_monitor_loop(bot, chat_id):
             sell_incoming   = _items(sell_incoming_res)
             sell_paid_items = _items(sell_paid_res)
 
+            # Build list of (coroutine) for new orders — stored as coroutines NOT tasks
+            # so we can run them sequentially and avoid bursting the Bybit rate limit
+            # when multiple orders arrive in the same poll cycle.
             tasks = []
             for item in buy_items:
                 oid = item.get("id")
                 if oid and oid not in sess.seen_order_ids:
                     sess.seen_order_ids.add(oid)
-                    tasks.append(asyncio.create_task(_handle_buy_order(bot, chat_id, oid)))
+                    tasks.append(_handle_buy_order(bot, chat_id, oid))
 
             for item in sell_incoming:
                 oid = item.get("id")
                 if oid and oid not in sess.seen_sell_ids:
                     sess.seen_sell_ids.add(oid)
-                    tasks.append(asyncio.create_task(_handle_sell_incoming(bot, chat_id, oid)))
+                    tasks.append(_handle_sell_incoming(bot, chat_id, oid))
 
             for item in sell_paid_items:
                 oid         = item.get("id")
                 release_key = f"paid_{oid}"
                 if oid and release_key not in sess.seen_sell_ids:
                     sess.seen_sell_ids.add(release_key)
-                    tasks.append(asyncio.create_task(_handle_sell_paid(bot, chat_id, oid)))
+                    tasks.append(_handle_sell_paid(bot, chat_id, oid))
 
-            if tasks:
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                for r in results:
-                    if isinstance(r, Exception):
-                        logger.error(f"[Orders] Task error for user {chat_id}: {r}")
+            # Rate-limit fix: run each new-order handler one at a time with a short gap.
+            # Each handler makes 2 API calls (get_order_detail + get_counterparty_info).
+            # Running them all in parallel when 5 orders arrive = 10 simultaneous calls
+            # which reliably triggers Bybit's 10 req/s limit (retCode 10006).
+            for coro in tasks:
+                if not sess.order_monitor_running:
+                    break
+                try:
+                    await coro
+                except Exception as e:
+                    logger.error(f"[Orders] Task error for user {chat_id}: {e}")
+                # 1.2 s stagger — allows up to ~8 new orders per 10 s cycle
+                # before the next poll, well within the 10 req/s read limit.
+                if tasks.index(coro) < len(tasks) - 1:
+                    await asyncio.sleep(1.2)
 
         except asyncio.CancelledError:
             logger.info(f"[Orders] Monitor task cancelled for user {chat_id}")
@@ -5065,7 +5085,7 @@ async def _upgrade_notifier_loop(bot):
             logger.error(f"[UpgradeNotifier] Loop error: {_loop_err}")
 
 
-async def _session_auto_reset_loop():
+async def _session_auto_reset_loop(bot=None):
     """
     Periodic memory cleanup — runs every 30 minutes.
 
@@ -5079,6 +5099,7 @@ async def _session_auto_reset_loop():
        (Webhook should have fired by then; if not, the transfer is stale anyway.)
     5. seen_chat_msgs per session — trimmed to last 30 active orders.
     6. unpaid_log per session — trimmed to last 100 entries.
+    7. Notifies users with active order monitoring so they know to re-check settings.
 
     This is the PRIMARY defence against the bot slowing down after long runtime.
     All of these dicts grow unboundedly without periodic cleanup.
@@ -5086,8 +5107,9 @@ async def _session_auto_reset_loop():
     while True:
         await asyncio.sleep(1800)   # every 30 minutes
         try:
-            # ── 1. Per-user session trimming ──
-            MAX_IDS = 500   # reduced from 1000 — older entries are irrelevant
+            # ── 1. Per-user session trimming + active-user notification ──
+            MAX_IDS   = 500   # reduced from 1000 — older entries are irrelevant
+            notified  = 0
             for _sess in get_all_sessions():
                 if len(_sess.seen_order_ids) > MAX_IDS:
                     _sess.seen_order_ids = set(list(_sess.seen_order_ids)[-MAX_IDS:])
@@ -5108,6 +5130,27 @@ async def _session_auto_reset_loop():
                 if hasattr(_sess, "order_msg_ids") and len(_sess.order_msg_ids) > 200:
                     _keep = list(_sess.order_msg_ids.items())[-200:]
                     _sess.order_msg_ids = dict(_keep)
+
+                # ── Notify users who have order monitoring active ──
+                if bot and _sess.order_monitor_running:
+                    try:
+                        await bot.send_message(
+                            chat_id=_sess.user_id,
+                            text=(
+                                "🔄 <b>Scheduled System Cleanup</b>\n\n"
+                                "The bot has completed its routine 30-minute memory cleanup "
+                                "to maintain optimal performance and remove stale session data.\n\n"
+                                "⚠️ <b>If you are currently trading</b>, please verify that your "
+                                "Order Monitor and any auto-pay settings are still active. "
+                                "Tap /menu → <b>📦 Order Monitor</b> to confirm and restart if needed.\n\n"
+                                "✅ Your API keys and saved settings are <b>not affected</b> — "
+                                "only the active in-memory session state was refreshed."
+                            ),
+                            parse_mode="HTML"
+                        )
+                        notified += 1
+                    except Exception as _notify_err:
+                        logger.debug(f"[AutoReset] Could not notify user {_sess.user_id}: {_notify_err}")
 
             # ── 2. Global _order_final_states — purge old entries ──
             # Keep only entries where the user still has active orders in session.
@@ -5139,7 +5182,7 @@ async def _session_auto_reset_loop():
                 _flw_transfer_registry = dict(_keep_flw)
 
             logger.info(
-                f"[AutoReset] Cleanup done | "
+                f"[AutoReset] Cleanup done | notified={notified} active users | "
                 f"final_states={len(_order_final_states)} "
                 f"locks={len(_order_action_locks)} "
                 f"flw_registry={len(_flw_transfer_registry)}"
@@ -5395,8 +5438,8 @@ def start_bot():
             asyncio.get_event_loop().run_in_executor(None, load_scammers)
         )
 
-        # Auto-reset stale sessions every hour
-        asyncio.create_task(_session_auto_reset_loop())
+        # Auto-reset stale sessions every 30 minutes + notify active users
+        asyncio.create_task(_session_auto_reset_loop(app.bot))
 
         # Auto-clear old DB sessions every 12h
         asyncio.create_task(_db_session_cleanup_loop())
