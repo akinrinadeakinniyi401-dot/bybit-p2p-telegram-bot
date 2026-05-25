@@ -238,7 +238,9 @@ async def run_bot_setup(render_url):
         asyncio.create_task(bot_module._db_session_cleanup_loop())
         # Pre-load scammer list
         from fraud_check import load_scammers as _load_scammers
-        asyncio.create_task(asyncio.get_event_loop().run_in_executor(None, _load_scammers))
+        async def _preload_scammers():
+            await asyncio.get_event_loop().run_in_executor(None, _load_scammers)
+        asyncio.create_task(_preload_scammers())
         logger.info("🟡 All background tasks started (fallback)")
 
     await bot.bot.set_webhook(url=webhook_url)
