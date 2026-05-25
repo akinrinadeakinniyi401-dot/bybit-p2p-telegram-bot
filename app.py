@@ -213,13 +213,34 @@ async def run_bot_setup(render_url):
     bot = start_bot()
     await bot.initialize()
 
-    # ── Ensure Paga queue worker is running ──
+    # ── CRITICAL: manually start all background tasks ──
+    # When running Flask + manual webhook (instead of bot.run_webhook / run_polling),
+    # python-telegram-bot NEVER calls post_init automatically — so _session_auto_reset_loop,
+    # _paga_queue_worker, _upgrade_notifier_loop, and the scammer pre-loader were all
+    # silently skipped on every deploy.  We call post_init explicitly here to fix that.
     import bot as bot_module
-    if bot_module._paga_queue is None:
-        bot_module._paga_queue = asyncio.Queue()
-    if bot_module._paga_worker_task is None or bot_module._paga_worker_task.done():
-        bot_module._paga_worker_task = asyncio.create_task(bot_module._paga_queue_worker())
-        logger.info("🟡 Paga payment queue worker started from app.py")
+    try:
+        if callable(getattr(bot, "post_init", None)):
+            await bot.post_init(bot)
+            logger.info("✅ post_init called — all background tasks started (session reset, paga queue, upgrade notifier)")
+        else:
+            raise AttributeError("post_init not callable")
+    except Exception as _pi_err:
+        # Fallback: start each background task directly in case post_init signature differs
+        logger.warning(f"⚠️ post_init failed ({_pi_err}) — starting background tasks manually")
+        if bot_module._paga_queue is None:
+            bot_module._paga_queue = asyncio.Queue()
+        if bot_module._paga_worker_task is None or bot_module._paga_worker_task.done():
+            bot_module._paga_worker_task = asyncio.create_task(bot_module._paga_queue_worker())
+            logger.info("🟡 Paga queue worker started (fallback)")
+        asyncio.create_task(bot_module._session_auto_reset_loop(bot.bot))
+        asyncio.create_task(bot_module._upgrade_notifier_loop(bot.bot))
+        asyncio.create_task(bot_module._db_session_cleanup_loop())
+        # Pre-load scammer list
+        from fraud_check import load_scammers as _load_scammers
+        asyncio.create_task(asyncio.get_event_loop().run_in_executor(None, _load_scammers))
+        logger.info("🟡 All background tasks started (fallback)")
+
     await bot.bot.set_webhook(url=webhook_url)
     # Set commands visible to regular users (no admin commands)
     await bot.bot.set_my_commands([
