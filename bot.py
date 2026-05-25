@@ -5433,10 +5433,11 @@ def start_bot():
         _paga_queue       = asyncio.Queue()
         _paga_worker_task = asyncio.create_task(_paga_queue_worker())
 
-        # Pre-load scammer list
-        asyncio.create_task(
-            asyncio.get_event_loop().run_in_executor(None, load_scammers)
-        )
+        # Pre-load scammer list — run_in_executor returns a Future not a coroutine,
+        # so wrap it in an async helper before passing to create_task.
+        async def _preload_scammers():
+            await asyncio.get_event_loop().run_in_executor(None, load_scammers)
+        asyncio.create_task(_preload_scammers())
 
         # Auto-reset stale sessions every 30 minutes + notify active users
         asyncio.create_task(_session_auto_reset_loop(app.bot))
