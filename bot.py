@@ -5191,39 +5191,49 @@ async def _session_auto_reset_loop(bot=None):
                         await bot.send_message(
                             chat_id=_sess.user_id,
                             text=(
-                                "🔄 <b>Scheduled System Reset</b>
-
-"
+                                "🔄 <b>Scheduled System Reset</b>\n\n"
                                 "The bot performs an automatic reset every 30 minutes to maintain "
-                                "optimal performance and prevent API rate-limit issues.
-
-"
-                                "Your active session has been cleared. This includes:
-"
-                                "• Order Monitor
-"
-                                "• Chat Monitor
-"
-                                "• Auto-Pay (Bybit / Flutterwave / Paga)
-"
-                                "• Sell Message
-"
-                                "• Buyer Protection &amp; Name Match
-
-"
+                                "optimal performance and prevent API rate-limit issues.\n\n"
+                                "Your active session has been cleared. This includes:\n"
+                                "• Order Monitor\n"
+                                "• Chat Monitor\n"
+                                "• Auto-Pay (Bybit / Flutterwave / Paga)\n"
+                                "• Sell Message\n"
+                                "• Buyer Protection &amp; Name Match\n\n"
                                 "<b>If you are currently trading</b>, please tap /menu and "
-                                "re-enable the features you need.
-
-"
+                                "re-enable the features you need.\n\n"
                                 "✅ Your API keys and account settings are <b>not affected</b>."
                             ),
-                            parse_mode="HTML"
                         )
                         notified += 1
                     except Exception as _notify_err:
                         logger.debug(f"[AutoReset] Could not notify user {_sess.user_id}: {_notify_err}")
 
-
+            # Global dict trimming
+            global _order_final_states, _order_action_locks, _flw_transfer_registry
+            if len(_order_final_states) > 2000:
+                _keep_n = list(_order_final_states.items())[-1000:]
+                _order_final_states = dict(_keep_n)
+            _active_lock_keys = {
+                k for k in list(_order_action_locks.keys())
+                if k not in _order_final_states
+            }
+            if len(_order_action_locks) > 500:
+                _order_action_locks = {
+                    k: v for k, v in _order_action_locks.items()
+                    if k in _active_lock_keys
+                }
+            if len(_flw_transfer_registry) > 200:
+                _keep_flw = list(_flw_transfer_registry.items())[-100:]
+                _flw_transfer_registry = dict(_keep_flw)
+            logger.info(
+                f"[AutoReset] Cleanup done | notified={notified} active users | "
+                f"final_states={len(_order_final_states)} "
+                f"locks={len(_order_action_locks)} "
+                f"flw_registry={len(_flw_transfer_registry)}"
+            )
+        except Exception as e:
+            logger.error(f"[AutoReset] Error: {e}")
 async def _db_session_cleanup_loop():
     """Clear old disk session files every 12 hours."""
     while True:
