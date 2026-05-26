@@ -5085,32 +5085,88 @@ async def _upgrade_notifier_loop(bot):
             logger.error(f"[UpgradeNotifier] Loop error: {_loop_err}")
 
 
+def _reset_user_session(sess) -> bool:
+    """
+    Fully deactivate all active features for one user — identical to the
+    'Reset Session' button.  Returns True if anything was actually active.
+    API keys and saved disk settings are NOT touched.
+    """
+    was_active = (
+        sess.order_monitor_running or sess.refresh_running or
+        sess.chat_monitor_enabled  or sess.auto_pay_enabled or
+        sess.flw_pay_enabled       or sess.paga_pay_enabled or
+        sess.buyer_protection_on   or sess.name_match_enabled or
+        sess.sell_msg_enabled
+    )
+    if not was_active:
+        return False
+
+    # Stop all background tasks
+    sess.refresh_running       = False
+    sess.order_monitor_running = False
+    sess.chat_monitor_enabled  = False
+    if sess.refresh_task and not sess.refresh_task.done():
+        sess.refresh_task.cancel()
+    sess.refresh_task = None
+    if sess.order_monitor_task and not sess.order_monitor_task.done():
+        sess.order_monitor_task.cancel()
+    sess.order_monitor_task = None
+    if sess.chat_monitor_task and not sess.chat_monitor_task.done():
+        sess.chat_monitor_task.cancel()
+    sess.chat_monitor_task = None
+
+    # Deactivate all feature flags
+    sess.auto_pay_enabled    = False
+    sess.flw_pay_enabled     = False
+    sess.paga_pay_enabled    = False
+    sess.buyer_protection_on = False
+    sess.name_match_enabled  = False
+    sess.sell_msg_enabled    = False
+    sess.sell_msg_count      = 1
+
+    # Clear volatile order / chat state
+    sess.seen_chat_msgs.clear()
+    sess.reply_state.clear()
+    sess.order_msg_ids.clear()
+    sess.my_account_id = ""
+    sess.my_nick       = ""
+    sess.current_price = Decimal("0")
+    sess.ad_data.clear()
+    sess.seen_order_ids = set()
+    sess.paid_order_ids = set()
+    sess.seen_sell_ids  = set()
+    sess.released_ids   = set()
+    sess.unpaid_log     = []
+
+    # Reset volatile P2P settings (API keys + sender_name etc. are kept)
+    for k, v in [("ad_id",""),("mode","fixed"),("increment","0.05"),
+                 ("float_pct",""),("local_usdt_ref",""),("interval",2)]:
+        sess.settings[k] = v
+    sess.settings.pop("manage_ad_id",   None)
+    sess.settings.pop("manage_ad_data", None)
+    sess.settings.pop("post_ad_qty",    None)
+
+    logger.info(f"[AutoReset] Session fully reset for user {sess.user_id}")
+    return True
+
+
 async def _session_auto_reset_loop(bot=None):
     """
-    Periodic memory cleanup — runs every 30 minutes.
-
-    Cleans:
-    1. Per-user session sets (seen_order_ids etc.) — trimmed to last 500 entries.
-    2. Global _order_final_states dict — keeps only entries for orders that still
-       have an active session (i.e. the user's monitor is still running). Stale
-       entries from completed/old orders are purged so the dict doesn't grow forever.
-    3. Global _order_action_locks dict — same rule; stale lock objects freed.
-    4. Global _flw_transfer_registry — entries older than 2 hours removed.
-       (Webhook should have fired by then; if not, the transfer is stale anyway.)
-    5. seen_chat_msgs per session — trimmed to last 30 active orders.
-    6. unpaid_log per session — trimmed to last 100 entries.
-    7. Notifies users with active order monitoring so they know to re-check settings.
-
-    This is the PRIMARY defence against the bot slowing down after long runtime.
-    All of these dicts grow unboundedly without periodic cleanup.
+    Runs every 30 minutes.
+    For every user with ANY active feature (order monitor, chat monitor,
+    auto-pay, sell msg, buyer protection, name match) it:
+      1. Fully resets their session — same as pressing the Reset Session button.
+      2. Sends a Telegram notification so they can re-enable if still trading.
+    Also trims global dicts to prevent unbounded memory growth.
     """
     while True:
         await asyncio.sleep(1800)   # every 30 minutes
         try:
-            # ── 1. Per-user session trimming + active-user notification ──
-            MAX_IDS   = 500   # reduced from 1000 — older entries are irrelevant
-            notified  = 0
+            MAX_IDS  = 500
+            notified = 0
+
             for _sess in get_all_sessions():
+                # Always trim memory sets regardless of active state
                 if len(_sess.seen_order_ids) > MAX_IDS:
                     _sess.seen_order_ids = set(list(_sess.seen_order_ids)[-MAX_IDS:])
                 if len(_sess.paid_order_ids) > MAX_IDS:
@@ -5119,76 +5175,53 @@ async def _session_auto_reset_loop(bot=None):
                     _sess.seen_sell_ids = set(list(_sess.seen_sell_ids)[-MAX_IDS:])
                 if len(_sess.released_ids) > MAX_IDS:
                     _sess.released_ids = set(list(_sess.released_ids)[-MAX_IDS:])
-                # seen_chat_msgs: {order_id: set(msg_ids)} — keep last 30 orders only
                 if len(_sess.seen_chat_msgs) > 30:
                     _keep_keys = list(_sess.seen_chat_msgs.keys())[-30:]
                     _sess.seen_chat_msgs = {k: _sess.seen_chat_msgs[k] for k in _keep_keys}
-                # unpaid_log: keep last 100 entries
                 if len(_sess.unpaid_log) > 100:
                     _sess.unpaid_log = _sess.unpaid_log[-100:]
-                # order_msg_ids: keep last 200 message IDs
                 if hasattr(_sess, "order_msg_ids") and len(_sess.order_msg_ids) > 200:
                     _keep = list(_sess.order_msg_ids.items())[-200:]
                     _sess.order_msg_ids = dict(_keep)
 
-                # ── Notify users who have order monitoring active ──
-                if bot and _sess.order_monitor_running:
+                # Reset any user who has at least one active feature, then notify
+                was_reset = _reset_user_session(_sess)
+                if was_reset and bot:
                     try:
                         await bot.send_message(
                             chat_id=_sess.user_id,
                             text=(
-                                "🔄 <b>Scheduled System Cleanup</b>\n\n"
-                                "The bot has completed its routine 30-minute memory cleanup "
-                                "to maintain optimal performance and remove stale session data.\n\n"
-                                "⚠️ <b>If you are currently trading</b>, please verify that your "
-                                "Order Monitor and any auto-pay settings are still active. "
-                                "Tap /menu → <b>📦 Order Monitor</b> to confirm and restart if needed.\n\n"
-                                "✅ Your API keys and saved settings are <b>not affected</b> — "
-                                "only the active in-memory session state was refreshed."
+                                "🔄 <b>Scheduled System Reset</b>
+
+"
+                                "The bot performs an automatic reset every 30 minutes to maintain "
+                                "optimal performance and prevent API rate-limit issues.
+
+"
+                                "Your active session has been cleared. This includes:
+"
+                                "• Order Monitor
+"
+                                "• Chat Monitor
+"
+                                "• Auto-Pay (Bybit / Flutterwave / Paga)
+"
+                                "• Sell Message
+"
+                                "• Buyer Protection &amp; Name Match
+
+"
+                                "<b>If you are currently trading</b>, please tap /menu and "
+                                "re-enable the features you need.
+
+"
+                                "✅ Your API keys and account settings are <b>not affected</b>."
                             ),
                             parse_mode="HTML"
                         )
                         notified += 1
                     except Exception as _notify_err:
                         logger.debug(f"[AutoReset] Could not notify user {_sess.user_id}: {_notify_err}")
-
-            # ── 2. Global _order_final_states — purge old entries ──
-            # Keep only entries where the user still has active orders in session.
-            # A simple size cap of 2000 is sufficient — beyond that, drop oldest half.
-            global _order_final_states, _order_action_locks, _flw_transfer_registry
-            if len(_order_final_states) > 2000:
-                _keep_n = list(_order_final_states.items())[-1000:]
-                _order_final_states = dict(_keep_n)
-
-            # ── 3. Global _order_action_locks — free locks for completed orders ──
-            # Only keep locks for orders that are NOT yet finalized (still in flight).
-            # Finalized orders' locks will never be acquired again — safe to delete.
-            _active_lock_keys = {
-                k for k in list(_order_action_locks.keys())
-                if k not in _order_final_states
-            }
-            # Also cap total lock count in case of edge cases
-            if len(_order_action_locks) > 500:
-                _order_action_locks = {
-                    k: v for k, v in _order_action_locks.items()
-                    if k in _active_lock_keys
-                }
-
-            # ── 4. Global _flw_transfer_registry — remove stale entries ──
-            # Entries should be consumed by webhook within minutes. After 2h, drop them.
-            # We don't store timestamps so use size cap: keep last 200 entries.
-            if len(_flw_transfer_registry) > 200:
-                _keep_flw = list(_flw_transfer_registry.items())[-100:]
-                _flw_transfer_registry = dict(_keep_flw)
-
-            logger.info(
-                f"[AutoReset] Cleanup done | notified={notified} active users | "
-                f"final_states={len(_order_final_states)} "
-                f"locks={len(_order_action_locks)} "
-                f"flw_registry={len(_flw_transfer_registry)}"
-            )
-        except Exception as e:
-            logger.error(f"[AutoReset] Error: {e}")
 
 
 async def _db_session_cleanup_loop():
