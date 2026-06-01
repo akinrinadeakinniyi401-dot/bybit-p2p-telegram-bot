@@ -341,6 +341,19 @@ def release_assets(order_id: str, creds: dict | None = None) -> dict:
 
 
 # ─────────────────────────────────────────
+# 💳 User Payment Methods
+# ─────────────────────────────────────────
+def get_user_payment_list(creds: dict | None = None) -> dict:
+    """
+    POST /v5/p2p/user/payment/list
+    Returns the user's own saved payment methods.
+    Each item contains paymentType and paymentConfigVo.paymentName.
+    Used to resolve payment type codes (e.g. 521) to real names (e.g. PalmPay).
+    """
+    return _post("/v5/p2p/user/payment/list", {}, creds=creds)
+
+
+# ─────────────────────────────────────────
 # 💬 Chat
 # ─────────────────────────────────────────
 def send_chat_message(order_id: str, message: str,
