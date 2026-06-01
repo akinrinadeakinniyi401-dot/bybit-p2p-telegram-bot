@@ -174,14 +174,8 @@ def _get_or_register_user(telegram_user):
     uid   = telegram_user.id
     uname = telegram_user.username or ""
     dname = telegram_user.full_name or ""
-    result = db.get_or_create_user(uid, uname, dname)
-    # Update last_active on every interaction so /userdata shows current timestamp
-    try:
-        from datetime import datetime as _dtnow
-        db.update_user_stats(uid, last_active=_dtnow.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"))
-    except Exception:
-        pass   # non-fatal — never block the user's action
-    return result
+    # get_or_create_user already writes last_active on every call (db.py line 160)
+    return db.get_or_create_user(uid, uname, dname)
 
 # Pre-populate admin chat IDs from environment config so upgrade notifications
 # work even before the admin has sent /start in this deploy session.
@@ -5487,7 +5481,7 @@ async def cmd_userdata(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 user.get("plan_expires",    "") or user.get("plan_expiry", ""),
                 user.get("upgrade_pending", False),
                 user.get("created_at",      ""),
-                user.get("last_active",     "") or user.get("last_seen", ""),
+                user.get("stats", {}).get("last_active", "") or user.get("last_active", "") or user.get("last_seen", ""),
                 total_buy,
                 total_sell,
             ]
