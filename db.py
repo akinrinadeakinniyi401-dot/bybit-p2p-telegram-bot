@@ -363,6 +363,30 @@ def increment_stat(user_id: int, stat: str, amount: int = 1):
         _write_json(_user_path(user_id), user)
 
 
+def update_user_stats(user_id: int, **kwargs):
+    """
+    Update one or more stats fields for a user.
+    Accepts any keyword argument that maps to a field in user['stats'].
+    Common usage:
+        update_user_stats(uid, last_active="2025-01-01 12:00:00")
+        update_user_stats(uid, total_buy_orders=5)
+    Always safe to call — silently returns if user not found.
+    """
+    with _lock:
+        user = get_user(user_id)
+        if not user:
+            return
+        if "stats" not in user or not isinstance(user["stats"], dict):
+            user["stats"] = {
+                "total_buy_orders":  0,
+                "total_sell_orders": 0,
+                "last_active":       "",
+            }
+        for key, value in kwargs.items():
+            user["stats"][key] = value
+        _write_json(_user_path(user_id), user)
+
+
 # ─────────────────────────────────────────
 # Session state (volatile P2P data — reset every 12h)
 # ─────────────────────────────────────────
