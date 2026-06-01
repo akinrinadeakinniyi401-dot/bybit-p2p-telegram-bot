@@ -20,6 +20,7 @@ from bybit import (
     set_active_account, get_active_account, get_all_accounts,
     get_chat_messages, post_new_ad, remove_ad,
     take_ad_offline, put_ad_online,
+    get_user_payment_list,
 )
 from fraud_check import check_buyer_name, load_scammers, get_scammer_count, get_last_updated
 import db
@@ -169,11 +170,18 @@ NO_ACCOUNT_WARN_MSG = (
 def is_admin(uid): return uid in ADMIN_IDS
 
 def _get_or_register_user(telegram_user):
-    """Register user in DB on first access. Returns (user_dict, is_new)."""
+    """Register user in DB on first access and update last_active. Returns (user_dict, is_new)."""
     uid   = telegram_user.id
     uname = telegram_user.username or ""
     dname = telegram_user.full_name or ""
-    return db.get_or_create_user(uid, uname, dname)
+    result = db.get_or_create_user(uid, uname, dname)
+    # Update last_active on every interaction so /userdata shows current timestamp
+    try:
+        from datetime import datetime as _dtnow
+        db.update_user_stats(uid, last_active=_dtnow.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC"))
+    except Exception:
+        pass   # non-fatal — never block the user's action
+    return result
 
 # Pre-populate admin chat IDs from environment config so upgrade notifications
 # work even before the admin has sent /start in this deploy session.
@@ -624,30 +632,113 @@ def buyer_protection_menu_text(uid: int = 0):
 # ─────────────────────────────────────────
 # 💳 Payment helpers
 # ─────────────────────────────────────────
-def _get_pay_name(pay_term: dict) -> str:
-    cfg = pay_term.get("paymentConfig", {}) or {}
+
+# Per-user payment method name cache: {user_id: {paymentType_str: paymentName_str}}
+# Populated lazily on first use; survives the session but is lightweight (just strings).
+_payment_name_cache: dict = {}
+
+
+def _fetch_user_payment_map(creds: dict) -> dict:
+    """
+    Call POST /v5/p2p/user/payment/list and return a dict mapping
+    paymentType (str) -> paymentName (str).
+    Falls back to empty dict on any error — callers always have the
+    static PAYMENT_TYPE_MAP in bybit.get_payment_name() as last resort.
+    """
+    try:
+        res = get_user_payment_list(creds=creds)
+        if res.get("retCode", -1) != 0:
+            return {}
+        items = res.get("result", {})
+        # result may be a list directly or wrapped in a key
+        if isinstance(items, dict):
+            items = items.get("paymentConfigVoList", items.get("list", []))
+        if not isinstance(items, list):
+            return {}
+        mapping = {}
+        for item in items:
+            ptype = str(item.get("paymentType", "")).strip()
+            pname = (
+                item.get("paymentConfigVo", {}).get("paymentName", "").strip()
+                or item.get("paymentName", "").strip()
+            )
+            if ptype and pname:
+                mapping[ptype] = pname
+        return mapping
+    except Exception as e:
+        logger.debug(f"[PaymentMap] Could not fetch user payment list: {e}")
+        return {}
+
+
+def _get_payment_name_for_user(ptype: str, uid: int) -> str:
+    """
+    Resolve a paymentType code to a human-readable name.
+    Priority: user's own payment list cache → static map → 'Type XXX' fallback.
+    """
+    if not ptype:
+        return "—"
+    ptype_str = str(ptype)
+    # 1. User's own cached map (most accurate — reflects their actual payment methods)
+    user_map = _payment_name_cache.get(uid, {})
+    if ptype_str in user_map:
+        return user_map[ptype_str]
+    # 2. Static built-in map in bybit.py
+    static = get_payment_name(ptype_str)
+    if not static.startswith("Type "):
+        return static
+    # 3. Fallback
+    return f"Type {ptype_str}"
+
+
+def _resolve_pay_term(order_detail: dict) -> dict:
+    """
+    Return the best available pay_term dict from an order.
+    Merges confirmedPayTerm + paymentTermList[0] so missing fields in one
+    can be filled from the other.
+    """
+    confirmed = order_detail.get("confirmedPayTerm", {}) or {}
+    terms     = order_detail.get("paymentTermList",   []) or []
+    fallback  = terms[0] if terms else {}
+    if not confirmed:
+        return dict(fallback)
+    if not fallback:
+        return dict(confirmed)
+    # Merge: confirmed takes priority; fallback fills any blank fields
+    merged = dict(fallback)
+    merged.update({k: v for k, v in confirmed.items() if v not in (None, "", {}, [])})
+    return merged
+
+
+def _get_pay_name(pay_term: dict, uid: int = 0) -> str:
+    """Resolve payment method name from a pay_term dict."""
+    # 1. paymentConfig.paymentName (richest source — comes from Bybit's own config)
+    cfg      = pay_term.get("paymentConfig", {}) or {}
     cfg_name = cfg.get("paymentName", "").strip()
     if cfg_name:
         return cfg_name
+    # 2. bankName field (sometimes contains the method name for bank transfers)
     bank = pay_term.get("bankName", "").strip()
+    # 3. paymentType code → resolved name
+    ptype = str(pay_term.get("paymentType", "")).strip()
+    if ptype:
+        resolved = _get_payment_name_for_user(ptype, uid)
+        if not resolved.startswith("Type "):
+            return resolved
+        # If we only have "Type XXX" and also have a bankName, prefer bankName
+        if bank:
+            return bank
+        return resolved
     if bank:
         return bank
-    ptype = pay_term.get("paymentType", "")
-    if ptype:
-        return get_payment_name(ptype)
     return "—"
 
 
 def _has_account_info(order_detail: dict) -> tuple:
     """
     Returns (has_info: bool, account_no: str, real_name: str).
-    Checks confirmedPayTerm first, then paymentTermList.
+    Uses merged pay_term from confirmedPayTerm + paymentTermList.
     """
-    pay_term = order_detail.get("confirmedPayTerm", {}) or {}
-    if not pay_term:
-        terms    = order_detail.get("paymentTermList", [])
-        pay_term = terms[0] if terms else {}
-
+    pay_term   = _resolve_pay_term(order_detail)
     account_no = pay_term.get("accountNo", "").strip()
     real_name  = (
         pay_term.get("realName", "").strip()
@@ -669,14 +760,16 @@ def format_order_message(order_detail: dict, seller_info: dict, uid: int = 0) ->
     order_id   = order_detail.get("id",        "—")
     token      = order_detail.get("tokenId",   "—")
 
-    pay_term   = order_detail.get("confirmedPayTerm", {}) or {}
-    if not pay_term:
-        terms    = order_detail.get("paymentTermList", [])
-        pay_term = terms[0] if terms else {}
+    # Unified resolver: merges confirmedPayTerm + paymentTermList[0] so no field is lost
+    pay_term   = _resolve_pay_term(order_detail)
 
-    pay_name   = _get_pay_name(pay_term)
+    pay_name   = _get_pay_name(pay_term, uid)
     bank_name  = pay_term.get("bankName",  "").strip() or "—"
-    real_name  = pay_term.get("realName",  "").strip() or order_detail.get("sellerRealName", "—")
+    real_name  = (
+        pay_term.get("realName", "").strip()
+        or order_detail.get("sellerRealName", "").strip()
+        or "—"
+    )
     account_no = pay_term.get("accountNo", "").strip() or "—"
 
     good_rate   = seller_info.get("goodAppraiseRate", "—")
@@ -715,7 +808,7 @@ def format_order_message(order_detail: dict, seller_info: dict, uid: int = 0) ->
     )
 
 
-def format_sell_order_message(order_detail: dict, buyer_info: dict) -> str:
+def format_sell_order_message(order_detail: dict, buyer_info: dict, uid: int = 0) -> str:
     quantity  = order_detail.get("quantity",  "—")
     amount    = order_detail.get("amount",    "—")
     currency  = order_detail.get("currencyId","—")
@@ -729,14 +822,16 @@ def format_sell_order_message(order_detail: dict, buyer_info: dict) -> str:
         or "—"
     )
 
-    my_pay_term = {}
-    pay_term_list = order_detail.get("paymentTermList", [])
-    if pay_term_list:
-        my_pay_term = pay_term_list[0]
-
-    my_pay_name  = _get_pay_name(my_pay_term)
+    # For sell orders MY payment details are in paymentTermList (seller's own terms).
+    # Use _resolve_pay_term to merge confirmedPayTerm + paymentTermList[0] so no field is lost.
+    my_pay_term  = _resolve_pay_term(order_detail)
+    my_pay_name  = _get_pay_name(my_pay_term, uid)
     my_bank      = my_pay_term.get("bankName",  "").strip() or "—"
-    my_name      = my_pay_term.get("realName",  "").strip() or order_detail.get("sellerRealName", "—")
+    my_name      = (
+        my_pay_term.get("realName", "").strip()
+        or order_detail.get("sellerRealName", "").strip()
+        or "—"
+    )
     my_account   = my_pay_term.get("accountNo", "").strip() or "—"
 
     good_rate    = buyer_info.get("goodAppraiseRate",    "—")
@@ -2386,7 +2481,16 @@ async def _handle_buy_order(bot, chat_id, order_id):
             if si.get("retCode", -1) == 0:
                 seller_info = si.get("result", {})
 
-        msg = format_order_message(order_detail, seller_info)
+        # Populate payment name cache for this user so Type XXX is resolved to real names
+        creds_for_map = get_user_creds(chat_id)
+        if chat_id not in _payment_name_cache or not _payment_name_cache[chat_id]:
+            fetched_map = await asyncio.get_event_loop().run_in_executor(
+                None, partial(_fetch_user_payment_map, creds_for_map)
+            )
+            if fetched_map:
+                _payment_name_cache[chat_id] = fetched_map
+
+        msg = format_order_message(order_detail, seller_info, uid=chat_id)
         sent_msg = await bot.send_message(
             chat_id=chat_id,
             text=f"🛒 <b>BUY Order — Pay Seller</b>\n{msg}",
@@ -2575,7 +2679,7 @@ async def _handle_sell_incoming(bot, chat_id, order_id):
             if bi.get("retCode", -1) == 0:
                 buyer_info = bi.get("result", {})
 
-        msg = format_sell_order_message(order_detail, buyer_info)
+        msg = format_sell_order_message(order_detail, buyer_info, uid=chat_id)
         await bot.send_message(
             chat_id=chat_id,
             text=f"💰 <b>SELL Order — Awaiting Buyer Payment</b>\n{msg}",
@@ -2678,7 +2782,7 @@ async def _handle_sell_paid(bot, chat_id, order_id):
             if bi.get("retCode", -1) == 0:
                 buyer_info = bi.get("result", {})
 
-        msg = format_sell_order_message(order_detail, buyer_info)
+        msg = format_sell_order_message(order_detail, buyer_info, uid=chat_id)
         await bot.send_message(
             chat_id=chat_id,
             text=f"✅ <b>SELL Order — Buyer Has Paid! Release Coin Now</b>\n{msg}",
