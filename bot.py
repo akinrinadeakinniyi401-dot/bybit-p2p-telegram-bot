@@ -5250,7 +5250,7 @@ def _reset_user_session(sess) -> bool:
 
 async def _session_auto_reset_loop(bot=None):
     """
-    Runs every 30 minutes.
+    Runs every 60 minutes (1 hour).
     For every user with ANY active feature (order monitor, chat monitor,
     auto-pay, sell msg, buyer protection, name match) it:
       1. Fully resets their session — same as pressing the Reset Session button.
@@ -5258,7 +5258,7 @@ async def _session_auto_reset_loop(bot=None):
     Also trims global dicts to prevent unbounded memory growth.
     """
     while True:
-        await asyncio.sleep(1800)   # every 30 minutes
+        await asyncio.sleep(3600)   # every 60 minutes
         try:
             MAX_IDS  = 500
             notified = 0
@@ -5289,19 +5289,19 @@ async def _session_auto_reset_loop(bot=None):
                         await bot.send_message(
                             chat_id=_sess.user_id,
                             text=(
-                                "🔄 <b>Scheduled System Reset</b>\n\n"
-                                "The bot performs an automatic reset every 30 minutes to maintain "
+                                "🔄 Scheduled System Reset\n\n"
+                                "The bot performs an automatic reset every hour to maintain "
                                 "optimal performance and prevent API rate-limit issues.\n\n"
                                 "Your active session has been cleared. This includes:\n"
                                 "• Order Monitor\n"
                                 "• Chat Monitor\n"
                                 "• Auto-Pay (Bybit / Flutterwave / Paga)\n"
                                 "• Sell Message\n"
-                                "• Buyer Protection &amp; Name Match\n\n"
-                                "<b>If you are currently trading</b>, please tap /menu and "
+                                "• Buyer Protection & Name Match\n\n"
+                                "If you are currently trading, please tap /menu and "
                                 "re-enable the features you need.\n\n"
-                                "✅ Your API keys and account settings are <b>not affected</b>."
-                            ),
+                                "✅ Your API keys and account settings are not affected."
+                            )
                         )
                         notified += 1
                     except Exception as _notify_err:
@@ -5580,7 +5580,7 @@ def start_bot():
             await asyncio.get_event_loop().run_in_executor(None, load_scammers)
         asyncio.create_task(_preload_scammers())
 
-        # Auto-reset stale sessions every 30 minutes + notify active users
+        # Auto-reset stale sessions every 60 minutes + notify active users
         asyncio.create_task(_session_auto_reset_loop(app.bot))
 
         # Auto-clear old DB sessions every 12h
