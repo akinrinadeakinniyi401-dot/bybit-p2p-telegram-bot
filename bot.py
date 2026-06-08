@@ -5402,8 +5402,16 @@ async def _db_session_cleanup_loop():
 
 
 async def refresh_scammers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Available to all registered users (not admin-only)
     _get_or_register_user(update.effective_user)
+    uid = update.effective_user.id
+    if not is_admin(uid) and not sub.is_pro(uid):
+        await update.message.reply_text(
+            "🔒 <b>Pro Plan Required</b>\n\n"
+            "The /refreshscammers command is available on the Pro plan only.\n\n"
+            "Tap <b>⬆️ Upgrade Plan</b> in /menu to request access from the admin.",
+            parse_mode="HTML"
+        )
+        return
     await update.message.reply_text("⏳ Refreshing scammer list from GitHub...")
     count = await asyncio.get_event_loop().run_in_executor(None, load_scammers)
     updated = get_last_updated()
@@ -5425,8 +5433,16 @@ async def refresh_scammers_command(update: Update, context: ContextTypes.DEFAULT
 
 async def check_name_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Manually check a name against the scammer list. Usage: /checkname John Doe"""
-    # Available to all registered users (not admin-only)
     _get_or_register_user(update.effective_user)
+    uid = update.effective_user.id
+    if not is_admin(uid) and not sub.is_pro(uid):
+        await update.message.reply_text(
+            "🔒 <b>Pro Plan Required</b>\n\n"
+            "The /checkname command is available on the Pro plan only.\n\n"
+            "Tap <b>⬆️ Upgrade Plan</b> in /menu to request access from the admin.",
+            parse_mode="HTML"
+        )
+        return
     name = " ".join(context.args).strip() if context.args else ""
     if not name:
         await update.message.reply_text(
