@@ -1,4 +1,5 @@
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 import logging
 from decimal import Decimal, ROUND_HALF_UP
@@ -54,6 +55,11 @@ async def _get_current_ip() -> str:
 #   - admin-level Paga queue (shared infra, not per-user state)
 #   - _current_user_id / _current_plan_badge (display-only, refreshed per request)
 from user_session import get_session, clear_session, get_all_sessions, SessionState
+
+# Dedicated thread pool for ad modification calls (modify_ad via run_in_executor).
+# Isolated from the default executor so order/chat monitor threads can never starve
+# ad-update threads (and vice versa), which was causing Telegram timeouts under load.
+_ad_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ad_modify")
 
 # Admin-level Paga queue (shared worker, but each user's jobs are tagged with their uid)
 import asyncio as _asyncio
@@ -2944,7 +2950,7 @@ async def auto_update_loop(bot, chat_id):
                 continue
 
         result   = await asyncio.get_event_loop().run_in_executor(
-            None, modify_ad, s["ad_id"], new_p_str, sess.ad_data, creds
+            _ad_executor, modify_ad, s["ad_id"], new_p_str, sess.ad_data, creds
         )
         ret_code = result.get("retCode", result.get("ret_code",-1))
         ret_msg  = result.get("retMsg",  result.get("ret_msg","Unknown"))
@@ -2953,7 +2959,7 @@ async def auto_update_loop(bot, chat_id):
             bybit_max = _extract_bybit_max(ret_msg)
             if bybit_max:
                 retry_result = await asyncio.get_event_loop().run_in_executor(
-                    None, modify_ad, s["ad_id"], bybit_max, sess.ad_data, creds
+                    _ad_executor, modify_ad, s["ad_id"], bybit_max, sess.ad_data, creds
                 )
                 retry_code = retry_result.get("retCode", retry_result.get("ret_code",-1))
                 retry_msg  = retry_result.get("retMsg",  retry_result.get("ret_msg","Unknown"))
@@ -3706,6 +3712,17 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 orders_section_keyboard(tuser.id)
             )
         else:
+            # Conflict guard: block chat monitor while auto-update is running
+            if _s(tuser.id).refresh_running:
+                await edit_menu(query,
+                    "⚠️ <b>Cannot start Chat Monitor</b>\n\n"
+                    "<b>Ad Auto-Update</b> is currently running.\n\n"
+                    "Running both simultaneously overloads the bot and causes delays "
+                    "for all users.\n\n"
+                    "Please stop Auto-Update first, then start Chat Monitor.",
+                    InlineKeyboardMarkup(back_section("section_orders"))
+                )
+                return
             # Set flag BEFORE creating task so UI reflects it immediately
             _s(tuser.id).chat_monitor_enabled = True
             _s(tuser.id).chat_monitor_task = asyncio.create_task(
@@ -3765,6 +3782,17 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 orders_section_keyboard(tuser.id)
             )
         else:
+            # Conflict guard: block order monitor while auto-update is running
+            if _s(tuser.id).refresh_running:
+                await edit_menu(query,
+                    "⚠️ <b>Cannot start Order Monitor</b>\n\n"
+                    "<b>Ad Auto-Update</b> is currently running.\n\n"
+                    "Running both simultaneously overloads the bot and causes delays "
+                    "for all users.\n\n"
+                    "Please stop Auto-Update first, then start Order Monitor.",
+                    InlineKeyboardMarkup(back_section("section_orders"))
+                )
+                return
             _s(tuser.id).order_monitor_task = asyncio.create_task(
                 order_monitor_loop(context.bot, chat_id)
             )
@@ -4053,6 +4081,19 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         if not _s(tuser.id).ad_data or not _s(tuser.id).settings.get("ad_id"):
             await edit_menu(query, "❌ Load ad details first.", InlineKeyboardMarkup(back_section("section_ads")))
             return
+        # ── Conflict guard: block manual update while order/chat monitor is running ──
+        _sess_chk2 = _s(tuser.id)
+        if _sess_chk2.order_monitor_running or _sess_chk2.chat_monitor_enabled:
+            _active2 = []
+            if _sess_chk2.order_monitor_running: _active2.append("Order Monitor")
+            if _sess_chk2.chat_monitor_enabled:  _active2.append("Chat Monitor")
+            await edit_menu(query,
+                "⚠️ <b>Cannot update while monitoring is active</b>\n\n"
+                f"<b>{' and '.join(_active2)}</b> is currently running.\n\n"
+                "Stop your active monitors first before updating ad price.",
+                InlineKeyboardMarkup(back_section("section_ads"))
+            )
+            return
         # Load per-user creds — MUST be done before modify_ad
         _update_creds = get_user_creds(tuser.id)
         if not _update_creds or not _update_creds.get("key"):
@@ -4080,7 +4121,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 await edit_menu(query, f"❌ <code>{_esc(str(err))}</code>", InlineKeyboardMarkup(back_section("section_ads")))
                 return
         result = await asyncio.get_event_loop().run_in_executor(
-            None, modify_ad, _s(tuser.id).settings["ad_id"], price, _s(tuser.id).ad_data, _update_creds
+            _ad_executor, modify_ad, _s(tuser.id).settings["ad_id"], price, _s(tuser.id).ad_data, _update_creds
         )
         rc = result.get("retCode", result.get("ret_code",-1))
         rm = result.get("retMsg",  result.get("ret_msg",""))
@@ -4088,7 +4129,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             bybit_max = _extract_bybit_max(rm)
             if bybit_max:
                 result = await asyncio.get_event_loop().run_in_executor(
-                    None, modify_ad, _s(tuser.id).settings["ad_id"], bybit_max, _s(tuser.id).ad_data, _update_creds
+                    _ad_executor, modify_ad, _s(tuser.id).settings["ad_id"], bybit_max, _s(tuser.id).ad_data, _update_creds
                 )
                 rc    = result.get("retCode", result.get("ret_code",-1))
                 rm    = result.get("retMsg",  result.get("ret_msg",""))
@@ -4593,6 +4634,23 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             if not _s(tuser.id).ad_data or not _s(tuser.id).settings.get("ad_id"):
                 await edit_menu(query,
                     f"❌ Not ready:\n\n_{next_setup_hint(tuser.id)}_",
+                    InlineKeyboardMarkup(back_section("section_ads"))
+                )
+                return
+            # ── Conflict guard: block auto-update while order/chat monitor is running ──
+            # Running both simultaneously saturates the shared thread pool and event loop,
+            # causing Telegram timeouts for ALL users. Users must choose one or the other.
+            _sess_chk = _s(tuser.id)
+            if _sess_chk.order_monitor_running or _sess_chk.chat_monitor_enabled:
+                active = []
+                if _sess_chk.order_monitor_running: active.append("Order Monitor")
+                if _sess_chk.chat_monitor_enabled:  active.append("Chat Monitor")
+                await edit_menu(query,
+                    "⚠️ <b>Cannot start Auto-Update</b>\n\n"
+                    f"<b>{' and '.join(active)}</b> is currently active.\n\n"
+                    "Running Ad Auto-Update together with Order Monitor or Chat Monitor "
+                    "overloads the bot and causes delays for all users.\n\n"
+                    "Please stop your active monitors first, then start Auto-Update.",
                     InlineKeyboardMarkup(back_section("section_ads"))
                 )
                 return
