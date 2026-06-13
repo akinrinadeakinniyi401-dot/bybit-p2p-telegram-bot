@@ -1,8 +1,5 @@
 import os
 import asyncio
-import hmac
-import hashlib
-import base64
 import logging
 import logging.handlers
 import threading
@@ -70,87 +67,52 @@ def webhook():
 
 
 # 💸 Flutterwave webhook
+# 💸 Flutterwave webhook
 @app.route("/flw-webhook", methods=["POST"])
 def flw_webhook():
-    from config import FLW_SECRET_HASH
-
-    raw_body  = request.get_data()
-    signature = request.headers.get("flutterwave-signature", "")
-
-    if FLW_SECRET_HASH and signature:
-        expected = base64.b64encode(
-            hmac.new(
-                FLW_SECRET_HASH.encode("utf-8"),
-                raw_body,
-                hashlib.sha256
-            ).digest()
-        ).decode("utf-8")
-
-        if signature != expected:
-            logger.warning(
-                f"[FLW Webhook] Signature mismatch.\n"
-                f"  Got:      {signature[:40]}...\n"
-                f"  Expected: {expected[:40]}...\n"
-                f"  Check FLW_SECRET_HASH matches Flutterwave dashboard → Settings → Webhooks"
-            )
-            return jsonify({"status": "unauthorized"}), 401
-
-    elif FLW_SECRET_HASH and not signature:
-        logger.warning(
-            "[FLW Webhook] No signature header received. "
-            "Set the same FLW_SECRET_HASH on Flutterwave dashboard → Settings → Webhooks → Secret Hash. "
-            "Accepting webhook anyway."
-        )
-    else:
-        logger.info("[FLW Webhook] No FLW_SECRET_HASH set — skipping signature check")
-
+    # All signature verification and per-user routing is handled inside
+    # bot.py's handle_flw_webhook(). Each user has their own FLW secret hash
+    # stored in the DB per user — there is no global FLW_SECRET_HASH.
+    # Flutterwave sends the secret hash value in the 'verif-hash' header.
+    global bot_app, bot_loop
+    if bot_app is None or bot_loop is None:
+        logger.warning("[FLW Webhook] Bot not ready yet")
+        return jsonify({"status": "error", "detail": "bot not ready"}), 500
     try:
-        payload     = request.get_json(force=True)
-        event_type  = payload.get("type", "")
-        data        = payload.get("data", {})
-        transfer_id = data.get("id", "")
-        status      = data.get("status", "")
-        reference   = data.get("reference", "")
-        amount      = data.get("amount", "")
-        currency    = data.get("destination_currency", data.get("source_currency", "NGN"))
-
-        logger.info(f"[FLW Webhook] type={event_type} | id={transfer_id} | status={status} | ref={reference} | amount={amount}")
-
-        if event_type == "transfer.disburse" and bot_app and bot_loop:
-            asyncio.run_coroutine_threadsafe(
-                _notify_flw_transfer(transfer_id, status, reference, amount, currency),
-                bot_loop
-            )
-
+        payload   = request.get_json(force=True)
+        # Flutterwave sends the user's Secret Hash value in 'verif-hash' header
+        signature = (
+            request.headers.get("verif-hash", "")
+            or request.headers.get("flutterwave-signature", "")
+        )
+        data       = payload.get("data", {}) if payload else {}
+        event_type = payload.get("event", payload.get("type", "")) if payload else ""
+        reference  = data.get("reference", "")
+        logger.info(
+            f"[FLW Webhook] Received | event={event_type!r} "
+            f"ref={reference!r} has_sig={'yes' if signature else 'no'}"
+        )
+        asyncio.run_coroutine_threadsafe(
+            _dispatch_flw_webhook(payload, signature),
+            bot_loop
+        )
         return jsonify({"status": "ok"}), 200
-
     except Exception as e:
         logger.exception(f"[FLW Webhook] Error: {e}")
         return jsonify({"status": "error"}), 500
 
 
-async def _notify_flw_transfer(transfer_id, status, reference, amount, currency):
+async def _dispatch_flw_webhook(payload: dict, signature: str):
+    """Route the FLW webhook to bot.py's per-user handler."""
     try:
-        from bot import _get_admin_chat_ids
-        chat_ids = _get_admin_chat_ids()
-        icon = "✅" if status == "SUCCESSFUL" else "❌"
-        msg  = (
-            f"{icon} *Flutterwave Transfer Update*\n\n"
-            f"Status: `{status}`\n"
-            f"Amount: `{amount} {currency}`\n"
-            f"Transfer ID: `{transfer_id}`\n"
-            f"Reference: `{reference}`"
-        )
-        for cid in chat_ids:
-            await bot_app.bot.send_message(chat_id=cid, text=msg, parse_mode="Markdown")
+        from bot import handle_flw_webhook
+        ok, reason = await handle_flw_webhook(bot_app.bot, payload, signature)
+        if not ok:
+            logger.warning(f"[FLW Webhook] handle_flw_webhook rejected: {reason}")
     except Exception as e:
-        logger.error(f"[FLW Webhook notify] {e}")
+        logger.error(f"[FLW Webhook] Dispatch error: {e}")
 
 
-# 🟡 Paga webhook
-# Paga sends a POST to this URL when a depositToBank transaction is processed.
-# Set this URL in your Paga dashboard → Settings → Callback URL
-# OR pass it dynamically as statusCallbackUrl in each depositToBank request.
 @app.route("/paga-webhook", methods=["POST"])
 def paga_webhook():
     try:
