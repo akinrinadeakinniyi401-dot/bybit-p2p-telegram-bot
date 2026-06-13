@@ -145,16 +145,22 @@ class SessionState:
 
 
 def get_session(user_id: int) -> SessionState:
-    """Get or create a session for a user. Auto-resets stale sessions."""
+    """Get or create a session for a user.
+
+    NOTE: Stale/auto-reset logic has been intentionally removed from here.
+    Resetting is now handled exclusively by _session_auto_reset_loop in bot.py,
+    which runs on a clean 1-hour schedule and sends the user a notification first.
+    Having reset logic here caused a race condition: any button click after the
+    1-hour reset would re-trigger reset_p2p() silently, killing active features
+    (order monitor, chat monitor etc.) without warning moments after the user
+    had just re-enabled them.
+    """
     with _lock:
         s = _sessions.get(user_id)
         if s is None:
             s = SessionState(user_id)
             _sessions[user_id] = s
             logger.info(f"[Session] Created for user {user_id}")
-        elif s.is_stale():
-            logger.info(f"[Session] Stale session for {user_id} — resetting P2P state")
-            s.reset_p2p()
         return s
 
 
@@ -170,13 +176,11 @@ def get_all_sessions() -> list:
 
 
 async def auto_reset_loop():
-    """Background task: reset stale sessions every hour."""
+    """
+    DEPRECATED — kept for import compatibility only. Do not use.
+    Session resets are now handled by _session_auto_reset_loop in bot.py,
+    which runs hourly and sends users a notification before resetting.
+    """
+    logger.info("[Session] auto_reset_loop is deprecated — resets handled by bot.py")
     while True:
-        await asyncio.sleep(3600)
-        with _lock:
-            stale = [uid for uid, s in _sessions.items() if s.is_stale()]
-        for uid in stale:
-            s = _sessions.get(uid)
-            if s:
-                logger.info(f"[Session] Auto-resetting stale session for user {uid}")
-                s.reset_p2p()
+        await asyncio.sleep(86400)   # sleep 24h doing nothing
