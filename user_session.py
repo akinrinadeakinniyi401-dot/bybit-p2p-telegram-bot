@@ -147,13 +147,12 @@ class SessionState:
 def get_session(user_id: int) -> SessionState:
     """Get or create a session for a user.
 
-    NOTE: Stale/auto-reset logic has been intentionally removed from here.
-    Resetting is now handled exclusively by _session_auto_reset_loop in bot.py,
-    which runs on a clean 1-hour schedule and sends the user a notification first.
-    Having reset logic here caused a race condition: any button click after the
-    1-hour reset would re-trigger reset_p2p() silently, killing active features
-    (order monitor, chat monitor etc.) without warning moments after the user
-    had just re-enabled them.
+    NOTE: The stale/auto-reset check has been intentionally removed.
+    Resetting is handled exclusively by _session_auto_reset_loop in bot.py,
+    which runs on a clean 1-hour schedule and sends the user a notification.
+    Having reset logic here caused a race condition: any button click after
+    the 1-hour reset could re-trigger reset_p2p() silently, killing active
+    features (order monitor, chat monitor etc.) with no warning.
     """
     with _lock:
         s = _sessions.get(user_id)
@@ -176,11 +175,10 @@ def get_all_sessions() -> list:
 
 
 async def auto_reset_loop():
-    """
-    DEPRECATED — kept for import compatibility only. Do not use.
-    Session resets are now handled by _session_auto_reset_loop in bot.py,
-    which runs hourly and sends users a notification before resetting.
+    """DEPRECATED — kept for import compatibility only. Do not use.
+    Session resets are handled by _session_auto_reset_loop in bot.py,
+    which runs hourly and notifies users before resetting.
     """
     logger.info("[Session] auto_reset_loop is deprecated — resets handled by bot.py")
     while True:
-        await asyncio.sleep(86400)   # sleep 24h doing nothing
+        await asyncio.sleep(86400)   # sleep 24h, doing nothing
