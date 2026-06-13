@@ -1312,6 +1312,16 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
         )
 
         if final_status == "SUCCESSFUL":
+            # ── Guard: webhook may have already handled this order ──
+            # The FLW webhook fires within seconds of transfer completion.
+            # If it arrived while we were polling, it already marked Bybit paid
+            # and sent a success notification. Don't duplicate.
+            if _is_order_final(order_id):
+                logger.info(
+                    f"[FLW] Poll got SUCCESSFUL but order already finalized by webhook "
+                    f"| user={chat_id} order={order_id} — skipping duplicate notification"
+                )
+                return
             # ── STEP 6: ONLY now mark Bybit order paid ──
             pay_type   = str(pay_term.get("paymentType", ""))
             payment_id = str(pay_term.get("id", ""))
@@ -1327,9 +1337,9 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
                     f"bybit_ok={bybit_ok} retCode={(pr or {}).get('retCode','?')}"
                 )
             _s(chat_id).paid_order_ids.add(order_id)
+            _set_order_final(order_id, "completed")
             # ── Update order message: remove action buttons, show ✅ Completed badge ──
             await _update_order_message_final(bot, chat_id, order_id, "Transfer Completed", "completed")
-            bybit_label = "✅ Marked paid on Bybit" if bybit_ok else "⚠️ Mark manually on Bybit"
             # ── STEP 7: Send Telegram confirmation ──
             await bot.send_message(chat_id=chat_id,
                 text=(
@@ -1338,7 +1348,7 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
                     f"Recipient: <b>{vname_safe}</b>\n"
                     f"Order: <code>{oid}</code>\n"
                     f"Transfer ID: <code>{tid_safe}</code>\n"
-                    f"Bybit: {bybit_label}"
+                    f"✅ Bybit order marked as paid."
                 ),
                 parse_mode="HTML")
 
@@ -1382,7 +1392,13 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
             await bot.send_message(chat_id=chat_id, text=fail_text, parse_mode="HTML")
 
         else:
-            # Status still pending after 60s — do NOT mark paid
+            # Status still pending after 60s polling — check if webhook already handled it
+            if _is_order_final(order_id):
+                logger.info(
+                    f"[FLW] Still-pending exit but order already finalized by webhook "
+                    f"| user={chat_id} order={order_id} — skipping pending notification"
+                )
+                return
             fstatus_safe = _esc(final_status)
             logger.info(
                 f"[FLW] Transfer still pending after polling | user={chat_id} order={order_id} "
