@@ -340,17 +340,36 @@ def release_assets(order_id: str, creds: dict | None = None) -> dict:
     return _post("/v5/p2p/order/finish", {"orderId": order_id}, creds=creds)
 
 
+
 # ─────────────────────────────────────────
-# 💳 User Payment Methods
+# 🚫 Seller Cancel Order Review
 # ─────────────────────────────────────────
-def get_user_payment_list(creds: dict | None = None) -> dict:
+def review_seller_cancel(order_id: str, examine_result: str,
+                         reject_reason: str = "",
+                         reject_proofs: str = "",
+                         reject_remark: str = "",
+                         creds: dict | None = None) -> dict:
     """
-    POST /v5/p2p/user/payment/list
-    Returns the user's own saved payment methods.
-    Each item contains paymentType and paymentConfigVo.paymentName.
-    Used to resolve payment type codes (e.g. 521) to real names (e.g. PalmPay).
+    POST /v5/p2p/order/buyer/examine/sellerCancelOrderApply
+    Called by the BUYER to accept or reject a seller cancellation request.
+
+    examine_result : 'PASS'   -> accept the cancellation
+                     'REJECT' -> reject it
+
+    Supported reject_reason values:
+        buyerRefuseOrderCancelReason_haveMadePayment
+        buyerRefuseOrderCancelReason_haveNotReceivedFullRefund
+        buyerRefuseOrderCancelReason_others
     """
-    return _post("/v5/p2p/user/payment/list", {}, creds=creds)
+    payload = {"orderId": order_id, "examineResult": examine_result}
+    if examine_result == "REJECT":
+        if reject_reason:
+            payload["rejectReason"] = reject_reason
+        if reject_proofs:
+            payload["rejectProofs"] = reject_proofs
+        if reject_remark:
+            payload["rejectRemark"] = reject_remark
+    return _post("/v5/p2p/order/buyer/examine/sellerCancelOrderApply", payload, creds=creds)
 
 
 # ─────────────────────────────────────────
