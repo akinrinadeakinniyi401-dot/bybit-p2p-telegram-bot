@@ -22,6 +22,7 @@ from bybit import (
     get_chat_messages, post_new_ad, remove_ad,
     take_ad_offline, put_ad_online,
     get_user_payment_list,
+    review_seller_cancel,
 )
 from fraud_check import check_buyer_name, load_scammers, get_scammer_count, get_last_updated
 import db
@@ -2475,10 +2476,240 @@ async def order_monitor_loop(bot, chat_id):
         except Exception as e:
             logger.error(f"[Orders] Loop error for user {chat_id}: {e}")
 
+        # ── Check for pending seller cancel requests on active buy orders ──
+        # We scan buy_items for any order where the seller has requested cancellation.
+        # Bybit signals this via the 'cancelStatus' field on the order (value '1').
+        # Only flag orders that were already slow-seller flagged (buyer protection).
+        for item in buy_items:
+            oid      = item.get("id", "")
+            c_status = str(item.get("cancelStatus", "0") or "0")
+            if oid and c_status == "1" and oid not in _s(chat_id).pending_cancel_reviews:
+                # Seller has an active cancel request — notify user
+                asyncio.create_task(
+                    _handle_seller_cancel_request(bot, chat_id, oid, item)
+                )
+
         await asyncio.sleep(10)
 
     sess.order_monitor_running = False
     logger.info(f"🔕 ORDER MONITOR STOPPED for user {chat_id}")
+
+
+# ─────────────────────────────────────────
+# 🚫 SELLER CANCEL REQUEST HANDLER
+# ─────────────────────────────────────────
+
+def _cancel_review_buttons(order_id: str) -> InlineKeyboardMarkup:
+    """Inline buttons for seller cancel review: Accept or Reject."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("✅ Accept Cancellation", callback_data=f"sc_accept_{order_id}"),
+            InlineKeyboardButton("❌ Reject",              callback_data=f"sc_reject_{order_id}"),
+        ]
+    ])
+
+
+def _cancel_reject_reason_buttons(order_id: str) -> InlineKeyboardMarkup:
+    """Inline buttons for rejection reason selection."""
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "💸 I have already made payment",
+            callback_data=f"sc_reason_{order_id}_haveMadePayment"
+        )],
+        [InlineKeyboardButton(
+            "💰 I have not received a full refund",
+            callback_data=f"sc_reason_{order_id}_haveNotReceivedFullRefund"
+        )],
+        [InlineKeyboardButton(
+            "📝 Other reason",
+            callback_data=f"sc_reason_{order_id}_others"
+        )],
+    ])
+
+
+async def _handle_seller_cancel_request(bot, chat_id: int, order_id: str, item: dict):
+    """
+    Called when order_monitor_loop detects cancelStatus == '1' on a buy order.
+    Fetches full order details, builds the notification with original flag reason
+    (buyer protection slow-seller), then sends Accept / Reject buttons to the user.
+    Per-user: uses chat_id for creds and session state.
+    """
+    sess = _s(chat_id)
+
+    # Guard: only process once per order
+    if order_id in sess.pending_cancel_reviews:
+        return
+
+    try:
+        # Fetch full order detail for payment info
+        det = await asyncio.get_event_loop().run_in_executor(
+            None, partial(get_order_detail, order_id, creds=get_user_creds(chat_id))
+        )
+        if det.get("retCode", -1) != 0:
+            logger.warning(f"[CancelReview] Could not fetch order {order_id}: {det.get('retMsg')}")
+            return
+        order_detail = det.get("result", {})
+
+        # Fetch seller info for release time display
+        seller_uid  = order_detail.get("targetUserId", "")
+        seller_info = {}
+        if seller_uid:
+            si = await asyncio.get_event_loop().run_in_executor(
+                None, partial(get_counterparty_info, str(seller_uid), order_id,
+                              creds=get_user_creds(chat_id))
+            )
+            if si.get("retCode", -1) == 0:
+                seller_info = si.get("result", {})
+
+        # Build flag reason — reuse buyer protection data if available
+        try:
+            release_mins = float(seller_info.get("averageReleaseTime", "0") or 0)
+        except (ValueError, TypeError):
+            release_mins = 0.0
+
+        thresh = sess.buyer_protection_mins if sess.buyer_protection_on else 0
+        if sess.buyer_protection_on and release_mins >= thresh:
+            flag_reason = (
+                f"Seller avg release time: {release_mins:.0f} min "
+                f"≥ your threshold: {thresh} min"
+            )
+        else:
+            flag_reason = "Seller requested order cancellation"
+
+        # Store in session so the button handler can retrieve it
+        sess.pending_cancel_reviews[order_id] = {
+            "order_detail": order_detail,
+            "seller_info":  seller_info,
+            "flag_reason":  flag_reason,
+        }
+
+        # Format the order details the same way as the original buy order message
+        order_detail["_seller_release_mins"] = release_mins
+        msg = format_order_message(order_detail, seller_info, uid=chat_id)
+
+        quantity = order_detail.get("quantity", "—")
+        amount   = order_detail.get("amount",   "—")
+        currency = order_detail.get("currencyId", "—")
+
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"🚨 <b>Seller Cancel Request</b>\n\n"
+                f"The seller has requested to cancel this buy order.\n\n"
+                f"⚠️ <b>Reason flagged:</b> {_esc(flag_reason)}\n\n"
+                f"{msg}\n\n"
+                f"<b>What would you like to do?</b>\n"
+                f"• <b>Accept</b> — allow the seller to cancel the order\n"
+                f"• <b>Reject</b> — refuse the cancellation and choose a reason"
+            ),
+            reply_markup=_cancel_review_buttons(order_id),
+            parse_mode="HTML"
+        )
+        logger.info(
+            f"[CancelReview] Notified user {chat_id} about cancel request "
+            f"for order {order_id} | reason: {flag_reason}"
+        )
+
+    except Exception as e:
+        logger.error(f"[CancelReview] Error handling cancel request {order_id} for user {chat_id}: {e}")
+
+
+async def _handle_cancel_review(bot, chat_id: int, order_id: str,
+                                 examine_result: str, reject_reason_key: str = ""):
+    """
+    Execute the buyer's decision (PASS or REJECT) via Bybit API.
+    Called from button_handler after the user taps Accept or a Reject reason.
+    """
+    sess = _s(chat_id)
+    creds = get_user_creds(chat_id)
+
+    # Map short key → full Bybit reason string
+    reason_map = {
+        "haveMadePayment":          "buyerRefuseOrderCancelReason_haveMadePayment",
+        "haveNotReceivedFullRefund": "buyerRefuseOrderCancelReason_haveNotReceivedFullRefund",
+        "others":                   "buyerRefuseOrderCancelReason_others",
+    }
+    full_reason = reason_map.get(reject_reason_key, "") if reject_reason_key else ""
+
+    try:
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, partial(
+                review_seller_cancel,
+                order_id,
+                examine_result,
+                full_reason,
+                "",   # rejectProofs — not required for text reasons
+                "",   # rejectRemark
+                creds=creds,
+            )
+        )
+        ret_code = result.get("retCode", -1)
+        ret_msg  = result.get("retMsg", "")
+
+        if ret_code == 0:
+            # Clean up session
+            sess.pending_cancel_reviews.pop(order_id, None)
+            if examine_result == "PASS":
+                # Order will be cancelled — mark as finalized
+                _set_order_final(order_id, "cancelled")
+                sess.paid_order_ids.discard(order_id)
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"✅ <b>Cancellation Accepted</b>\n\n"
+                        f"Order <code>{_esc(order_id)}</code> has been cancelled.\n"
+                        f"The seller's cancellation request was approved."
+                    ),
+                    parse_mode="HTML"
+                )
+            else:
+                # Readable label for the reason
+                reason_labels = {
+                    "haveMadePayment":           "I have already made payment",
+                    "haveNotReceivedFullRefund":  "I have not received a full refund",
+                    "others":                    "Other reason",
+                }
+                reason_label = reason_labels.get(reject_reason_key, reject_reason_key)
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"❌ <b>Cancellation Rejected</b>\n\n"
+                        f"Order <code>{_esc(order_id)}</code> — the seller's cancellation "
+                        f"request has been rejected.\n\n"
+                        f"<b>Reason given:</b> {_esc(reason_label)}\n\n"
+                        f"The order remains active. Bybit will handle the dispute."
+                    ),
+                    parse_mode="HTML"
+                )
+            logger.info(
+                f"[CancelReview] {examine_result} for order {order_id} "
+                f"user={chat_id} reason={full_reason!r} retCode=0"
+            )
+        else:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"❌ <b>Cancel Review Failed</b>\n\n"
+                    f"Order: <code>{_esc(order_id)}</code>\n"
+                    f"Error: <code>{_esc(ret_msg)}</code>\n\n"
+                    f"Please try again or handle manually on Bybit."
+                ),
+                parse_mode="HTML"
+            )
+            logger.warning(
+                f"[CancelReview] API error | order={order_id} user={chat_id} "
+                f"examine={examine_result} retCode={ret_code} msg={ret_msg!r}"
+            )
+    except Exception as e:
+        logger.error(f"[CancelReview] _handle_cancel_review error: {e}")
+        await bot.send_message(
+            chat_id=chat_id,
+            text=(
+                f"❌ <b>Error processing cancel review</b>\n"
+                f"<code>{_esc(str(e)[:200])}</code>"
+            ),
+            parse_mode="HTML"
+        )
 
 
 async def _handle_buy_order(bot, chat_id, order_id):
@@ -3349,6 +3580,9 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
     _is_free_allowed = (
         data in _FREE_ALLOWED
         or data.startswith("switch_account_")
+        or data.startswith("sc_accept_")
+        or data.startswith("sc_reject_")
+        or data.startswith("sc_reason_")
     )
     if not is_admin(tuser.id) and not sub.is_pro(tuser.id) and not _is_free_allowed:
         await query.answer(
@@ -4770,6 +5004,64 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 await context.bot.send_message(chat_id=chat_id,
                     text=f"❌ Failed\n<code>{_esc(pr.get('retMsg',''))}</code>", parse_mode="HTML")
 
+    # ── 🚫 Seller Cancel Review — Accept ──
+    elif data.startswith("sc_accept_"):
+        order_id = data[len("sc_accept_"):]
+        if order_id not in _s(tuser.id).pending_cancel_reviews:
+            await query.answer("This cancel request has already been handled.", show_alert=True)
+            return
+        await query.answer("Processing...")
+        # Remove buttons from the notification message
+        try:
+            await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([]))
+        except Exception:
+            pass
+        await _handle_cancel_review(context.bot, chat_id, order_id, "PASS")
+
+    # ── 🚫 Seller Cancel Review — Reject (show reason buttons) ──
+    elif data.startswith("sc_reject_"):
+        order_id = data[len("sc_reject_"):]
+        if order_id not in _s(tuser.id).pending_cancel_reviews:
+            await query.answer("This cancel request has already been handled.", show_alert=True)
+            return
+        await query.answer()
+        # Replace the Accept/Reject buttons with reason selection buttons
+        try:
+            await query.edit_message_reply_markup(
+                reply_markup=_cancel_reject_reason_buttons(order_id)
+            )
+        except Exception:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"Select your reason for rejecting the cancellation of order "
+                    f"<code>{_esc(order_id)}</code>:"
+                ),
+                reply_markup=_cancel_reject_reason_buttons(order_id),
+                parse_mode="HTML"
+            )
+
+    # ── 🚫 Seller Cancel Review — Reason chosen ──
+    elif data.startswith("sc_reason_"):
+        # Format: sc_reason_{order_id}_{reason_key}
+        rest     = data[len("sc_reason_"):]
+        # reason_key is always one of the 3 fixed strings — split from the right
+        parts    = rest.rsplit("_", 1)
+        if len(parts) != 2:
+            await query.answer("Invalid selection.", show_alert=True)
+            return
+        order_id, reason_key = parts[0], parts[1]
+        if order_id not in _s(tuser.id).pending_cancel_reviews:
+            await query.answer("This cancel request has already been handled.", show_alert=True)
+            return
+        await query.answer("Submitting rejection...")
+        # Remove reason buttons
+        try:
+            await query.edit_message_reply_markup(reply_markup=InlineKeyboardMarkup([]))
+        except Exception:
+            pass
+        await _handle_cancel_review(context.bot, chat_id, order_id, "REJECT", reason_key)
+
     # ── 🔕 Order Status Badge (noop — already finalized) ──
     elif data.startswith("order_status_noop_"):
         await query.answer("This order has already been processed.", show_alert=False)
@@ -5309,6 +5601,8 @@ def _reset_user_session(sess) -> bool:
     sess.seen_sell_ids  = set()
     sess.released_ids   = set()
     sess.unpaid_log     = []
+    sess.pending_cancel_reviews = {}   # clear pending seller cancel requests
+    sess.pending_cancel_reviews = {}   # clear pending seller cancel requests on reset
 
     # Reset volatile P2P settings (API keys + sender_name etc. are kept)
     for k, v in [("ad_id",""),("mode","fixed"),("increment","0.05"),
