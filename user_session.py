@@ -94,6 +94,12 @@ class SessionState:
         self.paga_worker_task      = None
         self.paga_queue_list: list = []
 
+        # ── Seller cancel review ──
+        # {order_id: {"order_detail": dict, "seller_info": dict, "flag_reason": str}}
+        # Populated when buyer-protection flags a slow-seller cancel request.
+        # Cleared when the user accepts or rejects via inline button.
+        self.pending_cancel_reviews: dict = {}
+
         # ── Bybit API (loaded from disk at session start) ──
         self._bybit_key    = ""
         self._bybit_secret = ""
