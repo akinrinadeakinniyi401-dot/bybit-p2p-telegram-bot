@@ -307,6 +307,22 @@ def get_incoming_sell_orders(creds: dict | None = None) -> dict:
     return _post("/v5/p2p/order/pending/simplifyList",
                  {"status": 10, "side": 1, "page": 1, "size": 30}, creds=creds)
 
+def get_cancel_pending_buy_orders(creds: dict | None = None) -> dict:
+    """Fetch buy orders in cancel-pending status (seller requested cancel).
+    status=100 (objectioning) catches seller cancel requests.
+    status=110 (waiting buyer objection) catches pre-cancel state.
+    Both are polled and merged into one items list.
+    """
+    items = []
+    for status in (100, 110):
+        r = _post("/v5/p2p/order/pending/simplifyList",
+                  {"status": status, "side": 0, "page": 1, "size": 30}, creds=creds)
+        if r.get("retCode", -1) == 0:
+            items += r.get("result", {}).get("items", [])
+    return {"retCode": 0, "result": {"items": items}}
+
+
+
 
 def get_order_detail(order_id: str, creds: dict | None = None) -> dict:
     return _post("/v5/p2p/order/info", {"orderId": order_id}, creds=creds)
@@ -340,52 +356,41 @@ def release_assets(order_id: str, creds: dict | None = None) -> dict:
     return _post("/v5/p2p/order/finish", {"orderId": order_id}, creds=creds)
 
 
-
-# ─────────────────────────────────────────
-# 🚫 Seller Cancel Order Review
 # ─────────────────────────────────────────
 # ─────────────────────────────────────────
 # 💳 User Payment Methods
 # ─────────────────────────────────────────
 def get_user_payment_list(creds: dict | None = None) -> dict:
-    """
-    POST /v5/p2p/user/payment/list
-    Returns the user's own saved payment methods.
-    Each item contains paymentType and paymentConfigVo.paymentName.
-    Used to resolve payment type codes (e.g. 521) to real names (e.g. PalmPay).
+    """POST /v5/p2p/user/payment/list
+    Returns user's saved payment methods with paymentType → paymentName mapping.
     """
     return _post("/v5/p2p/user/payment/list", {}, creds=creds)
 
 
+# ─────────────────────────────────────────
+# 🚫 Seller Cancel Order Review
+# ─────────────────────────────────────────
 def review_seller_cancel(order_id: str, examine_result: str,
                          reject_reason: str = "",
                          reject_proofs: str = "",
                          reject_remark: str = "",
                          creds: dict | None = None) -> dict:
-    """
-    POST /v5/p2p/order/buyer/examine/sellerCancelOrderApply
-    Called by the BUYER to accept or reject a seller cancellation request.
-
-    examine_result : 'PASS'   -> accept the cancellation
-                     'REJECT' -> reject it
-
-    Supported reject_reason values:
+    """POST /v5/p2p/order/buyer/examine/sellerCancelOrderApply
+    examine_result: 'PASS' to accept cancel, 'REJECT' to refuse.
+    reject_reason values:
         buyerRefuseOrderCancelReason_haveMadePayment
         buyerRefuseOrderCancelReason_haveNotReceivedFullRefund
         buyerRefuseOrderCancelReason_others
     """
     payload = {"orderId": order_id, "examineResult": examine_result}
     if examine_result == "REJECT":
-        if reject_reason:
-            payload["rejectReason"] = reject_reason
-        if reject_proofs:
-            payload["rejectProofs"] = reject_proofs
-        if reject_remark:
-            payload["rejectRemark"] = reject_remark
-    return _post("/v5/p2p/order/buyer/examine/sellerCancelOrderApply", payload, creds=creds)
+        if reject_reason:  payload["rejectReason"] = reject_reason
+        if reject_proofs:  payload["rejectProofs"] = reject_proofs
+        if reject_remark:  payload["rejectRemark"] = reject_remark
+    return _post("/v5/p2p/order/buyer/examine/sellerCancelOrderApply",
+                 payload, creds=creds)
 
 
-# ─────────────────────────────────────────
 # 💬 Chat
 # ─────────────────────────────────────────
 def send_chat_message(order_id: str, message: str,
