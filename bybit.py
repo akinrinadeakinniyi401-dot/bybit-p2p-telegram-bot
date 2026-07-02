@@ -317,8 +317,17 @@ def get_cancel_pending_buy_orders(creds: dict | None = None) -> dict:
     for status in (100, 110):
         r = _post("/v5/p2p/order/pending/simplifyList",
                   {"status": status, "side": 0, "page": 1, "size": 30}, creds=creds)
-        if r.get("retCode", -1) == 0:
+        ret_code = r.get("retCode", -1)
+        if ret_code == 0:
             items += r.get("result", {}).get("items", [])
+        else:
+            # Previously swallowed silently — a rate-limit hit here meant
+            # seller cancel requests could go undetected with no trace in
+            # the logs. Surface it instead.
+            logger.warning(
+                f"[Bybit] get_cancel_pending_buy_orders status={status} "
+                f"failed: retCode={ret_code} msg={r.get('retMsg','')!r}"
+            )
     return {"retCode": 0, "result": {"items": items}}
 
 
