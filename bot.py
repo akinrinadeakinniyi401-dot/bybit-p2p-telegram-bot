@@ -946,6 +946,7 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
                     None, partial(send_chat_message, order_id, NO_ACCOUNT_WARN_MSG,
                                   creds=get_user_creds(chat_id))
                 )
+                _s(chat_id).expecting_cancel_ids.add(order_id)
                 oid = _esc(order_id)
                 await bot.send_message(chat_id=chat_id,
                     text=(
@@ -1028,6 +1029,7 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
                     None, partial(send_chat_message, order_id, SELLER_WARN_MSG,
                                   creds=get_user_creds(chat_id))
                 )
+                _s(chat_id).expecting_cancel_ids.add(order_id)
                 oid    = _esc(order_id)
                 thresh = _s(chat_id).buyer_protection_mins
                 # ── Update order message: remove buttons, show ⏭ Skipped badge ──
@@ -1925,6 +1927,7 @@ async def _paga_autopay(bot, chat_id, order_id, order_detail):
                     None, partial(send_chat_message, order_id, NO_ACCOUNT_WARN_MSG,
                                   creds=get_user_creds(chat_id))
                 )
+                _s(chat_id).expecting_cancel_ids.add(order_id)
                 await bot.send_message(chat_id=chat_id,
                     text=(
                         f"🔍 <b>Name Match — Missing Info</b>\n\n"
@@ -1994,6 +1997,7 @@ async def _paga_autopay(bot, chat_id, order_id, order_detail):
                     None, partial(send_chat_message, order_id, SELLER_WARN_MSG,
                                   creds=get_user_creds(chat_id))
                 )
+                _s(chat_id).expecting_cancel_ids.add(order_id)
                 await bot.send_message(chat_id=chat_id,
                     text=(
                         f"🛡 <b>Buyer Protection Triggered</b> — Order <code>{order_id}</code>\n\n"
@@ -2481,20 +2485,34 @@ async def order_monitor_loop(bot, chat_id):
         # When a seller requests order cancellation, Bybit moves the order OUT of
         # status=10/20 and into status=100 (objectioning) or status=110.
         # These are NOT returned by get_pending_orders(), so we poll separately.
-        # This runs every 10s alongside the normal order monitor cycle.
-        try:
-            cancel_res   = await asyncio.get_event_loop().run_in_executor(
-                None, partial(get_cancel_pending_buy_orders, creds=creds)
-            )
-            cancel_items = cancel_res.get("result", {}).get("items", [])
-            for item in cancel_items:
-                oid = item.get("id", "")
-                if oid and oid not in _s(chat_id).pending_cancel_reviews:
-                    asyncio.create_task(
-                        _handle_seller_cancel_request(bot, chat_id, oid, item)
-                    )
-        except Exception as _ce:
-            logger.debug(f"[CancelPoll] Error polling cancel orders for {chat_id}: {_ce}")
+        #
+        # IMPORTANT: this poll (and the resend-with-buttons it triggers) is
+        # scoped ONLY to orders the bot itself marked paid + warned the seller
+        # about (buyer-protection / slow-release / name-match). If the seller
+        # requests a cancel on an order we never flagged, we do nothing.
+        #
+        # We also skip the API call entirely when expecting_cancel_ids is
+        # empty — most cycles will have nothing flagged, so this avoids
+        # burning simplifyList rate-limit quota for no reason.
+        expecting = _s(chat_id).expecting_cancel_ids
+        if expecting:
+            try:
+                cancel_res   = await asyncio.get_event_loop().run_in_executor(
+                    None, partial(get_cancel_pending_buy_orders, creds=creds)
+                )
+                cancel_items = cancel_res.get("result", {}).get("items", [])
+                for item in cancel_items:
+                    oid = item.get("id", "")
+                    if (
+                        oid
+                        and oid in expecting
+                        and oid not in _s(chat_id).pending_cancel_reviews
+                    ):
+                        asyncio.create_task(
+                            _handle_seller_cancel_request(bot, chat_id, oid, item)
+                        )
+            except Exception as _ce:
+                logger.debug(f"[CancelPoll] Error polling cancel orders for {chat_id}: {_ce}")
 
         await asyncio.sleep(10)
 
@@ -2656,6 +2674,7 @@ async def _handle_cancel_review(bot, chat_id: int, order_id: str,
         if ret_code == 0:
             # Clean up session
             sess.pending_cancel_reviews.pop(order_id, None)
+            sess.expecting_cancel_ids.discard(order_id)
             if examine_result == "PASS":
                 # Order will be cancelled — mark as finalized
                 _set_order_final(order_id, "cancelled")
@@ -2784,6 +2803,7 @@ async def _handle_buy_order(bot, chat_id, order_id):
                     None, partial(send_chat_message, order_id, NO_ACCOUNT_WARN_MSG,
                                   creds=get_user_creds(chat_id))
                 )
+                _s(chat_id).expecting_cancel_ids.add(order_id)
                 await bot.send_message(chat_id=chat_id,
                     text=(
                         f"🔍 <b>Name Match — Missing Info</b>\n\n"
@@ -2847,6 +2867,7 @@ async def _handle_buy_order(bot, chat_id, order_id):
                     None, partial(send_chat_message, order_id, SELLER_WARN_MSG,
                                   creds=get_user_creds(chat_id))
                 )
+                _s(chat_id).expecting_cancel_ids.add(order_id)
                 _s(chat_id).unpaid_log.append({
                     "order_id":   order_id,
                     "account_no": str(pay_term_bp.get("accountNo","—")),
