@@ -16,6 +16,7 @@ from bybit import (
     get_btc_usdt_price, get_eth_usdt_price, get_token_usdt_price,
     get_max_float_pct, get_min_float_pct, currency_needs_ref,
     get_pending_orders, get_sell_orders, get_incoming_sell_orders, get_order_detail,
+    get_cancel_pending_buy_orders,
     get_counterparty_info, mark_order_paid,
     send_chat_message, get_payment_name, release_assets,
     set_active_account, get_active_account, get_all_accounts,
@@ -2476,18 +2477,24 @@ async def order_monitor_loop(bot, chat_id):
         except Exception as e:
             logger.error(f"[Orders] Loop error for user {chat_id}: {e}")
 
-        # ── Check for pending seller cancel requests on active buy orders ──
-        # We scan buy_items for any order where the seller has requested cancellation.
-        # Bybit signals this via the 'cancelStatus' field on the order (value '1').
-        # Only flag orders that were already slow-seller flagged (buyer protection).
-        for item in buy_items:
-            oid      = item.get("id", "")
-            c_status = str(item.get("cancelStatus", "0") or "0")
-            if oid and c_status == "1" and oid not in _s(chat_id).pending_cancel_reviews:
-                # Seller has an active cancel request — notify user
-                asyncio.create_task(
-                    _handle_seller_cancel_request(bot, chat_id, oid, item)
-                )
+        # ── Check for seller cancel requests (status 100/110 buy orders) ──
+        # When a seller requests order cancellation, Bybit moves the order OUT of
+        # status=10/20 and into status=100 (objectioning) or status=110.
+        # These are NOT returned by get_pending_orders(), so we poll separately.
+        # This runs every 10s alongside the normal order monitor cycle.
+        try:
+            cancel_res   = await asyncio.get_event_loop().run_in_executor(
+                None, partial(get_cancel_pending_buy_orders, creds=creds)
+            )
+            cancel_items = cancel_res.get("result", {}).get("items", [])
+            for item in cancel_items:
+                oid = item.get("id", "")
+                if oid and oid not in _s(chat_id).pending_cancel_reviews:
+                    asyncio.create_task(
+                        _handle_seller_cancel_request(bot, chat_id, oid, item)
+                    )
+        except Exception as _ce:
+            logger.debug(f"[CancelPoll] Error polling cancel orders for {chat_id}: {_ce}")
 
         await asyncio.sleep(10)
 
