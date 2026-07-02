@@ -100,6 +100,17 @@ class SessionState:
         # Cleared when the user accepts or rejects via inline button.
         self.pending_cancel_reviews: dict = {}
 
+        # ── Orders "expecting" a seller cancel request ──
+        # Populated the moment the bot marks an order paid + sends the seller
+        # a warning message (buyer-protection / slow-release / name-match paths).
+        # The cancel-status poll (status 100/110) only runs, and only reacts,
+        # for order_ids in this set — NOT for every buy order on the account.
+        # This scopes "resend with Accept/Reject" to bot-flagged orders only,
+        # and keeps the cancel poll from running (and burning rate limit)
+        # when there's nothing to check for.
+        # Cleared once the review is resolved (accept/reject).
+        self.expecting_cancel_ids: set = set()
+
         # ── Bybit API (loaded from disk at session start) ──
         self._bybit_key    = ""
         self._bybit_secret = ""
@@ -137,6 +148,8 @@ class SessionState:
         self.unpaid_log.clear()
         self.seen_chat_msgs.clear()
         self.reply_state.clear()
+        self.pending_cancel_reviews.clear()
+        self.expecting_cancel_ids.clear()
         self.my_account_id = ""
         self.my_nick = ""
         self.paga_queue = None
