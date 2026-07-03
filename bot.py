@@ -16,7 +16,6 @@ from bybit import (
     get_btc_usdt_price, get_eth_usdt_price, get_token_usdt_price,
     get_max_float_pct, get_min_float_pct, currency_needs_ref,
     get_pending_orders, get_sell_orders, get_incoming_sell_orders, get_order_detail,
-    get_cancel_pending_buy_orders,
     get_counterparty_info, mark_order_paid,
     send_chat_message, get_payment_name, release_assets,
     set_active_account, get_active_account, get_all_accounts,
@@ -1007,8 +1006,13 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
                 release_mins = float(order_detail.get("_seller_release_mins", 0) or 0)
             except (ValueError, TypeError):
                 release_mins = 0.0
-            if release_mins >= _s(chat_id).buyer_protection_mins:
-                reason = f"Seller avg release time ({release_mins:.0f} min) ≥ threshold ({_s(chat_id).buyer_protection_mins} min)"
+            release_unknown = bool(order_detail.get("_seller_release_unknown", False))
+            if release_unknown or release_mins >= _s(chat_id).buyer_protection_mins:
+                reason = (
+                    "Seller release time unknown (fetch failed) — flagged as high-risk"
+                    if release_unknown else
+                    f"Seller avg release time ({release_mins:.0f} min) ≥ threshold ({_s(chat_id).buyer_protection_mins} min)"
+                )
                 logger.info(f"[FLW][BuyerProtection] Skipping FLW — {reason} | order={order_id} user={chat_id}")
                 _s(chat_id).unpaid_log.append({
                     "order_id":   order_id,
@@ -1974,9 +1978,14 @@ async def _paga_autopay(bot, chat_id, order_id, order_detail):
 
         # ── Buyer Protection ──
         if _s(chat_id).buyer_protection_on:
-            release_mins = float(order_detail.get("_seller_release_mins", 0))
-            if release_mins >= _s(chat_id).buyer_protection_mins:
-                reason = f"Seller avg release time ({release_mins:.0f} min) ≥ threshold ({_s(chat_id).buyer_protection_mins} min)"
+            release_mins    = float(order_detail.get("_seller_release_mins", 0))
+            release_unknown = bool(order_detail.get("_seller_release_unknown", False))
+            if release_unknown or release_mins >= _s(chat_id).buyer_protection_mins:
+                reason = (
+                    "Seller release time unknown (fetch failed) — flagged as high-risk"
+                    if release_unknown else
+                    f"Seller avg release time ({release_mins:.0f} min) ≥ threshold ({_s(chat_id).buyer_protection_mins} min)"
+                )
                 logger.info(f"[Paga BuyerProtection] Skipping — {reason}")
                 _s(chat_id).unpaid_log.append({
                     "order_id":   order_id,
@@ -2481,38 +2490,43 @@ async def order_monitor_loop(bot, chat_id):
         except Exception as e:
             logger.error(f"[Orders] Loop error for user {chat_id}: {e}")
 
-        # ── Check for seller cancel requests (status 100/110 buy orders) ──
+        # ── Check flagged orders for a seller cancel request ──
         # When a seller requests order cancellation, Bybit moves the order OUT of
-        # status=10/20 and into status=100 (objectioning) or status=110.
-        # These are NOT returned by get_pending_orders(), so we poll separately.
+        # status=10/20 and into status=100 (objectioning) or status=110 (waiting
+        # buyer objection). We check this DIRECTLY on each order we're expecting
+        # a cancel from — the same targeted get_order_detail() lookup used
+        # everywhere else in the bot (e.g. the sell-side paid/release flow) —
+        # rather than scanning a broad status-filtered list. That bulk list
+        # scan needed 2 extra simplifyList calls every cycle, contributed to
+        # rate-limit hits, and didn't reliably surface real cancel requests.
         #
-        # IMPORTANT: this poll (and the resend-with-buttons it triggers) is
-        # scoped ONLY to orders the bot itself marked paid + warned the seller
-        # about (buyer-protection / slow-release / name-match). If the seller
-        # requests a cancel on an order we never flagged, we do nothing.
-        #
-        # We also skip the API call entirely when expecting_cancel_ids is
-        # empty — most cycles will have nothing flagged, so this avoids
-        # burning simplifyList rate-limit quota for no reason.
-        expecting = _s(chat_id).expecting_cancel_ids
-        if expecting:
+        # This only runs for orders the bot itself flagged (buyer-protection /
+        # slow-release / name-match) and marked paid + warned the seller about.
+        # If the seller never requests a cancel on a flagged order, nothing
+        # happens — we just keep checking it each cycle until it resolves.
+        expecting = list(_s(chat_id).expecting_cancel_ids)
+        for oid in expecting:
+            if oid in _s(chat_id).pending_cancel_reviews:
+                continue   # already notified, waiting on the user's Accept/Reject
             try:
-                cancel_res   = await asyncio.get_event_loop().run_in_executor(
-                    None, partial(get_cancel_pending_buy_orders, creds=creds)
+                od = await asyncio.get_event_loop().run_in_executor(
+                    None, partial(get_order_detail, oid, creds=creds)
                 )
-                cancel_items = cancel_res.get("result", {}).get("items", [])
-                for item in cancel_items:
-                    oid = item.get("id", "")
-                    if (
-                        oid
-                        and oid in expecting
-                        and oid not in _s(chat_id).pending_cancel_reviews
-                    ):
-                        asyncio.create_task(
-                            _handle_seller_cancel_request(bot, chat_id, oid, item)
-                        )
+                if od.get("retCode", -1) != 0:
+                    logger.debug(f"[CancelPoll] Could not fetch order {oid} for {chat_id}: {od.get('retMsg')}")
+                    continue
+                status = str(od.get("result", {}).get("status", ""))
+                if status in ("100", "110"):
+                    asyncio.create_task(
+                        _handle_seller_cancel_request(bot, chat_id, oid)
+                    )
+                elif status in ("30", "40", "50"):
+                    # Order reached a terminal state some other way (completed/
+                    # cancelled/appeal) without ever hitting the cancel-review
+                    # flow — stop tracking it so we don't keep polling forever.
+                    _s(chat_id).expecting_cancel_ids.discard(oid)
             except Exception as _ce:
-                logger.debug(f"[CancelPoll] Error polling cancel orders for {chat_id}: {_ce}")
+                logger.debug(f"[CancelPoll] Error checking order {oid} for {chat_id}: {_ce}")
 
         await asyncio.sleep(10)
 
@@ -2552,9 +2566,10 @@ def _cancel_reject_reason_buttons(order_id: str) -> InlineKeyboardMarkup:
     ])
 
 
-async def _handle_seller_cancel_request(bot, chat_id: int, order_id: str, item: dict):
+async def _handle_seller_cancel_request(bot, chat_id: int, order_id: str):
     """
-    Called when order_monitor_loop detects cancelStatus == '1' on a buy order.
+    Called when order_monitor_loop detects status 100/110 on a flagged buy order
+    (i.e. one the bot itself marked paid + warned the seller about).
     Fetches full order details, builds the notification with original flag reason
     (buyer protection slow-seller), then sends Accept / Reject buttons to the user.
     Per-user: uses chat_id for creds and session state.
@@ -2746,13 +2761,41 @@ async def _handle_buy_order(bot, chat_id, order_id):
         order_detail = det.get("result", {})
         seller_uid   = order_detail.get("targetUserId", "")
 
+        # ── Fetch seller counterparty info (used for buyer-protection release-time check) ──
+        # IMPORTANT: this call can fail transiently (rate limit, timeout). Previously a
+        # failure here silently left seller_info={} for the rest of the function, which
+        # made release_mins default to 0 and silently bypassed buyer protection entirely
+        # — the order would get auto-paid with no warning even if the seller's real
+        # release time was high. We now retry once and, if still unavailable, flag it
+        # as unknown rather than silently treating it as "safe" (0 min).
         seller_info = {}
+        seller_info_unknown = False
         if seller_uid:
             si = await asyncio.get_event_loop().run_in_executor(
                 None, partial(get_counterparty_info, str(seller_uid), order_id, creds=get_user_creds(chat_id))
             )
             if si.get("retCode", -1) == 0:
                 seller_info = si.get("result", {})
+            else:
+                logger.warning(
+                    f"[BuyOrder] get_counterparty_info failed for order {order_id} "
+                    f"user={chat_id} seller={seller_uid}: retCode={si.get('retCode')} "
+                    f"msg={si.get('retMsg','')!r} — retrying once"
+                )
+                await asyncio.sleep(2)
+                si_retry = await asyncio.get_event_loop().run_in_executor(
+                    None, partial(get_counterparty_info, str(seller_uid), order_id, creds=get_user_creds(chat_id))
+                )
+                if si_retry.get("retCode", -1) == 0:
+                    seller_info = si_retry.get("result", {})
+                else:
+                    seller_info_unknown = True
+                    logger.warning(
+                        f"[BuyOrder] get_counterparty_info retry also failed for order "
+                        f"{order_id} user={chat_id}: retCode={si_retry.get('retCode')} "
+                        f"msg={si_retry.get('retMsg','')!r} — release time unknown, "
+                        f"treating as high-risk for buyer protection"
+                    )
 
         # Populate payment name cache for this user so Type XXX is resolved to real names
         creds_for_map = get_user_creds(chat_id)
@@ -2798,7 +2841,7 @@ async def _handle_buy_order(bot, chat_id, order_id):
                                       creds=get_user_creds(chat_id))
                     )
                     _s(chat_id).paid_order_ids.add(order_id)
-                    await _remove_order_buttons(bot, chat_id, order_id)
+                    await _update_order_message_final(bot, chat_id, order_id, "Warning Sent", "warned")
                 await asyncio.get_event_loop().run_in_executor(
                     None, partial(send_chat_message, order_id, NO_ACCOUNT_WARN_MSG,
                                   creds=get_user_creds(chat_id))
@@ -2818,7 +2861,8 @@ async def _handle_buy_order(bot, chat_id, order_id):
             seller_release = float(seller_info.get("averageReleaseTime", "0") or 0)
         except (ValueError, TypeError):
             seller_release = 0
-        order_detail["_seller_release_mins"] = seller_release
+        order_detail["_seller_release_mins"]    = seller_release
+        order_detail["_seller_release_unknown"] = seller_info_unknown
 
         if _s(chat_id).paga_pay_enabled and order_id not in _s(chat_id).paid_order_ids:
             await asyncio.sleep(5)
@@ -2848,7 +2892,14 @@ async def _handle_buy_order(bot, chat_id, order_id):
                 release_mins = 0
 
             # ── Buyer Protection check BEFORE marking paid ──
-            if _s(chat_id).buyer_protection_on and release_mins >= _s(chat_id).buyer_protection_mins:
+            # If we couldn't confirm the seller's release time (API fetch failed
+            # twice), fail safe: treat it as if it's above your threshold so the
+            # order gets the warning + review flow instead of silently auto-paying
+            # with zero visibility into the actual release time.
+            bp_triggered = _s(chat_id).buyer_protection_on and (
+                seller_info_unknown or release_mins >= _s(chat_id).buyer_protection_mins
+            )
+            if bp_triggered:
                 pay_term_bp = order_detail.get("confirmedPayTerm", {}) or {}
                 if not pay_term_bp:
                     terms_bp    = order_detail.get("paymentTermList", [])
@@ -2862,26 +2913,38 @@ async def _handle_buy_order(bot, chat_id, order_id):
                     )
                     if pr_bp.get("retCode", -1) == 0:
                         _s(chat_id).paid_order_ids.add(order_id)
-                        await _remove_order_buttons(bot, chat_id, order_id)
+                        # Use the "warned" badge, not "completed" — this order was
+                        # flagged by buyer protection, it wasn't a plain successful
+                        # auto-pay. The badge should make that visible at a glance.
+                        await _update_order_message_final(bot, chat_id, order_id, "Warning Sent", "warned")
                 await asyncio.get_event_loop().run_in_executor(
                     None, partial(send_chat_message, order_id, SELLER_WARN_MSG,
                                   creds=get_user_creds(chat_id))
                 )
                 _s(chat_id).expecting_cancel_ids.add(order_id)
+                bp_reason = (
+                    "Buyer Protection: seller release time unknown (fetch failed) — flagged as high-risk"
+                    if seller_info_unknown else
+                    f"Buyer Protection: seller release {release_mins:.0f} min ≥ {_s(chat_id).buyer_protection_mins} min"
+                )
                 _s(chat_id).unpaid_log.append({
                     "order_id":   order_id,
                     "account_no": str(pay_term_bp.get("accountNo","—")),
                     "bank":       get_payment_name(str(pay_term_bp.get("paymentType",""))),
                     "amount":     float(order_detail.get("amount","0")),
-                    "reason":     f"Buyer Protection: seller release {release_mins:.0f} min ≥ {_s(chat_id).buyer_protection_mins} min",
+                    "reason":     bp_reason,
                     "timestamp":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 })
                 await bot.send_message(
                     chat_id=chat_id,
                     text=(
                         f"🛡 <b>Buyer Protection</b> — Order <code>{_esc(order_id)}</code>\n\n"
-                        f"Seller release: <code>{release_mins:.0f} min</code> ≥ <code>{_s(chat_id).buyer_protection_mins} min</code>\n"
-                        "✅ Marked paid on Bybit + warning sent to seller."
+                        + (
+                            "Seller release time: <code>unknown</code> (info fetch failed twice — flagged as high-risk)\n"
+                            if seller_info_unknown else
+                            f"Seller release: <code>{release_mins:.0f} min</code> ≥ <code>{_s(chat_id).buyer_protection_mins} min</code>\n"
+                        )
+                        + "✅ Marked paid on Bybit + warning sent to seller."
                     ),
                     parse_mode="HTML"
                 )
@@ -5630,7 +5693,7 @@ def _reset_user_session(sess) -> bool:
     sess.released_ids   = set()
     sess.unpaid_log     = []
     sess.pending_cancel_reviews = {}   # clear pending seller cancel requests
-    sess.pending_cancel_reviews = {}   # clear pending seller cancel requests on reset
+    sess.expecting_cancel_ids  = set()  # clear orders no longer being tracked for cancel review
 
     # Reset volatile P2P settings (API keys + sender_name etc. are kept)
     for k, v in [("ad_id",""),("mode","fixed"),("increment","0.05"),
