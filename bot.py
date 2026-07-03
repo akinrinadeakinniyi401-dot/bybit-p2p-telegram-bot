@@ -2491,14 +2491,19 @@ async def order_monitor_loop(bot, chat_id):
             logger.error(f"[Orders] Loop error for user {chat_id}: {e}")
 
         # ── Check flagged orders for a seller cancel request ──
-        # When a seller requests order cancellation, Bybit moves the order OUT of
-        # status=10/20 and into status=100 (objectioning) or status=110 (waiting
-        # buyer objection). We check this DIRECTLY on each order we're expecting
-        # a cancel from — the same targeted get_order_detail() lookup used
-        # everywhere else in the bot (e.g. the sell-side paid/release flow) —
-        # rather than scanning a broad status-filtered list. That bulk list
-        # scan needed 2 extra simplifyList calls every cycle, contributed to
-        # rate-limit hits, and didn't reliably surface real cancel requests.
+        # Per Bybit's official /v5/p2p/order/info docs, status 100/110 mean
+        # "objectioning" / "waiting for the user to raise an objection" —
+        # that's the APPEAL/DISPUTE flow, not a seller cancel request. That
+        # was the actual bug this whole time: we were watching the wrong
+        # field. Bybit provides a dedicated boolean for exactly this:
+        #
+        #   needBuyerExamineCancel: true → a seller cancel application is
+        #   pending and the buyer (us) should show the Accept/Reject UI.
+        #
+        # We check this DIRECTLY on each order we're expecting a cancel
+        # from — the same targeted get_order_detail() lookup used
+        # everywhere else in the bot — rather than scanning a broad
+        # status-filtered list.
         #
         # This only runs for orders the bot itself flagged (buyer-protection /
         # slow-release / name-match) and marked paid + warned the seller about.
@@ -2515,15 +2520,17 @@ async def order_monitor_loop(bot, chat_id):
                 if od.get("retCode", -1) != 0:
                     logger.debug(f"[CancelPoll] Could not fetch order {oid} for {chat_id}: {od.get('retMsg')}")
                     continue
-                status = str(od.get("result", {}).get("status", ""))
-                if status in ("100", "110"):
+                result = od.get("result", {})
+                status = str(result.get("status", ""))
+                if result.get("needBuyerExamineCancel"):
                     asyncio.create_task(
                         _handle_seller_cancel_request(bot, chat_id, oid)
                     )
-                elif status in ("30", "40", "50"):
-                    # Order reached a terminal state some other way (completed/
-                    # cancelled/appeal) without ever hitting the cancel-review
-                    # flow — stop tracking it so we don't keep polling forever.
+                elif status not in ("10", "20") and not result.get("needBuyerExamineCancel"):
+                    # Order left the normal in-flight window (10=waiting buy pay,
+                    # 20=waiting seller release) some other way — appeal, or it
+                    # simply completed/cancelled without a cancel review ever
+                    # being needed. Stop tracking it so we don't poll forever.
                     _s(chat_id).expecting_cancel_ids.discard(oid)
             except Exception as _ce:
                 logger.debug(f"[CancelPoll] Error checking order {oid} for {chat_id}: {_ce}")
@@ -2568,8 +2575,9 @@ def _cancel_reject_reason_buttons(order_id: str) -> InlineKeyboardMarkup:
 
 async def _handle_seller_cancel_request(bot, chat_id: int, order_id: str):
     """
-    Called when order_monitor_loop detects status 100/110 on a flagged buy order
-    (i.e. one the bot itself marked paid + warned the seller about).
+    Called when order_monitor_loop sees needBuyerExamineCancel=true on a
+    flagged buy order (i.e. one the bot itself marked paid + warned the
+    seller about).
     Fetches full order details, builds the notification with original flag reason
     (buyer protection slow-seller), then sends Accept / Reject buttons to the user.
     Per-user: uses chat_id for creds and session state.
@@ -6103,4 +6111,4 @@ def start_bot():
 
     application.post_init = _post_init
     logger.info("🤖 Bot handlers registered")
-    return application
+    return applicatio
