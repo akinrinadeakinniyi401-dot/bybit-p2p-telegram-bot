@@ -6111,4 +6111,4 @@ def start_bot():
 
     application.post_init = _post_init
     logger.info("🤖 Bot handlers registered")
-    return applicatio
+    return application
