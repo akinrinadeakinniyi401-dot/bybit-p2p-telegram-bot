@@ -115,6 +115,68 @@ class SessionState:
         self._bybit_key    = ""
         self._bybit_secret = ""
 
+        # ── Buy volume analytics (rolling 24h, independent of the hourly reset) ──
+        # Tracks cumulative COIN quantity bought per token (USDT/USDC/BTC/ETH/...),
+        # plus order counts, purely for the user's own reference. Deliberately
+        # NOT touched by the hourly session reset (_reset_user_session in bot.py)
+        # or by reset_p2p() — it only resets on its own 24h clock, tracked here.
+        self.buy_volume:            dict = {}   # {"USDT": Decimal("2000.00"), ...}
+        self.buy_volume_counts:     dict = {}   # {"USDT": 30, ...}
+        self.buy_volume_order_ids: set  = set() # prevents double-counting the same order
+        self.buy_volume_started_at      = datetime.now()
+
+    def _maybe_reset_buy_volume(self):
+        """Roll the 24h window over if it has elapsed. Called lazily before
+        every read/write so no background task is needed for this."""
+        age = (datetime.now() - self.buy_volume_started_at).total_seconds()
+        if age > 24 * 3600:
+            self.buy_volume.clear()
+            self.buy_volume_counts.clear()
+            self.buy_volume_order_ids.clear()
+            self.buy_volume_started_at = datetime.now()
+            logger.info(f"[BuyVolume] 24h analytics window reset for user {self.user_id}")
+
+    def record_buy_volume(self, order_id: str, token: str, qty) -> bool:
+        """Add one buy order's COIN quantity (not fiat) to the 24h rolling total.
+        Idempotent per order_id — calling this twice for the same order_id is a
+        no-op the second time, so it's safe to call from multiple pay paths
+        without double-counting. Returns True if it was actually recorded."""
+        self._maybe_reset_buy_volume()
+        if not order_id or order_id in self.buy_volume_order_ids:
+            return False
+        try:
+            qty_dec = Decimal(str(qty))
+        except Exception:
+            return False
+        if qty_dec <= 0:
+            return False
+        token = (token or "UNKNOWN").upper().strip()
+        self.buy_volume[token]        = self.buy_volume.get(token, Decimal("0")) + qty_dec
+        self.buy_volume_counts[token] = self.buy_volume_counts.get(token, 0) + 1
+        self.buy_volume_order_ids.add(order_id)
+        return True
+
+    def get_buy_volume_lines(self) -> list:
+        """Return formatted 'TOKEN: qty (N orders)' lines, sorted by token name.
+        Rolls the 24h window over first if it has elapsed."""
+        self._maybe_reset_buy_volume()
+        lines = []
+        for token in sorted(self.buy_volume.keys()):
+            qty = self.buy_volume[token]
+            cnt = self.buy_volume_counts.get(token, 0)
+            # Fixed-point formatting, trimmed of trailing zeros — avoids
+            # Decimal.normalize() occasionally producing scientific notation.
+            qty_str = f"{qty:.8f}".rstrip("0").rstrip(".")
+            if not qty_str:
+                qty_str = "0"
+            lines.append(f"{token}: {qty_str}  ({cnt} order{'s' if cnt != 1 else ''})")
+        return lines
+
+    def buy_volume_reset_in_seconds(self) -> int:
+        """Seconds remaining until the current 24h window rolls over."""
+        elapsed = (datetime.now() - self.buy_volume_started_at).total_seconds()
+        return max(0, int(24 * 3600 - elapsed))
+
     def is_stale(self, max_hours: int = 12) -> bool:
         age = (datetime.now() - self.created_at).total_seconds()
         return age > max_hours * 3600
