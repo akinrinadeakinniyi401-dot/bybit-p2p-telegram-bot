@@ -550,6 +550,7 @@ def autopay_section_keyboard(uid: int = 0):
         [InlineKeyboardButton(bp_tog,                         callback_data="toggle_buyer_protection")],
         [InlineKeyboardButton(nm_tog,                         callback_data="toggle_name_match")],
         [InlineKeyboardButton("📋 View Unpaid Orders",        callback_data="view_unpaid_orders")],
+        [InlineKeyboardButton("📊 Buy Volume (24h)",          callback_data="view_buy_volume")],
         [InlineKeyboardButton("ℹ️ How Auto-Pay Works",        callback_data="autopay_info")],
         [InlineKeyboardButton("ℹ️ How Flutterwave Pay Works", callback_data="flw_info")],
         [InlineKeyboardButton("ℹ️ How Paga Pay Works",        callback_data="paga_info")],
@@ -575,6 +576,8 @@ def autopay_section_text(uid: int = 0) -> str:
     unpaid_count = len(sess.unpaid_log)
     bp_status    = f"✅ ON — threshold: {sess.buyer_protection_mins} min" if sess.buyer_protection_on else "❌ OFF"
     nm_status    = "✅ ON — skips orders with missing account info" if sess.name_match_enabled else "❌ OFF"
+    bv_lines     = sess.get_buy_volume_lines()
+    bv_summary   = ", ".join(l.split("  (")[0] for l in bv_lines) if bv_lines else "No buy orders yet"
     return (
         f"💳 <b>AUTO-PAY</b>\n\n"
         f"Bybit Mark-Paid: <b>{bybit_status}</b>\n"
@@ -583,7 +586,8 @@ def autopay_section_text(uid: int = 0) -> str:
         f"Flutterwave: {flw_configured}\n"
         f"Paga: {paga_configured}\n"
         f"✏️ Sender name: <code>{sender_name}</code>\n"
-        f"📋 Unpaid orders this session: <code>{unpaid_count}</code>\n\n"
+        f"📋 Unpaid orders this session: <code>{unpaid_count}</code>\n"
+        f"📊 Buy volume (24h): <code>{bv_summary}</code>\n\n"
         f"🛡 <b>Buyer Protection:</b> {bp_status}\n"
         f"🔍 <b>Name Match:</b> {nm_status}\n\n"
         "⚠️ Enable only ONE of Bybit or Flutterwave at a time.\n"
@@ -941,6 +945,7 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
                         None, partial(mark_order_paid, order_id, pt, pid, creds=get_user_creds(chat_id))
                     )
                     _s(chat_id).paid_order_ids.add(order_id)
+                    _track_buy_volume(chat_id, order_id, order_detail)
                 await asyncio.get_event_loop().run_in_executor(
                     None, partial(send_chat_message, order_id, NO_ACCOUNT_WARN_MSG,
                                   creds=get_user_creds(chat_id))
@@ -1029,6 +1034,7 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
                         None, partial(mark_order_paid, order_id, pay_type, payment_id, creds=get_user_creds(chat_id))
                     )
                     _s(chat_id).paid_order_ids.add(order_id)
+                    _track_buy_volume(chat_id, order_id, order_detail)
                 await asyncio.get_event_loop().run_in_executor(
                     None, partial(send_chat_message, order_id, SELLER_WARN_MSG,
                                   creds=get_user_creds(chat_id))
@@ -1345,6 +1351,7 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
                     f"bybit_ok={bybit_ok} retCode={(pr or {}).get('retCode','?')}"
                 )
             _s(chat_id).paid_order_ids.add(order_id)
+            _track_buy_volume(chat_id, order_id, order_detail)
             _set_order_final(order_id, "completed")
             # ── Update order message: remove action buttons, show ✅ Completed badge ──
             await _update_order_message_final(bot, chat_id, order_id, "Transfer Completed", "completed")
@@ -1793,6 +1800,14 @@ async def handle_flw_webhook(bot, payload: dict, signature_header: str | None):
         logger.warning(f"[FLW Webhook] Missing pay_type or payment_id — cannot mark Bybit paid | order={order_id}")
 
     _s(chat_id).paid_order_ids.add(order_id)
+    try:
+        _od_bv = await asyncio.get_event_loop().run_in_executor(
+            None, partial(get_order_detail, order_id, creds=get_user_creds(chat_id))
+        )
+        if _od_bv.get("retCode", -1) == 0:
+            _track_buy_volume(chat_id, order_id, _od_bv.get("result", {}))
+    except Exception as _bv_err:
+        logger.debug(f"[BuyVolume] FLW webhook fetch failed for {order_id}: {_bv_err}")
     _set_order_final(order_id, "completed")
 
     # ── STEP 5: Remove buttons + update message ──
@@ -1843,6 +1858,14 @@ async def _paga_handle_success(bot, chat_id, order_id, pay_term, amount, holder_
         )
         bybit_ok = pr.get("retCode", -1) == 0
     _s(chat_id).paid_order_ids.add(order_id)
+    try:
+        _od_bv = await asyncio.get_event_loop().run_in_executor(
+            None, partial(get_order_detail, order_id, creds=get_user_creds(chat_id))
+        )
+        if _od_bv.get("retCode", -1) == 0:
+            _track_buy_volume(chat_id, order_id, _od_bv.get("result", {}))
+    except Exception as _bv_err:
+        logger.debug(f"[BuyVolume] Paga success fetch failed for {order_id}: {_bv_err}")
     logger.info(f"[Paga] ✅ SUCCESS: txnId={txn_id} | Bybit={bybit_ok}")
     await _remove_order_buttons(bot, chat_id, order_id)
     await bot.send_message(chat_id=chat_id,
@@ -1927,6 +1950,7 @@ async def _paga_autopay(bot, chat_id, order_id, order_detail):
                         None, partial(mark_order_paid, order_id, pt, pid, creds=get_user_creds(chat_id))
                     )
                     _s(chat_id).paid_order_ids.add(order_id)
+                    _track_buy_volume(chat_id, order_id, order_detail)
                 await asyncio.get_event_loop().run_in_executor(
                     None, partial(send_chat_message, order_id, NO_ACCOUNT_WARN_MSG,
                                   creds=get_user_creds(chat_id))
@@ -2002,6 +2026,7 @@ async def _paga_autopay(bot, chat_id, order_id, order_detail):
                         None, partial(mark_order_paid, order_id, pay_type, payment_id, creds=get_user_creds(chat_id))
                     )
                     _s(chat_id).paid_order_ids.add(order_id)
+                    _track_buy_volume(chat_id, order_id, order_detail)
                 await asyncio.get_event_loop().run_in_executor(
                     None, partial(send_chat_message, order_id, SELLER_WARN_MSG,
                                   creds=get_user_creds(chat_id))
@@ -2761,6 +2786,20 @@ async def _handle_cancel_review(bot, chat_id: int, order_id: str,
         )
 
 
+def _track_buy_volume(uid: int, order_id: str, order_detail: dict):
+    """Add this buy order's coin quantity (quantity/tokenId — NOT the fiat
+    amount/currencyId) to the user's rolling 24h buy-volume analytics.
+    Safe to call from every pay path — idempotent per order_id, so it will
+    never double-count even if called more than once for the same order."""
+    try:
+        token = str(order_detail.get("tokenId", "")).upper().strip()
+        qty   = order_detail.get("quantity", "0")
+        if token and qty:
+            _s(uid).record_buy_volume(order_id, token, qty)
+    except Exception as _e:
+        logger.debug(f"[BuyVolume] Failed to record order {order_id} for user {uid}: {_e}")
+
+
 async def _handle_buy_order(bot, chat_id, order_id):
     try:
         det = await asyncio.get_event_loop().run_in_executor(None, partial(get_order_detail, order_id, creds=get_user_creds(chat_id)))
@@ -2849,6 +2888,7 @@ async def _handle_buy_order(bot, chat_id, order_id):
                                       creds=get_user_creds(chat_id))
                     )
                     _s(chat_id).paid_order_ids.add(order_id)
+                    _track_buy_volume(chat_id, order_id, order_detail)
                     await _update_order_message_final(bot, chat_id, order_id, "Warning Sent", "warned")
                 await asyncio.get_event_loop().run_in_executor(
                     None, partial(send_chat_message, order_id, NO_ACCOUNT_WARN_MSG,
@@ -2921,6 +2961,7 @@ async def _handle_buy_order(bot, chat_id, order_id):
                     )
                     if pr_bp.get("retCode", -1) == 0:
                         _s(chat_id).paid_order_ids.add(order_id)
+                        _track_buy_volume(chat_id, order_id, order_detail)
                         # Use the "warned" badge, not "completed" — this order was
                         # flagged by buyer protection, it wasn't a plain successful
                         # auto-pay. The badge should make that visible at a glance.
@@ -2990,6 +3031,7 @@ async def _handle_buy_order(bot, chat_id, order_id):
                     )
                     if pr.get("retCode", -1) == 0:
                         _s(chat_id).paid_order_ids.add(order_id)
+                        _track_buy_volume(chat_id, order_id, order_detail)
                         await _remove_order_buttons(bot, chat_id, order_id)
                         await bot.send_message(
                             chat_id=chat_id,
@@ -4049,6 +4091,27 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         _s(tuser.id).unpaid_log.clear()
         await edit_menu(query, "✅ Unpaid orders log cleared.", InlineKeyboardMarkup(back_section("section_autopay")))
 
+    # ── 📊 View Buy Volume Analytics (24h) ──
+    elif data == "view_buy_volume":
+        sess_bv = _s(tuser.id)
+        lines_bv = sess_bv.get_buy_volume_lines()
+        secs_left = sess_bv.buy_volume_reset_in_seconds()
+        hrs_left  = secs_left // 3600
+        mins_left = (secs_left % 3600) // 60
+        if not lines_bv:
+            body = "No buy orders recorded in the current 24h window yet."
+        else:
+            body = "<code>" + "\n".join(lines_bv) + "</code>"
+        await edit_menu(query,
+            f"📊 <b>Buy Volume — 24h Window</b>\n\n"
+            f"{body}\n\n"
+            f"⏱ Window resets in <b>{hrs_left}h {mins_left}m</b>\n\n"
+            f"<i>Coin quantities only (not fiat) — total volume you've bought "
+            f"across all accepted/auto-paid buy orders in this window. "
+            f"Not affected by the hourly session reset.</i>",
+            InlineKeyboardMarkup(back_section("section_autopay"))
+        )
+
     # ── 💬 Toggle Chat Monitor ──
     elif data == "toggle_chat_monitor":
         if _s(tuser.id).chat_monitor_enabled:
@@ -5046,6 +5109,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             )
             if result.get("retCode", result.get("ret_code",-1)) == 0:
                 _s(tuser.id).paid_order_ids.add(order_id)
+                _track_buy_volume(tuser.id, order_id, order_detail)
                 # ── Edit original message: remove buttons, show status badge ──
                 await _update_order_message_final(context.bot, chat_id, order_id, "Completed", "completed")
                 await context.bot.send_message(chat_id=chat_id,
@@ -5088,6 +5152,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             )
             if pr.get("retCode", pr.get("ret_code",-1)) == 0:
                 _s(tuser.id).paid_order_ids.add(order_id)
+                _track_buy_volume(tuser.id, order_id, order_detail)
                 mr = await asyncio.get_event_loop().run_in_executor(
                     None, partial(send_chat_message, order_id, SELLER_WARN_MSG,
                                       creds=get_user_creds(chat_id))
