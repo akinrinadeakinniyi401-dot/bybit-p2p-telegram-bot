@@ -238,6 +238,9 @@ async def run_bot_setup(render_url):
                 BotCommand("awardref",        "💵 Approve referral commission"),
                 BotCommand("addbalance",      "➕ Add to user balance"),
                 BotCommand("deductbalance",   "➖ Deduct from user balance"),
+                BotCommand("withdrawals",     "💸 View pending withdrawals"),
+                BotCommand("approvewithdraw", "✅ Approve a withdrawal"),
+                BotCommand("rejectwithdraw",  "❌ Reject a withdrawal"),
             ], scope=BotCommandScopeChat(chat_id=admin_id))
         except Exception as e:
             logger.warning(f"Could not set admin commands for {admin_id}: {e}")
