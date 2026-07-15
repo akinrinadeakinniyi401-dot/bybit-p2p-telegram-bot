@@ -234,6 +234,10 @@ async def run_bot_setup(render_url):
                 BotCommand("requests",        "📋 View upgrade requests"),
                 BotCommand("listusers",       "👥 List all users"),
                 BotCommand("userdata",        "📊 Download user Excel"),
+                BotCommand("referrals",       "🎁 Referral analytics"),
+                BotCommand("awardref",        "💵 Approve referral commission"),
+                BotCommand("addbalance",      "➕ Add to user balance"),
+                BotCommand("deductbalance",   "➖ Deduct from user balance"),
             ], scope=BotCommandScopeChat(chat_id=admin_id))
         except Exception as e:
             logger.warning(f"Could not set admin commands for {admin_id}: {e}")
