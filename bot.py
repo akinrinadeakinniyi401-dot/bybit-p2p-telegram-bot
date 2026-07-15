@@ -27,7 +27,12 @@ from bybit import (
 from fraud_check import check_buyer_name, load_scammers, get_scammer_count, get_last_updated
 import db
 import subscription as sub
-from admin_commands import cmd_upgrade, cmd_downgrade, cmd_requests, cmd_listusers, cmd_userdata
+from admin_commands import (
+    cmd_upgrade, cmd_downgrade, cmd_requests, cmd_listusers, cmd_userdata,
+    cmd_awardref, cmd_addbalance, cmd_deductbalance, cmd_referrals,
+)
+import help_agent
+from config import REFERRAL_REWARD_NGN, BOT_OWNER_USERNAME
 
 logger = logging.getLogger(__name__)
 
@@ -308,6 +313,7 @@ def main_menu_keyboard(uid: int = 0):
         [InlineKeyboardButton(f"{p_icon} AUTO-PAY",      callback_data="section_autopay")],
         [InlineKeyboardButton("🔑 Set APIs",             callback_data="section_apis")],
         [InlineKeyboardButton("⬆️ Upgrade Plan",         callback_data="upgrade_plan")],
+        [InlineKeyboardButton("🎁 Referrals",            callback_data="referrals")],
         [InlineKeyboardButton("📡 Bot Status",           callback_data="bot_status")],
         [InlineKeyboardButton("🌍 Get My IP",            callback_data="get_my_ip")],
         [InlineKeyboardButton("🔁 Reset Session",        callback_data="reset_confirm")],
@@ -3472,6 +3478,33 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_admin(tuser.id):
         _admin_chat_ids.add(update.message.chat_id)
 
+    # ── Referral capture ──
+    # Deep link looks like https://t.me/<bot>?start=ref_R<code> — only ever
+    # takes effect for genuinely new accounts, and never for self-referral
+    # (db.record_referral_join() enforces both, plus "referrer must exist").
+    if is_new and context.args:
+        payload = context.args[0]
+        if payload.startswith("ref_"):
+            referrer_id = db.resolve_referral_code(payload[len("ref_"):])
+            if referrer_id:
+                linked = db.record_referral_join(
+                    tuser.id, referrer_id, tuser.username or "", tuser.full_name or ""
+                )
+                if linked:
+                    logger.info(f"[Referral] {tuser.id} linked to referrer {referrer_id}")
+                    try:
+                        await context.bot.send_message(
+                            chat_id=referrer_id,
+                            text=(
+                                f"🎁 <b>New referral!</b>\n\n"
+                                f"@{tuser.username or tuser.full_name or tuser.id} joined using your link.\n"
+                                f"You'll earn ₦{REFERRAL_REWARD_NGN:,} once they upgrade to Pro and the admin approves it."
+                            ),
+                            parse_mode="HTML"
+                        )
+                    except Exception:
+                        pass
+
     # Auto-downgrade expired pro users
     db.check_and_auto_downgrade(tuser.id)
 
@@ -3487,6 +3520,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Load scammer list if empty
     if get_scammer_count() == 0:
         asyncio.get_event_loop().run_in_executor(None, load_scammers)
+
+    # Load help-agent knowledge base if empty
+    if help_agent.get_entry_count() == 0:
+        asyncio.get_event_loop().run_in_executor(None, help_agent.load_knowledge)
 
     await send_menu(update, context)
 
@@ -3709,6 +3746,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
     # get_my_ip, section_apis, set_api_*, delete_apis, delete_apis_confirm, reset_*
     _FREE_ALLOWED = {
         "main_menu", "upgrade_plan", "upgrade_request_yes",
+        "referrals",
         "bot_status", "reset_confirm", "reset_do",
         "section_apis", "set_api_bybit", "set_api_flw", "set_api_paga",
         "set_api_bybit_1", "set_api_bybit_2",
@@ -5011,11 +5049,18 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
         # ── Step 3: Notify admin(s) directly — in try/except so any Telegram
         # API error is logged but CANNOT propagate and crash the bot. ──
+        _ref_line = ""
+        _referrer_id = db.get_referrer(uid)
+        if _referrer_id:
+            _referrer = db.get_user(_referrer_id)
+            _rname = _esc(_referrer.get("username") or _referrer.get("display_name") or str(_referrer_id)) if _referrer else str(_referrer_id)
+            _ref_line = f"🎁 Referred by: @{_rname} (<code>{_referrer_id}</code>)\n\n"
         _admin_msg = (
             f"🔔 <b>New Upgrade Request!</b>\n\n"
             f"👤 User ID: <code>{uid}</code>\n"
             f"Username: @{uname if uname else 'None'}\n"
             f"Name: {dname}\n\n"
+            f"{_ref_line}"
             f"Approve: <code>/upgrade {uid} 30</code>"
         )
         for _admin_id in list(_admin_chat_ids):
@@ -5029,6 +5074,44 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             except Exception as _notify_err:
                 logger.error(f"[Upgrade] Could not notify admin {_admin_id}: {_notify_err}")
                 # The background _upgrade_notifier_loop will retry in 30 s
+
+    # ── 🎁 Referrals ──
+    elif data == "referrals":
+        uid  = query.from_user.id
+        bot_username = (await context.bot.get_me()).username
+        code = db.get_or_create_referral_code(uid)
+        link = f"https://t.me/{bot_username}?start=ref_{code}"
+        bal  = db.get_referral_balance(uid)
+        rows = db.get_referrals_for(uid)
+
+        status_icon = {"none": "⏳", "pending": "💵", "approved": "✅"}
+        if rows:
+            invite_lines = []
+            for r in rows[:15]:
+                uname = _esc(r.get("referred_username") or "someone")
+                icon  = status_icon.get(r.get("reward_status"), "•")
+                invite_lines.append(f"{icon} @{uname}")
+            invite_block = "\n".join(invite_lines)
+            if len(rows) > 15:
+                invite_block += f"\n…and {len(rows) - 15} more"
+        else:
+            invite_block = "No referrals yet — share your link below!"
+
+        upgraded_count = sum(1 for r in rows if r.get("reward_status") in ("pending", "approved"))
+
+        await edit_menu(query,
+            f"🎁 <b>Your Referral Program</b>\n\n"
+            f"Share your link — when someone joins and later upgrades to "
+            f"Pro, you earn <b>₦{REFERRAL_REWARD_NGN:,}</b> once the admin approves it.\n\n"
+            f"🔗 <b>Your link:</b>\n<code>{link}</code>\n\n"
+            f"👥 Total referred: <b>{len(rows)}</b>\n"
+            f"💎 Upgraded to Pro: <b>{upgraded_count}</b>\n"
+            f"💰 Available balance: <b>₦{bal['balance']:,}</b>\n"
+            f"📈 Total earned (lifetime): <b>₦{bal['total_earned']:,}</b>\n\n"
+            f"<b>Your invites:</b>\n{invite_block}\n\n"
+            f"⏳ pending upgrade · 💵 commission pending · ✅ paid to balance",
+            InlineKeyboardMarkup(back_main())
+        )
 
     # ── 🟢/🔴 Toggle Price Update ──
     elif data == "toggle_refresh":
@@ -5665,6 +5748,30 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             await update.message.reply_text("❌ Send a whole number like `25`", parse_mode="HTML")
 
+    else:
+        # ── No active input flow — this is free-text chat, not a bot setting.
+        # Route it to the local help agent (no external AI API — see
+        # help_agent.py). Shows a "typing…" indicator first so replies don't
+        # look instant/copy-pasted, and never uses inline buttons here —
+        # unmatched questions get a plain list of things the agent can help
+        # with instead.
+        try:
+            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
+        except Exception:
+            pass
+
+        reply_text = help_agent.answer_question(text)
+
+        # Small delay proportional to reply length, capped, so the typing
+        # indicator has time to show before the message lands.
+        await asyncio.sleep(min(2.5, 0.5 + len(reply_text) / 400))
+
+        try:
+            await update.message.reply_text(reply_text, parse_mode="HTML", disable_web_page_preview=True)
+        except Exception:
+            # Fall back to plain text if HTML somehow fails to parse
+            await update.message.reply_text(reply_text, disable_web_page_preview=True)
+
 
 # ─────────────────────────────────────────
 # 🔔 UPGRADE NOTIFIER — background polling
@@ -6087,11 +6194,15 @@ def start_bot():
     application.add_handler(CommandHandler("checkname",        check_name_command))
 
     # ── Admin-only commands ──
-    application.add_handler(CommandHandler("upgrade",    cmd_upgrade))
-    application.add_handler(CommandHandler("downgrade",  cmd_downgrade))
-    application.add_handler(CommandHandler("requests",   cmd_requests))
-    application.add_handler(CommandHandler("listusers",  cmd_listusers))
-    application.add_handler(CommandHandler("userdata",   cmd_userdata))
+    application.add_handler(CommandHandler("upgrade",       cmd_upgrade))
+    application.add_handler(CommandHandler("downgrade",     cmd_downgrade))
+    application.add_handler(CommandHandler("requests",      cmd_requests))
+    application.add_handler(CommandHandler("listusers",     cmd_listusers))
+    application.add_handler(CommandHandler("userdata",      cmd_userdata))
+    application.add_handler(CommandHandler("awardref",      cmd_awardref))
+    application.add_handler(CommandHandler("addbalance",    cmd_addbalance))
+    application.add_handler(CommandHandler("deductbalance", cmd_deductbalance))
+    application.add_handler(CommandHandler("referrals",     cmd_referrals))
 
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
