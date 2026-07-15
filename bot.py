@@ -1,4 +1,5 @@
 import asyncio
+import random
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 import logging
@@ -3451,6 +3452,24 @@ def _esc(value: str) -> str:
     return (value or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+async def _typing(context: ContextTypes.DEFAULT_TYPE, chat_id: int, min_delay: float = 0.5, max_delay: float = 1.4):
+    """
+    Show the 'typing…' indicator and hold for a short human-feeling delay
+    before the caller sends its reply. Called at the top of every
+    user-facing handler (buttons, free text, commands) so nothing lands
+    instantly. Failures here are swallowed — this is cosmetic only and
+    must never block or crash a real response.
+    """
+    try:
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+    except Exception:
+        pass
+    try:
+        await asyncio.sleep(random.uniform(min_delay, max_delay))
+    except Exception:
+        pass
+
+
 async def edit_menu_html(query, text: str, keyboard: InlineKeyboardMarkup):
     """Like edit_menu but uses HTML parse mode — safe for raw API keys / UUIDs."""
     try:
@@ -3525,6 +3544,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if help_agent.get_entry_count() == 0:
         asyncio.get_event_loop().run_in_executor(None, help_agent.load_knowledge)
 
+    await _typing(context, update.effective_chat.id)
     await send_menu(update, context)
 
 
@@ -3538,6 +3558,7 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def ping_bybit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Test Bybit API — works for all Pro users and admin, using their own saved keys."""
     uid   = update.effective_user.id
+    await _typing(context, update.effective_chat.id)
     creds = get_user_creds(uid)
     if not is_admin(uid) and not creds.get("key"):
         await update.message.reply_text(
@@ -3578,6 +3599,7 @@ async def ping_bybit_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def ping_flutterwave_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Test Flutterwave API — uses the user's own saved FLW secret key from DB."""
     uid        = update.effective_user.id
+    await _typing(context, update.effective_chat.id)
     secret_key = db.get_api(uid, "flw_secret_key")
 
     if not secret_key:
@@ -3628,6 +3650,7 @@ async def ping_flutterwave_command(update: Update, context: ContextTypes.DEFAULT
 async def ping_paga_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Test Paga API — uses the user's own saved Paga keys from DB."""
     uid        = update.effective_user.id
+    await _typing(context, update.effective_chat.id)
     principal  = db.get_api(uid, "paga_principal")
     credential = db.get_api(uid, "paga_credential")
     api_key    = db.get_api(uid, "paga_api_key")
@@ -3719,6 +3742,9 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         await query.answer()
     except Exception as _ans_err:
         logger.warning(f"[ButtonHandler] query.answer() failed: {_ans_err}")
+
+    if chat_id:
+        await _typing(context, chat_id)
 
     # ── Register/update user on every interaction ──
     global _current_user_id, _current_plan_badge
@@ -5349,6 +5375,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     text = update.message.text.strip()
 
+    await _typing(context, update.effective_chat.id)
+
     # ── Per-user isolated state ──
     # Admin uses the global user_state dict.
     # Non-admin users get their own state via context.user_data so their
@@ -5751,20 +5779,13 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         # ── No active input flow — this is free-text chat, not a bot setting.
         # Route it to the local help agent (no external AI API — see
-        # help_agent.py). Shows a "typing…" indicator first so replies don't
-        # look instant/copy-pasted, and never uses inline buttons here —
-        # unmatched questions get a plain list of things the agent can help
-        # with instead.
-        try:
-            await context.bot.send_chat_action(chat_id=update.effective_chat.id, action="typing")
-        except Exception:
-            pass
-
+        # help_agent.py). The typing indicator was already shown at the top
+        # of this handler; add a little extra delay proportional to the
+        # reply length so longer answers feel less instant. Never uses
+        # inline buttons here — unmatched questions get a plain list of
+        # things the agent can help with instead.
         reply_text = help_agent.answer_question(text)
-
-        # Small delay proportional to reply length, capped, so the typing
-        # indicator has time to show before the message lands.
-        await asyncio.sleep(min(2.5, 0.5 + len(reply_text) / 400))
+        await asyncio.sleep(min(2.0, len(reply_text) / 500))
 
         try:
             await update.message.reply_text(reply_text, parse_mode="HTML", disable_web_page_preview=True)
@@ -5985,6 +6006,7 @@ async def _db_session_cleanup_loop():
 async def refresh_scammers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _get_or_register_user(update.effective_user)
     uid = update.effective_user.id
+    await _typing(context, update.effective_chat.id)
     if not is_admin(uid) and not sub.is_pro(uid):
         await update.message.reply_text(
             "🔒 <b>Pro Plan Required</b>\n\n"
@@ -6016,6 +6038,7 @@ async def check_name_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     """Manually check a name against the scammer list. Usage: /checkname John Doe"""
     _get_or_register_user(update.effective_user)
     uid = update.effective_user.id
+    await _typing(context, update.effective_chat.id)
     if not is_admin(uid) and not sub.is_pro(uid):
         await update.message.reply_text(
             "🔒 <b>Pro Plan Required</b>\n\n"
