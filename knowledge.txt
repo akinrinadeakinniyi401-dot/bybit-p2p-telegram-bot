@@ -1,4 +1,8 @@
-# knowledge.txt — help agent knowledge base
+# knowledge.txt — Agent Nova's knowledge base
+#
+# Source of truth: P2P_Exchange_Bot_Knowledge_Base.md. Keep this file in
+# sync whenever that document is updated — the persona, greeting, and
+# off-topic wording live in help_agent.py and are copied from it directly.
 #
 # Edit this file and push to GitHub. The bot re-reads it automatically
 # every ~30 minutes (same refresh cycle as scammers.txt), or immediately
@@ -13,81 +17,156 @@
 # you like — just separate each one with a line containing only "---".
 
 Q: What do I need to do first as a new user?
-K: getting started, new user, how to start, first steps, setup guide, onboarding, before i can use the bot
-A: Welcome! Here's the quickest path to using the bot: 1) Go to Main Menu -> 🔑 Set APIs and add your Bybit API Key/Secret (free — no Pro needed). 2) Request an upgrade from Main Menu -> ⬆️ Upgrade Plan if you want price bot, order monitor, auto-pay, and other Pro features. 3) Once you're Pro, open 📊 AD PRICE BOT and set your Ad ID + Bybit UID before starting the price bot. 4) Turn on 📦 Order Monitor so incoming orders are tracked automatically. That's the core setup — everything else (Auto-Pay, Buyer Protection, Name Match) is optional on top of that.
+K: getting started, new user, how to start, first steps, setup guide, onboarding, before i can use the bot, setup progress
+A: Open /menu to see your dashboard — it shows your Telegram User ID, current plan, active Bybit account, and a setup progress counter (0/5 to 5/5). To reach 5/5: 1) Set your Bybit API key under API Settings (free). 2) Request an upgrade if you want Pro features. 3) Set your AD ID in the AD Price Bot section. 4) Fetch your AD details. 5) Start Order Monitor. Only one Bybit account (Account 1 or Account 2) can be active at a time.
 ---
 
-Q: What is the auto price bot and what are the benefits?
+Q: How do I open the dashboard / what does /menu show?
+K: menu, dashboard, home, setup, status, account, what does menu show
+A: The /menu command opens the bot dashboard. It shows your Telegram User ID, your current subscription plan, your active Bybit account (Account 1 or Account 2), your setup progress (0/5 to 5/5), and which features are currently active. Only one Bybit account can be active at a time — if you want to switch from Account 1 to Account 2, first stop every active bot service, switch accounts, then start the services again.
+---
+
+Q: How do I switch between Bybit Account 1 and Account 2?
+K: switch account, change bybit account, account 1 account 2, switch bybit
+A: Only one Bybit account can be active at a time. Before switching: 1) Stop every active bot service (price bot, order monitor, auto-pay, etc). 2) Switch to the other account under API Settings. 3) Start the services again. Switching without stopping services first can cause the bot to mix up orders between accounts.
+---
+
+Q: What does /pingbybit do?
+K: pingbybit, bybit api, connection test, api key test, test bybit connection
+A: /pingbybit checks whether your Bybit API connection is working correctly. Use it right after adding your API keys, or any time you suspect a connection issue. A successful result means your Bybit account is ready for trading.
+---
+
+Q: What does /pingflutterwave do?
+K: pingflutterwave, flutterwave, banks, transfer, payment, flutterwave connection
+A: /pingflutterwave checks your Flutterwave API connection. It also downloads every bank supported for transfers. Run this before enabling Flutterwave Auto Pay.
+---
+
+Q: What does /pingpaga do?
+K: pingpaga, paga, business api, transfer, paga connection
+A: /pingpaga checks your Paga Business API connection. It also downloads the supported transfer banks. Run this before enabling Paga Pay.
+---
+
+Q: What does /refreshscammers do?
+K: refresh scammers, blacklist, fraud database, refreshscammers
+A: /refreshscammers downloads the newest fraud database from GitHub. Run it regularly before trading so your scammer checks use the latest list.
+---
+
+Q: How do I check a buyer's name against the scammer list?
+K: checkname, buyer, fraud, blacklist, verify buyer, scammer check
+A: Use /checkname followed by the name, for example: /checkname John Doe. If the name exists in the database, the bot warns you that the buyer has previous fraud reports. If it's not found, the bot reports no current record — but no record found does NOT guarantee the buyer is safe, so always stay cautious.
+---
+
+Q: What is the AD Price Bot and how does it work?
 K: what is price bot, ad price bot, auto price, price bot benefits, why use price bot
-A: The auto price bot keeps your P2P ad price updated automatically instead of you manually editing it every few minutes. You set a mode (Fixed price, or Floating based on a reference price) and an update interval, and the bot reprices your ad for you in the background. Benefits: your ad stays competitive around the clock, you don't lose trades to faster competitors, and you save the time of manually watching and editing prices all day.
+A: The AD Price Bot automatically edits your Bybit advertisements so you don't have to manually update the price every few minutes. Setup: Step 1 — open My Ads List to fetch every ad linked to your account and copy the Advertisement ID you want to manage. Step 2 — open Set AD ID and paste it in. Step 3 — click Fetch AD Details to pull payment methods, currency, and current settings (required before editing can begin). Step 4 — set your update Interval in minutes (e.g. "3" = every 3 minutes). Step 5 — choose Fixed Mode (best for USDT/USDC, uses Set Increment e.g. ₦10 added each update) or Floating Mode (best for BTC/ETH, uses Set Float percentage plus a Set NGN/USDT Ref price copied from the Bybit ad page). Then use Update Once Now to test it, or Start Auto Update to run it continuously.
+---
+
+Q: How do I set my Ad ID and fetch ad details?
+K: set ad id, fetch ad details, my ads list, advertisement id
+A: First open My Ads List — the bot fetches every advertisement linked to your account; copy the Advertisement ID you want to manage. Then open Set AD ID and paste it in. Finally click Fetch AD Details to retrieve payment methods, advertisement information, currency, and current settings — this step is required before any editing can begin.
+---
+
+Q: What's the difference between Fixed Mode and Floating Mode?
+K: fixed mode, floating mode, set increment, set float, ngn usdt reference
+A: Fixed Mode is best for USDT/USDC — you use Set Increment (e.g. "10") and the bot adds ₦10 to the ad price on every update. Floating Mode is best for BTC/ETH — Set Increment becomes Set Float, where you enter a floating percentage (e.g. "110"), then click Set NGN/USDT Ref and paste the NGN/USDT reference price copied from the Bybit advertisement page.
+---
+
+Q: How do I post a new advertisement?
+K: post ad, post advertisement, go online, ad manager
+A: 1) Open My Ads List and copy the Advertisement ID with the red indicator. 2) Open Post / Remove AD. 3) Click Set Manage AD ID and paste the ID. 4) Click Fetch Manage AD. 5) Click Post AD (Go Online).
+---
+
+Q: How do I remove an advertisement?
+K: remove ad, remove advertisement, go offline, delete ad
+A: 1) Open My Ads List and copy the Advertisement ID with the green indicator. 2) Open Post / Remove AD. 3) Click Set Manage AD ID and paste the ID. 4) Click Fetch Manage AD. 5) Click Remove AD (Go Offline).
 ---
 
 Q: What is Order Monitor and what are the benefits?
-K: what is order monitor, order monitor benefits, why use order monitor
-A: Order Monitor watches your incoming P2P buy/sell orders in real time and alerts you the moment a new order comes in, with the order details. Benefits: you never miss an order notification, you can react (pay, release, or flag) faster, and it feeds the bot's other safety features — Buyer Protection, Name Match, and fraud checks — which only run on orders the monitor sees.
+K: what is order monitor, order monitor benefits, why use order monitor, start monitoring
+A: Order Monitor checks your Bybit P2P account every 10 seconds for new orders. Once you tap Start Monitoring, the bot immediately sends you the order details whenever a new order arrives. Benefits: you never miss an order, you react faster, and it powers the bot's other safety features (Buyer Protection, Name Match, fraud checks), which only run on orders the monitor sees.
 ---
 
-Q: How does Auto-Pay work?
-K: how auto pay works, autopay explained, auto pay, automatic payment, flutterwave pay, paga pay
-A: Auto-Pay automatically sends payment to the buyer's bank account the moment you confirm a sell order, instead of you doing a manual bank transfer every time. You choose the payment rail — Bybit balance auto-pay, Flutterwave auto-pay, or Paga auto-pay — and each needs its own API keys set up first under Set APIs. Once enabled from the Auto-Pay section, the bot detects a newly paid sell order, matches the buyer's bank details, and sends the payout automatically — you just get a confirmation message once it's done.
+Q: What is Chat Monitor?
+K: chat monitor, bybit chat, reply from telegram
+A: When Chat Monitor is enabled, every Bybit chat message is forwarded into Telegram, and you can reply directly from Telegram — the bot sends your reply back into the Bybit chat automatically.
+---
+
+Q: How do I check my active orders right now?
+K: check orders now, active orders, current orders
+A: Tap Check Orders Now inside Order Monitor to see all your active orders immediately, without waiting for the next automatic check.
+---
+
+Q: How do I reset seen orders?
+K: clear seen orders, reset seen orders, seen orders zero
+A: Tap Clear Seen Orders inside Order Monitor to reset your viewed-orders count back to zero.
+---
+
+Q: What is the Sell Message feature?
+K: sell message, set sell message, message count, auto message buyer
+A: Sell Message automatically sends a message to the buyer on every new Sell order. Use Set Sell Message to save the exact text that gets sent, and Set Message Count to choose how many times it's sent automatically (e.g. "3" sends it three times).
+---
+
+Q: What is Auto Pay and how does it work?
+K: how auto pay works, autopay explained, auto pay, automatic payment
+A: Auto Pay works together with Order Monitor — when Order Monitor detects a Buy order, Auto Pay performs whichever actions you've enabled: Enable Auto Pay (Bybit) automatically marks Buy orders as Paid, but this does NOT send money by itself. Enable Flutterwave Pay automatically sends money from your Flutterwave account (requires Flutterwave API set up first). Enable Paga Pay automatically sends money from your Paga Business account (requires Paga API set up first). You can also Set Sender Name, which is the name shown on Flutterwave transfer remarks.
+---
+
+Q: Does Bybit Auto Pay actually send money?
+K: does auto pay send money, bybit auto pay money, auto pay bybit only
+A: No. Enable Auto Pay (Bybit) only marks Buy orders as Paid on Bybit — it does not move any money. To actually send money automatically, you need Flutterwave Pay or Paga Pay enabled, each with its own API configured under API Settings.
 ---
 
 Q: How do I set up Buyer Protection?
 K: buyer protection setup, how to set up buyer protection, buyer protection threshold, protect buyer, cancel protection
-A: Go to Main Menu -> 💳 AUTO-PAY -> Buyer Protection and tap the toggle to turn it on. Then set your threshold in minutes (e.g. 30) — this is how long the bot waits on a slow or suspicious seller cancel request before flagging it to you instead of letting it go through automatically. When it's flagged, you'll get an Accept/Reject prompt so you stay in control instead of losing coins to a rushed cancel.
----
-
-Q: What is Name Match and how do I turn it on?
-K: name match, name matching, buyer name check, turn on name match
-A: Name Match checks the payer's name on an incoming payment against the name on file for that order — and against the scammer list — before funds are released, catching mismatched or fraudulent payments. Turn it on from Main Menu -> 💳 AUTO-PAY -> Name Match toggle.
----
-
-Q: How do I check for scammers or verify a buyer's name?
-K: scammer check, checkname, fraud check, verify buyer, scammer list
-A: Use the /checkname command and send the buyer's name — the bot checks it against the live scammer list (exact, partial, and fuzzy matching). Admins can force-refresh that list any time with /refreshscammers.
+A: Buyer Protection protects you from buyers with a long average release time. Set your threshold in minutes — for example, if set to 15 minutes, any buyer whose average release time exceeds 15 minutes will be flagged, and Auto Pay will not approve that order automatically. Use View Unpaid Orders to see every order that Buyer Protection has blocked.
 ---
 
 Q: How do I check my Buy Volume (24h) analytics?
 K: buy volume, 24 hour volume, volume analytics, how much have i bought, buy volume 24 hours
-A: Go to Main Menu -> 📦 Order Monitor -> 📊 Buy Volume (24h). It shows your total coin quantity bought per token (USDT, USDC, BTC, etc.) and how many orders that came from, over a rolling 24-hour window that resets automatically — purely for your own tracking, separate from your session resets.
+A: Buy Volume (24 Hours), inside the Auto Pay section, displays your total Buy volume over the last 24 hours — useful for tracking your own trading activity.
+---
+
+Q: How do I set up my API keys?
+K: set api, api settings, bybit api key, flutterwave api, paga api, connect bybit, delete apis
+A: Under API Settings you can: Set Bybit Account 1 API (API Key + Secret Key), Set Bybit Account 2 API (API Key + Secret Key), Set Flutterwave API (your Flutterwave credentials), Set Paga API (your Paga Business credentials), and Delete APIs to remove any saved API individually.
 ---
 
 Q: How do I upgrade to Pro?
 K: upgrade, upgrade plan, become pro, pro plan, subscribe
-A: Go to Main Menu -> ⬆️ Upgrade Plan -> Request Upgrade. The admin reviews your request and approves it manually — you'll get a message the moment it's approved. Most P2P automation features (price bot, order monitor, auto-pay, buyer protection, name match, ad posting) are Pro-only; API key setup itself is free.
----
-
-Q: How do I check my current plan?
-K: my plan, current plan, am i pro, plan status, bot status
-A: Go to Main Menu -> 📡 Bot Status, or just open /menu — your plan (Free or Pro) and expiry date are shown at the top.
+A: New users can request a subscription upgrade from the Upgrade Plan menu. The admin reviews your request and approves it manually — you'll get a message the moment it's approved.
 ---
 
 Q: How does the referral program work?
 K: referral, refer a friend, referral link, invite friends, referral program, how to use referral
-A: Open Main Menu -> 🎁 Referrals to get your personal invite link — every user's link is unique and permanent. Share it anywhere; when someone starts the bot through your link and is later upgraded to Pro, you earn a ₦5,000 commission once the admin approves it. The same Referrals page lists everyone you've invited and where each one stands: ⏳ joined but not upgraded, 💵 commission pending admin approval, or ✅ paid into your balance.
+A: Every user gets a unique referral link — invite merchants using it, and whenever a referred merchant upgrades successfully, you earn a commission. Your Referrals dashboard shows: Total Referrals, how many have Upgraded to Pro, your Available Balance, and your Lifetime Earnings.
 ---
 
 Q: How do I check my referral balance?
-K: my balance, referral balance, how much have i earned, check balance
-A: Open Main Menu -> 🎁 Referrals — your available balance, total lifetime earnings, and full list of people you've referred are all shown there.
+K: check my balance, check referral balance, how much have i earned, view my earnings
+A: Open Main Menu -> 🎁 Referrals — your Available Balance, Lifetime Earnings, Total Referrals, and how many have Upgraded to Pro are all shown there.
 ---
 
-Q: How do I get paid my referral balance?
-K: withdraw, payout, get paid, cash out, referral payment
-A: Referral payouts are arranged manually with the admin — message them once you have a balance you'd like to withdraw. They'll send your payment and update your balance on the bot afterward.
+Q: How do I withdraw my referral balance?
+K: withdraw, payout, get paid, cash out, referral payment, withdraw balance, withdraw money, withdraw my balance, withdraw my earnings
+A: Open Main Menu -> 🎁 Referrals -> 💸 Withdraw. You'll be asked for your bank account number, account name, and bank name, then the amount you want to withdraw — the minimum is ₦5,000. If your available balance is below the amount you request, the withdrawal fails with an insufficient balance message and nothing is deducted. If it's approved to proceed, the amount is deducted from your balance right away and the request goes to Pending Processing. The admin reviews it: if approved, your withdrawal is marked Completed and the money stays deducted (it's on its way to your account); if rejected, the amount is automatically returned to your balance.
 ---
 
-Q: How do I find my public IP and set it up on Bybit, Flutterwave, and Paga?
+Q: How do I check my withdrawal history or status?
+K: withdrawal history, withdrawal status, pending withdrawal, is my withdrawal approved
+A: Open Main Menu -> 🎁 Referrals -> 📜 Withdrawal History to see every withdrawal you've requested and its current status: ⏳ Pending, ✅ Completed, or ❌ Rejected (with the reason, if one was given).
+---
+
+Q: What does Bot Status show?
+K: bot status, my stats, total orders, running services
+A: Bot Status displays your current active Bybit account, total Buy orders seen, total Sell orders seen, and which services are currently running.
+---
+
+Q: How do I find my public IP and whitelist it on Bybit, Flutterwave, and Paga?
 K: get my ip, whitelist ip, get ip, ip address, ip whitelist, set up bybit ip, whitelist bybit, whitelist paga, whitelist flutterwave
-A: Go to Main Menu -> 🌍 Get My IP to see the bot's current public IP address. Then whitelist that exact IP on each platform you use: on Bybit, go to API Management -> your API key -> edit and add the IP under IP restriction. On Flutterwave, go to Settings -> API -> Webhooks/IP whitelist and add it there. On Paga, go to your Business dashboard -> Settings -> IP Whitelist and add it. Do this for every service whose API keys you've connected, or those API calls will be rejected.
+A: Get My IP shows the bot's current public IP address. Use that IP for whitelisting on Bybit, Flutterwave, and Paga — go to each platform's API/security settings and add the IP under IP restriction/whitelist. Note the IP can change periodically, so re-check it if any API calls start failing.
 ---
 
 Q: How do I reset my session?
 K: reset session, reset bot, clear session, restart session
-A: Go to Main Menu -> 🔁 Reset Session. This clears your temporary P2P state (seen orders, running tasks) without touching your saved API keys or settings.
----
-
-Q: How do I post or remove an ad?
-K: post ad, remove ad, repost ad, manage ad, ad manager
-A: Open the 📊 AD PRICE BOT section and look for the Post/Remove Ad Manager. From there you can clone-post a new ad, repost an existing one, or remove it — this is a Pro feature.
+A: Reset Session resets every active feature back to its default state — useful when restarting your setup or troubleshooting. It does not delete your saved API keys.
 ---
