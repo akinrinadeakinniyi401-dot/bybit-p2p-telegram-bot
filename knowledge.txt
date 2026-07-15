@@ -12,44 +12,49 @@
 # Keep answers short, plain, and instructional. Add as many entries as
 # you like — just separate each one with a line containing only "---".
 
-Q: How do I set my Bybit API key?
-K: bybit api, api key, set bybit, bybit account, bybit setup, connect bybit
-A: Go to Main Menu -> 🔑 Set APIs -> choose Bybit Account 1 or Account 2, then send your API Key when asked, followed by your API Secret. Your keys are stored securely and are only ever used to act on your own Bybit account.
+Q: What do I need to do first as a new user?
+K: getting started, new user, how to start, first steps, setup guide, onboarding, before i can use the bot
+A: Welcome! Here's the quickest path to using the bot: 1) Go to Main Menu -> 🔑 Set APIs and add your Bybit API Key/Secret (free — no Pro needed). 2) Request an upgrade from Main Menu -> ⬆️ Upgrade Plan if you want price bot, order monitor, auto-pay, and other Pro features. 3) Once you're Pro, open 📊 AD PRICE BOT and set your Ad ID + Bybit UID before starting the price bot. 4) Turn on 📦 Order Monitor so incoming orders are tracked automatically. That's the core setup — everything else (Auto-Pay, Buyer Protection, Name Match) is optional on top of that.
 ---
 
-Q: How do I start the auto price bot?
-K: price bot, auto update, refresh price, start price, ad price bot
-A: Go to Main Menu -> 📊 AD PRICE BOT. Set your Ad ID and UID first, choose Fixed or Floating mode, then tap Start Auto-Update. The bot will keep your ad price refreshed automatically at the interval you set.
+Q: What is the auto price bot and what are the benefits?
+K: what is price bot, ad price bot, auto price, price bot benefits, why use price bot
+A: The auto price bot keeps your P2P ad price updated automatically instead of you manually editing it every few minutes. You set a mode (Fixed price, or Floating based on a reference price) and an update interval, and the bot reprices your ad for you in the background. Benefits: your ad stays competitive around the clock, you don't lose trades to faster competitors, and you save the time of manually watching and editing prices all day.
 ---
 
-Q: How do I turn on Order Monitor?
-K: order monitor, monitor orders, track orders, incoming orders
-A: Go to Main Menu -> 📦 ORDER MONITOR and tap the toggle to turn it on. Once active, the bot watches your incoming P2P orders and alerts you as they come in.
+Q: What is Order Monitor and what are the benefits?
+K: what is order monitor, order monitor benefits, why use order monitor
+A: Order Monitor watches your incoming P2P buy/sell orders in real time and alerts you the moment a new order comes in, with the order details. Benefits: you never miss an order notification, you can react (pay, release, or flag) faster, and it feeds the bot's other safety features — Buyer Protection, Name Match, and fraud checks — which only run on orders the monitor sees.
 ---
 
-Q: How do I set up Auto-Pay?
-K: auto pay, autopay, automatic payment, auto payment, flutterwave pay, paga pay
-A: Go to Main Menu -> 💳 AUTO-PAY. You can enable Bybit balance auto-pay, Flutterwave auto-pay, or Paga auto-pay depending on which payment API you've connected under Set APIs.
+Q: How does Auto-Pay work?
+K: how auto pay works, autopay explained, auto pay, automatic payment, flutterwave pay, paga pay
+A: Auto-Pay automatically sends payment to the buyer's bank account the moment you confirm a sell order, instead of you doing a manual bank transfer every time. You choose the payment rail — Bybit balance auto-pay, Flutterwave auto-pay, or Paga auto-pay — and each needs its own API keys set up first under Set APIs. Once enabled from the Auto-Pay section, the bot detects a newly paid sell order, matches the buyer's bank details, and sends the payout automatically — you just get a confirmation message once it's done.
 ---
 
-Q: What is Buyer Protection and how do I turn it on?
-K: buyer protection, protect buyer, cancel protection
-A: Buyer Protection flags slow or suspicious seller cancel requests so you get a chance to Accept or Reject them yourself instead of losing coins automatically. Turn it on from the Auto-Pay section and set your threshold in minutes.
+Q: How do I set up Buyer Protection?
+K: buyer protection setup, how to set up buyer protection, buyer protection threshold, protect buyer, cancel protection
+A: Go to Main Menu -> 💳 AUTO-PAY -> Buyer Protection and tap the toggle to turn it on. Then set your threshold in minutes (e.g. 30) — this is how long the bot waits on a slow or suspicious seller cancel request before flagging it to you instead of letting it go through automatically. When it's flagged, you'll get an Accept/Reject prompt so you stay in control instead of losing coins to a rushed cancel.
 ---
 
-Q: What is Name Match?
-K: name match, name matching, buyer name check
-A: Name Match checks the payer's name against the name on file for that order, and against the scammer list, before releasing funds — an extra layer of fraud protection. Toggle it from the Auto-Pay section.
+Q: What is Name Match and how do I turn it on?
+K: name match, name matching, buyer name check, turn on name match
+A: Name Match checks the payer's name on an incoming payment against the name on file for that order — and against the scammer list — before funds are released, catching mismatched or fraudulent payments. Turn it on from Main Menu -> 💳 AUTO-PAY -> Name Match toggle.
 ---
 
 Q: How do I check for scammers or verify a buyer's name?
 K: scammer check, checkname, fraud check, verify buyer, scammer list
-A: Use the /checkname command and send the buyer's name — the bot checks it against the live scammer list. Admins can refresh that list any time with /refreshscammers.
+A: Use the /checkname command and send the buyer's name — the bot checks it against the live scammer list (exact, partial, and fuzzy matching). Admins can force-refresh that list any time with /refreshscammers.
+---
+
+Q: How do I check my Buy Volume (24h) analytics?
+K: buy volume, 24 hour volume, volume analytics, how much have i bought, buy volume 24 hours
+A: Go to Main Menu -> 📦 Order Monitor -> 📊 Buy Volume (24h). It shows your total coin quantity bought per token (USDT, USDC, BTC, etc.) and how many orders that came from, over a rolling 24-hour window that resets automatically — purely for your own tracking, separate from your session resets.
 ---
 
 Q: How do I upgrade to Pro?
 K: upgrade, upgrade plan, become pro, pro plan, subscribe
-A: Go to Main Menu -> ⬆️ Upgrade Plan -> Request Upgrade. The admin will review your request and approve it — you'll get a message the moment it's approved.
+A: Go to Main Menu -> ⬆️ Upgrade Plan -> Request Upgrade. The admin reviews your request and approves it manually — you'll get a message the moment it's approved. Most P2P automation features (price bot, order monitor, auto-pay, buyer protection, name match, ad posting) are Pro-only; API key setup itself is free.
 ---
 
 Q: How do I check my current plan?
@@ -58,18 +63,23 @@ A: Go to Main Menu -> 📡 Bot Status, or just open /menu — your plan (Free or
 ---
 
 Q: How does the referral program work?
-K: referral, refer a friend, referral link, invite friends, referral program
-A: Open Main Menu -> 🎁 Referrals to get your personal invite link. Share it — when someone joins through your link and is later upgraded to Pro, you earn a ₦5,000 commission once the admin approves it. Your Referrals page shows everyone you've invited and their status.
+K: referral, refer a friend, referral link, invite friends, referral program, how to use referral
+A: Open Main Menu -> 🎁 Referrals to get your personal invite link — every user's link is unique and permanent. Share it anywhere; when someone starts the bot through your link and is later upgraded to Pro, you earn a ₦5,000 commission once the admin approves it. The same Referrals page lists everyone you've invited and where each one stands: ⏳ joined but not upgraded, 💵 commission pending admin approval, or ✅ paid into your balance.
 ---
 
 Q: How do I check my referral balance?
 K: my balance, referral balance, how much have i earned, check balance
-A: Open Main Menu -> 🎁 Referrals — your available balance, total lifetime earnings, and full list of people you've referred are shown there.
+A: Open Main Menu -> 🎁 Referrals — your available balance, total lifetime earnings, and full list of people you've referred are all shown there.
 ---
 
 Q: How do I get paid my referral balance?
 K: withdraw, payout, get paid, cash out, referral payment
-A: Referral payouts are arranged manually with the admin — message them once you have a balance you'd like to withdraw. They'll send your payment and update your balance on the bot.
+A: Referral payouts are arranged manually with the admin — message them once you have a balance you'd like to withdraw. They'll send your payment and update your balance on the bot afterward.
+---
+
+Q: How do I find my public IP and set it up on Bybit, Flutterwave, and Paga?
+K: get my ip, whitelist ip, get ip, ip address, ip whitelist, set up bybit ip, whitelist bybit, whitelist paga, whitelist flutterwave
+A: Go to Main Menu -> 🌍 Get My IP to see the bot's current public IP address. Then whitelist that exact IP on each platform you use: on Bybit, go to API Management -> your API key -> edit and add the IP under IP restriction. On Flutterwave, go to Settings -> API -> Webhooks/IP whitelist and add it there. On Paga, go to your Business dashboard -> Settings -> IP Whitelist and add it. Do this for every service whose API keys you've connected, or those API calls will be rejected.
 ---
 
 Q: How do I reset my session?
@@ -77,12 +87,7 @@ K: reset session, reset bot, clear session, restart session
 A: Go to Main Menu -> 🔁 Reset Session. This clears your temporary P2P state (seen orders, running tasks) without touching your saved API keys or settings.
 ---
 
-Q: How do I find my public IP for whitelisting?
-K: my ip, whitelist ip, get ip, ip address
-A: Go to Main Menu -> 🌍 Get My IP. Add that IP to the whitelist on your Bybit, Flutterwave, or Paga dashboard so your API keys are allowed to connect.
----
-
 Q: How do I post or remove an ad?
 K: post ad, remove ad, repost ad, manage ad, ad manager
-A: Open the AD PRICE BOT section and look for the Post/Remove Ad Manager. From there you can clone-post a new ad, repost, or remove an existing one — this is a Pro feature.
+A: Open the 📊 AD PRICE BOT section and look for the Post/Remove Ad Manager. From there you can clone-post a new ad, repost an existing one, or remove it — this is a Pro feature.
 ---
