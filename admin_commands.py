@@ -2,11 +2,17 @@
 admin_commands.py — Admin-only Telegram command handlers.
 
 Commands:
-  /upgrade <user_id> <days>    — upgrade a user to pro
-  /downgrade <user_id>         — downgrade user to free
-  /requests                    — list pending upgrade requests
-  /userdata                    — download all user data as Excel
-  /listusers                   — list all users with plan status
+  /upgrade <user_id> <days>       — upgrade a user to pro
+  /downgrade <user_id>            — downgrade user to free
+  /requests                       — list pending upgrade requests
+  /userdata                       — download all user data as Excel
+  /listusers                      — list all users with plan status
+
+  /referrals [user_id]              — referral analytics overview, or one user's detail
+  /awardref <referred_user_id>      — approve a pending referral commission (moves it
+                                       from "pending" into the referrer's available balance)
+  /addbalance <user_id> <amount>    — add NGN to a user's referral balance
+  /deductbalance <user_id> <amount> — deduct NGN from a user's referral balance
 
 NOTE on /userdata:
   cmd_userdata here is a thin stub that defers to the version defined in bot.py.
@@ -16,23 +22,47 @@ NOTE on /userdata:
     • merges live session counts via get_session(uid) per user
     • takes max(db_total, live_total) so totals are never under-reported
   The bot.py version is registered last in start_bot(), so it wins.
+
+NOTE on formatting:
+  All messages here use parse_mode="HTML" with every dynamic field passed
+  through esc(). Telegram usernames/display names can legally contain
+  underscores and other Markdown special characters — using legacy
+  "Markdown" parse mode with unescaped text throws
+  `Can't parse entities: can't find end of the entity` and crashes the
+  handler. HTML mode + escaping avoids that entirely.
 """
 
-import asyncio
+import html
 import logging
 import io
-import os
 from datetime import datetime
 from telegram import Update
 from telegram.ext import ContextTypes
 import db
-from config import ADMIN_IDS
+from config import ADMIN_IDS, REFERRAL_REWARD_NGN
 
 logger = logging.getLogger(__name__)
 
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
+
+
+def esc(value) -> str:
+    """HTML-escape any user-supplied text before embedding it in an
+    HTML-parse-mode Telegram message. Use this on every username,
+    display name, or other free-text field pulled from the DB."""
+    return html.escape(str(value), quote=False)
+
+
+def _referrer_line(referred_user_id: int) -> str:
+    """Build a '🎁 Referred by @x' line for a user, or '' if none."""
+    referrer_id = db.get_referrer(referred_user_id)
+    if not referrer_id:
+        return ""
+    referrer = db.get_user(referrer_id)
+    rname = esc(referrer.get("username") or referrer.get("display_name") or str(referrer_id)) if referrer else str(referrer_id)
+    return f"   🎁 Referred by: @{rname} (<code>{referrer_id}</code>)\n"
 
 
 # ─────────────────────────────────────────
@@ -44,8 +74,8 @@ async def cmd_upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) < 2:
         await update.message.reply_text(
-            "Usage: `/upgrade <user_id> <days>`\n\nExample: `/upgrade 123456789 30`",
-            parse_mode="Markdown"
+            "Usage: <code>/upgrade &lt;user_id&gt; &lt;days&gt;</code>\n\nExample: <code>/upgrade 123456789 30</code>",
+            parse_mode="HTML"
         )
         return
     try:
@@ -54,42 +84,61 @@ async def cmd_upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if days < 1:
             raise ValueError
     except ValueError:
-        await update.message.reply_text("❌ Invalid arguments. Usage: `/upgrade 123456789 30`", parse_mode="Markdown")
+        await update.message.reply_text("❌ Invalid arguments. Usage: <code>/upgrade 123456789 30</code>", parse_mode="HTML")
         return
 
     user = db.get_user(target_id)
     if not user:
-        await update.message.reply_text(f"❌ User `{target_id}` not found in database.", parse_mode="Markdown")
+        await update.message.reply_text(f"❌ User <code>{target_id}</code> not found in database.", parse_mode="HTML")
         return
 
     updated = db.upgrade_user(target_id, days)
     db.remove_upgrade_request(target_id)
+
+    # ── Referral commission trigger ──
+    # If this user was referred by someone, this first-ever Pro approval
+    # flips that referral from "none" to "pending" exactly once — renewal
+    # upgrades for the same user won't re-trigger a reward.
+    ref_line = ""
+    referrer_id = db.get_referrer(target_id)
+    if referrer_id:
+        rec = db.mark_reward_pending(target_id, REFERRAL_REWARD_NGN)
+        if rec:
+            referrer = db.get_user(referrer_id)
+            rname = esc(referrer.get("username") or referrer.get("display_name") or str(referrer_id)) if referrer else str(referrer_id)
+            ref_line = (
+                f"\n🎁 <b>Referral commission pending!</b>\n"
+                f"This user was referred by @{rname} (<code>{referrer_id}</code>).\n"
+                f"💰 ₦{REFERRAL_REWARD_NGN:,} is now owed.\n"
+                f"Approve payout: <code>/awardref {target_id}</code>\n"
+            )
 
     try:
         exp_str = updated.get("plan_expires", "")
         await context.bot.send_message(
             chat_id=target_id,
             text=(
-                f"🎉 *Your upgrade has been approved!*\n\n"
-                f"💎 Plan: *Pro*\n"
-                f"⏰ Expires: `{exp_str}`\n\n"
+                f"🎉 <b>Your upgrade has been approved!</b>\n\n"
+                f"💎 Plan: <b>Pro</b>\n"
+                f"⏰ Expires: <code>{esc(exp_str)}</code>\n\n"
                 f"You now have full access to all bot features.\n"
                 f"Tap /menu to see your updated profile!"
             ),
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
         notified = "✅ User notified"
     except Exception as e:
-        notified = f"⚠️ Could not notify user: {e}"
+        notified = f"⚠️ Could not notify user: {esc(e)}"
 
     await update.message.reply_text(
-        f"✅ *User upgraded!*\n\n"
-        f"User ID: `{target_id}`\n"
-        f"Username: @{user.get('username','?')}\n"
+        f"✅ <b>User upgraded!</b>\n\n"
+        f"User ID: <code>{target_id}</code>\n"
+        f"Username: @{esc(user.get('username','?'))}\n"
         f"Plan: Pro\n"
-        f"Expires: `{updated.get('plan_expires','')}`\n\n"
-        f"{notified}",
-        parse_mode="Markdown"
+        f"Expires: <code>{esc(updated.get('plan_expires',''))}</code>\n\n"
+        f"{notified}"
+        f"{ref_line}",
+        parse_mode="HTML"
     )
     logger.info(f"[Admin] Upgraded user {target_id} for {days} days by admin {update.effective_user.id}")
 
@@ -102,17 +151,17 @@ async def cmd_downgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     args = context.args
     if not args:
-        await update.message.reply_text("Usage: `/downgrade <user_id>`", parse_mode="Markdown")
+        await update.message.reply_text("Usage: <code>/downgrade &lt;user_id&gt;</code>", parse_mode="HTML")
         return
     try:
         target_id = int(args[0])
     except ValueError:
-        await update.message.reply_text("❌ Invalid user ID.", parse_mode="Markdown")
+        await update.message.reply_text("❌ Invalid user ID.", parse_mode="HTML")
         return
 
     user = db.get_user(target_id)
     if not user:
-        await update.message.reply_text(f"❌ User `{target_id}` not found.", parse_mode="Markdown")
+        await update.message.reply_text(f"❌ User <code>{target_id}</code> not found.", parse_mode="HTML")
         return
 
     db.downgrade_user(target_id)
@@ -121,18 +170,18 @@ async def cmd_downgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(
             chat_id=target_id,
             text=(
-                "⚠️ *Your Pro plan has ended.*\n\n"
+                "⚠️ <b>Your Pro plan has ended.</b>\n\n"
                 "You have been moved to the Free plan.\n"
                 "Contact the admin to renew your subscription."
             ),
-            parse_mode="Markdown"
+            parse_mode="HTML"
         )
     except Exception:
         pass
 
     await update.message.reply_text(
-        f"✅ User `{target_id}` (@{user.get('username','?')}) downgraded to Free.",
-        parse_mode="Markdown"
+        f"✅ User <code>{target_id}</code> (@{esc(user.get('username','?'))}) downgraded to Free.",
+        parse_mode="HTML"
     )
 
 
@@ -144,25 +193,27 @@ async def cmd_requests(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     pending = db.get_pending_requests()
     if not pending:
-        await update.message.reply_text("📋 No pending upgrade requests.", parse_mode="Markdown")
+        await update.message.reply_text("📋 No pending upgrade requests.")
         return
 
-    lines = [f"📋 *Pending Upgrade Requests ({len(pending)}):*\n"]
+    lines = [f"📋 <b>Pending Upgrade Requests ({len(pending)}):</b>\n"]
     for req in pending:
         uid   = req.get("user_id", "?")
-        uname = req.get("username", "?")
-        dname = req.get("display_name", "?")
-        reqat = req.get("requested_at", "?")
+        uname = esc(req.get("username", "?"))
+        dname = esc(req.get("display_name", "?"))
+        reqat = esc(req.get("requested_at", "?"))
+        ref_line = _referrer_line(uid) if isinstance(uid, int) else ""
         lines.append(
-            f"👤 `{uid}` — @{uname} ({dname})\n"
+            f"👤 <code>{uid}</code> — @{uname} ({dname})\n"
             f"   📅 Requested: {reqat}\n"
-            f"   ✅ Approve: `/upgrade {uid} 30`\n"
+            f"{ref_line}"
+            f"   ✅ Approve: <code>/upgrade {uid} 30</code>\n"
         )
 
     msg = "\n".join(lines)
     if len(msg) > 4000:
         msg = msg[:4000] + "\n...(truncated)"
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await update.message.reply_text(msg, parse_mode="HTML")
 
 
 # ─────────────────────────────────────────
@@ -173,23 +224,25 @@ async def cmd_listusers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     users = db.get_all_users()
     if not users:
-        await update.message.reply_text("No users registered yet.", parse_mode="Markdown")
+        await update.message.reply_text("No users registered yet.")
         return
 
-    lines = [f"👥 *All Users ({len(users)}):*\n"]
+    lines = [f"👥 <b>All Users ({len(users)}):</b>\n"]
     for u in sorted(users, key=lambda x: x.get("created_at",""), reverse=True):
         uid   = u.get("user_id","?")
-        uname = u.get("username","?")
-        plan  = u.get("plan","free").upper()
-        exp   = u.get("plan_expires","") or "—"
+        uname = esc(u.get("username","?"))
+        plan  = esc(u.get("plan","free").upper())
+        exp   = esc(u.get("plan_expires","") or "—")
         pend  = " ⏳" if u.get("upgrade_pending") else ""
         icon  = "💎" if plan == "PRO" else "⚪"
-        lines.append(f"{icon} `{uid}` @{uname} — {plan}{pend} | exp: {exp}")
+        bal   = u.get("referral", {}).get("balance", 0)
+        bal_tag = f" | 🎁₦{bal:,}" if bal else ""
+        lines.append(f"{icon} <code>{uid}</code> @{uname} — {plan}{pend} | exp: {exp}{bal_tag}")
 
     msg = "\n".join(lines)
     if len(msg) > 4000:
         msg = msg[:4000] + "\n...(truncated)"
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await update.message.reply_text(msg, parse_mode="HTML")
 
 
 # ─────────────────────────────────────────
@@ -219,4 +272,186 @@ async def cmd_userdata(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as e:
         logger.error(f"[Admin] userdata export error: {e}")
-        await update.message.reply_text(f"❌ Export failed: {e}")
+        await update.message.reply_text(f"❌ Export failed: {esc(e)}", parse_mode="HTML")
+
+
+# ─────────────────────────────────────────
+# /awardref <referred_user_id> — approve a pending referral commission
+# ─────────────────────────────────────────
+async def cmd_awardref(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Usage: <code>/awardref &lt;referred_user_id&gt;</code>\n\n"
+            "Tip: this ID is the person who WAS referred (the new Pro user), "
+            "not the referrer — you'll find it on their upgrade confirmation message.",
+            parse_mode="HTML"
+        )
+        return
+    try:
+        referred_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Invalid user ID.", parse_mode="HTML")
+        return
+
+    result = db.approve_referral_reward(referred_id)
+    if not result["ok"]:
+        reasons = {
+            "no_referral":      "That user has no referral record on file.",
+            "already_approved": f"Already approved — ₦{result['amount']:,} was already added to the referrer's balance.",
+            "not_pending":      "This referral isn't pending yet — the referred user may not have been upgraded to Pro yet.",
+            "referrer_missing": "The referrer's account could not be found in the database.",
+        }
+        await update.message.reply_text(f"❌ {reasons.get(result['reason'], 'Could not process this referral.')}", parse_mode="HTML")
+        return
+
+    referrer_id = result["referrer_id"]
+    amount      = result["amount"]
+    referrer    = db.get_user(referrer_id)
+    uname       = esc(referrer.get("username") or referrer.get("display_name") or str(referrer_id)) if referrer else str(referrer_id)
+    bal         = db.get_referral_balance(referrer_id)
+
+    await update.message.reply_text(
+        f"✅ ₦{amount:,} commission approved for @{uname} (<code>{referrer_id}</code>).\n"
+        f"💰 New available balance: ₦{bal['balance']:,}",
+        parse_mode="HTML"
+    )
+
+    try:
+        await context.bot.send_message(
+            chat_id=referrer_id,
+            text=(
+                f"🎉 <b>Referral commission approved!</b>\n\n"
+                f"₦{amount:,} has been added to your referral balance.\n"
+                f"💰 Available balance: ₦{bal['balance']:,}\n\n"
+                f"Contact the admin to arrange your payout."
+            ),
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.warning(f"[Admin] Could not notify referrer {referrer_id}: {e}")
+
+
+# ─────────────────────────────────────────
+# /addbalance <user_id> <amount>    — add NGN to a user's referral balance
+# /deductbalance <user_id> <amount> — deduct NGN from a user's referral balance
+# ─────────────────────────────────────────
+async def _adjust_balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, sign: int, verb: str):
+    if not is_admin(update.effective_user.id):
+        return
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text(
+            f"Usage: <code>/{verb}balance &lt;user_id&gt; &lt;amount&gt;</code>\n\nExample: <code>/{verb}balance 123456789 5000</code>",
+            parse_mode="HTML"
+        )
+        return
+    try:
+        target_id = int(args[0])
+        amount    = int(args[1])
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ Invalid arguments — amount must be a positive whole number.", parse_mode="HTML")
+        return
+
+    ref = db.adjust_balance(target_id, sign * amount)
+    if ref is None:
+        await update.message.reply_text(f"❌ User <code>{target_id}</code> not found.", parse_mode="HTML")
+        return
+
+    action = "Added" if sign > 0 else "Deducted"
+    await update.message.reply_text(
+        f"✅ {action} ₦{amount:,} {'to' if sign > 0 else 'from'} user <code>{target_id}</code>.\n"
+        f"💰 New balance: ₦{ref['balance']:,}",
+        parse_mode="HTML"
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=target_id,
+            text=(
+                f"💰 <b>Your referral balance was updated by the admin.</b>\n\n"
+                f"{action}: ₦{amount:,}\n"
+                f"New balance: ₦{ref['balance']:,}"
+            ),
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
+
+
+async def cmd_addbalance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _adjust_balance_cmd(update, context, sign=1, verb="add")
+
+
+async def cmd_deductbalance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _adjust_balance_cmd(update, context, sign=-1, verb="deduct")
+
+
+# ─────────────────────────────────────────
+# /referrals [user_id] — referral program analytics
+# ─────────────────────────────────────────
+async def cmd_referrals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    args = context.args
+
+    if args:
+        try:
+            uid = int(args[0])
+        except ValueError:
+            await update.message.reply_text("❌ Invalid user ID.", parse_mode="HTML")
+            return
+        user = db.get_user(uid)
+        if not user:
+            await update.message.reply_text(f"❌ User <code>{uid}</code> not found.", parse_mode="HTML")
+            return
+
+        rows = db.get_referrals_for(uid)
+        bal  = db.get_referral_balance(uid)
+        code = db.get_or_create_referral_code(uid)
+        lines = [
+            f"👤 <b>Referral details — @{esc(user.get('username','?'))}</b> (<code>{uid}</code>)\n",
+            f"🔗 Code: <code>{code}</code>",
+            f"💰 Available balance: ₦{bal['balance']:,}",
+            f"📈 Total earned (lifetime): ₦{bal['total_earned']:,}",
+            f"👥 Total referred: {len(rows)}\n",
+        ]
+        status_icon = {"none": "⏳ Joined (not upgraded)", "pending": "💵 Pending approval", "approved": "✅ Paid to balance"}
+        if not rows:
+            lines.append("— no referrals yet —")
+        for r in rows:
+            uname = esc(r.get("referred_username") or "?")
+            status = status_icon.get(r.get("reward_status"), "?")
+            amt = r.get("reward_amount", 0)
+            amt_str = f" (₦{amt:,})" if amt else ""
+            lines.append(f"• @{uname} — {status}{amt_str}")
+        msg = "\n".join(lines)
+
+    else:
+        summary = db.get_referral_summary()
+        top     = db.get_referral_leaderboard(10)
+        lines = [
+            "📊 <b>Referral Program — Overview</b>\n",
+            f"👥 Total referred users: {summary['total_referred']}",
+            f"⏳ Pending commissions: {summary['pending_count']} (₦{summary['pending_amount']:,})",
+            f"✅ Approved commissions: {summary['approved_count']} (₦{summary['approved_amount']:,})",
+            f"💰 Outstanding balance owed (all users, unpaid-out): ₦{summary['outstanding_balance']:,}\n",
+            "<b>Top referrers:</b>",
+        ]
+        if not top:
+            lines.append("— none yet —")
+        for i, r in enumerate(top, 1):
+            uname = esc(r["username"] or str(r["user_id"]))
+            lines.append(
+                f"{i}. @{uname} (<code>{r['user_id']}</code>) — {r['referrals']} referred | "
+                f"₦{r['total_earned']:,} earned | ₦{r['balance']:,} balance"
+            )
+        lines.append("\nUse <code>/referrals &lt;user_id&gt;</code> for one user's full detail.")
+        msg = "\n".join(lines)
+
+    if len(msg) > 4000:
+        msg = msg[:4000] + "\n...(truncated)"
+    await update.message.reply_text(msg, parse_mode="HTML")
