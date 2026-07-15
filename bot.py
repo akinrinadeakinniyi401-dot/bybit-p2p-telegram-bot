@@ -31,9 +31,10 @@ import subscription as sub
 from admin_commands import (
     cmd_upgrade, cmd_downgrade, cmd_requests, cmd_listusers, cmd_userdata,
     cmd_awardref, cmd_addbalance, cmd_deductbalance, cmd_referrals,
+    cmd_withdrawals, cmd_approvewithdraw, cmd_rejectwithdraw,
 )
 import help_agent
-from config import REFERRAL_REWARD_NGN, BOT_OWNER_USERNAME
+from config import REFERRAL_REWARD_NGN, BOT_OWNER_USERNAME, MIN_WITHDRAWAL_NGN
 
 logger = logging.getLogger(__name__)
 
@@ -3544,7 +3545,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if help_agent.get_entry_count() == 0:
         asyncio.get_event_loop().run_in_executor(None, help_agent.load_knowledge)
 
-    await _typing(context, update.effective_chat.id)
     await send_menu(update, context)
 
 
@@ -3558,7 +3558,6 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def ping_bybit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Test Bybit API — works for all Pro users and admin, using their own saved keys."""
     uid   = update.effective_user.id
-    await _typing(context, update.effective_chat.id)
     creds = get_user_creds(uid)
     if not is_admin(uid) and not creds.get("key"):
         await update.message.reply_text(
@@ -3599,7 +3598,6 @@ async def ping_bybit_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def ping_flutterwave_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Test Flutterwave API — uses the user's own saved FLW secret key from DB."""
     uid        = update.effective_user.id
-    await _typing(context, update.effective_chat.id)
     secret_key = db.get_api(uid, "flw_secret_key")
 
     if not secret_key:
@@ -3650,7 +3648,6 @@ async def ping_flutterwave_command(update: Update, context: ContextTypes.DEFAULT
 async def ping_paga_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Test Paga API — uses the user's own saved Paga keys from DB."""
     uid        = update.effective_user.id
-    await _typing(context, update.effective_chat.id)
     principal  = db.get_api(uid, "paga_principal")
     credential = db.get_api(uid, "paga_credential")
     api_key    = db.get_api(uid, "paga_api_key")
@@ -3742,9 +3739,6 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         await query.answer()
     except Exception as _ans_err:
         logger.warning(f"[ButtonHandler] query.answer() failed: {_ans_err}")
-
-    if chat_id:
-        await _typing(context, chat_id)
 
     # ── Register/update user on every interaction ──
     global _current_user_id, _current_plan_badge
@@ -5125,6 +5119,11 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
         upgraded_count = sum(1 for r in rows if r.get("reward_status") in ("pending", "approved"))
 
+        keyboard = [
+            [InlineKeyboardButton("💸 Withdraw",            callback_data="withdraw_start")],
+            [InlineKeyboardButton("📜 Withdrawal History",  callback_data="withdraw_history")],
+        ] + back_main()
+
         await edit_menu(query,
             f"🎁 <b>Your Referral Program</b>\n\n"
             f"Share your link — when someone joins and later upgrades to "
@@ -5135,7 +5134,56 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             f"💰 Available balance: <b>₦{bal['balance']:,}</b>\n"
             f"📈 Total earned (lifetime): <b>₦{bal['total_earned']:,}</b>\n\n"
             f"<b>Your invites:</b>\n{invite_block}\n\n"
-            f"⏳ pending upgrade · 💵 commission pending · ✅ paid to balance",
+            f"⏳ pending upgrade · 💵 commission pending · ✅ paid to balance\n\n"
+            f"Minimum withdrawal: ₦{MIN_WITHDRAWAL_NGN:,}",
+            InlineKeyboardMarkup(keyboard)
+        )
+
+    # ── 💸 Withdraw — start flow (collects bank details, then amount) ──
+    elif data == "withdraw_start":
+        uid = query.from_user.id
+        bal = db.get_referral_balance(uid)
+
+        if bal["balance"] < MIN_WITHDRAWAL_NGN:
+            await edit_menu(query,
+                f"💸 <b>Withdraw</b>\n\n"
+                f"❌ Insufficient balance.\n\n"
+                f"💰 Available balance: ₦{bal['balance']:,}\n"
+                f"Minimum withdrawal: ₦{MIN_WITHDRAWAL_NGN:,}\n\n"
+                f"Keep referring — once your balance reaches the minimum you can withdraw here.",
+                InlineKeyboardMarkup(back_main())
+            )
+        else:
+            _btn_state["action"] = "withdraw_acct_number"
+            _btn_state["withdraw_temp"] = {}
+            await edit_menu(query,
+                f"💸 <b>Withdraw — Bank Details</b>\n\n"
+                f"💰 Available balance: ₦{bal['balance']:,}\n\n"
+                f"Step 1 of 4 — send your <b>bank account number</b>.",
+                InlineKeyboardMarkup(back_main())
+            )
+
+    # ── 📜 Withdrawal history ──
+    elif data == "withdraw_history":
+        uid  = query.from_user.id
+        rows = db.get_withdrawals_for(uid)
+        status_icon = {"pending": "⏳ Pending", "completed": "✅ Completed", "rejected": "❌ Rejected"}
+        if not rows:
+            body = "No withdrawal requests yet."
+        else:
+            lines = []
+            for w in rows[:15]:
+                icon = status_icon.get(w.get("status"), "?")
+                line = f"{icon} — ₦{w['amount']:,} — <code>{w['withdrawal_id']}</code> ({_esc(w.get('requested_at',''))})"
+                if w.get("status") == "rejected" and w.get("reject_reason"):
+                    line += f"\n   Reason: {_esc(w['reject_reason'])}"
+                lines.append(line)
+            body = "\n".join(lines)
+            if len(rows) > 15:
+                body += f"\n…and {len(rows) - 15} more"
+
+        await edit_menu(query,
+            f"📜 <b>Your Withdrawal History</b>\n\n{body}",
             InlineKeyboardMarkup(back_main())
         )
 
@@ -5374,8 +5422,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _get_or_register_user(tuser)  # ensure user exists in DB
 
     text = update.message.text.strip()
-
-    await _typing(context, update.effective_chat.id)
 
     # ── Per-user isolated state ──
     # Admin uses the global user_state dict.
@@ -5776,14 +5822,123 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             await update.message.reply_text("❌ Send a whole number like `25`", parse_mode="HTML")
 
+    # ── 💸 Withdraw flow — Step 1/4: bank account number ──
+    elif action == "withdraw_acct_number":
+        if not text:
+            await update.message.reply_text("❌ Please send your bank account number.")
+        else:
+            _state.setdefault("withdraw_temp", {})["account_number"] = text
+            _state["action"] = "withdraw_acct_name"
+            await update.message.reply_text(
+                "Step 2 of 4 — send the <b>account name</b> (the name on the bank account).",
+                parse_mode="HTML"
+            )
+
+    # ── 💸 Withdraw flow — Step 2/4: account name ──
+    elif action == "withdraw_acct_name":
+        if not text:
+            await update.message.reply_text("❌ Please send the account name.")
+        else:
+            _state.setdefault("withdraw_temp", {})["account_name"] = text
+            _state["action"] = "withdraw_bank_name"
+            await update.message.reply_text(
+                "Step 3 of 4 — send the <b>bank name</b> (e.g. GTBank, Access Bank, OPay).",
+                parse_mode="HTML"
+            )
+
+    # ── 💸 Withdraw flow — Step 3/4: bank name ──
+    elif action == "withdraw_bank_name":
+        if not text:
+            await update.message.reply_text("❌ Please send the bank name.")
+        else:
+            _state.setdefault("withdraw_temp", {})["bank_name"] = text
+            _state["action"] = "withdraw_amount"
+            bal = db.get_referral_balance(uid)
+            await update.message.reply_text(
+                f"Step 4 of 4 — send the <b>amount</b> you want to withdraw (numbers only).\n\n"
+                f"💰 Available balance: ₦{bal['balance']:,}\n"
+                f"Minimum withdrawal: ₦{MIN_WITHDRAWAL_NGN:,}",
+                parse_mode="HTML"
+            )
+
+    # ── 💸 Withdraw flow — Step 4/4: amount + submit ──
+    elif action == "withdraw_amount":
+        try:
+            amount = int(text.replace(",", "").strip())
+            if amount <= 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("❌ Send a whole number, e.g. `5000`", parse_mode="HTML")
+        else:
+            bank = _state.get("withdraw_temp", {})
+            result = db.create_withdrawal_request(uid, amount, bank, min_amount=MIN_WITHDRAWAL_NGN)
+
+            if not result["ok"]:
+                if result["reason"] == "below_minimum":
+                    await update.message.reply_text(
+                        f"❌ Minimum withdrawal is ₦{MIN_WITHDRAWAL_NGN:,}. You sent ₦{amount:,}.\n\n"
+                        f"Send a new amount, or tap 🏠 Main Menu to cancel.",
+                        parse_mode="HTML"
+                    )
+                elif result["reason"] == "insufficient":
+                    await update.message.reply_text(
+                        f"❌ <b>Insufficient balance.</b>\n\n"
+                        f"💰 Available balance: ₦{result['balance']:,}\n"
+                        f"You requested: ₦{amount:,}\n\n"
+                        f"Send a smaller amount, or tap 🏠 Main Menu to cancel.",
+                        parse_mode="HTML"
+                    )
+                else:
+                    await update.message.reply_text("❌ Could not process withdrawal. Please try again.")
+                # Stay in the same step so the user can retry with a different amount
+            else:
+                _state["action"] = None
+                _state.pop("withdraw_temp", None)
+                wid = result["withdrawal_id"]
+
+                await update.message.reply_text(
+                    f"✅ <b>Withdrawal request submitted!</b>\n\n"
+                    f"🆔 Reference: <code>{wid}</code>\n"
+                    f"💵 Amount: ₦{amount:,}\n"
+                    f"🏦 {_esc(bank.get('bank_name',''))} — {_esc(bank.get('account_number',''))} ({_esc(bank.get('account_name',''))})\n\n"
+                    f"Status: ⏳ <b>Pending processing</b>\n"
+                    f"💰 New balance: ₦{result['new_balance']:,}\n\n"
+                    f"You'll be notified once the admin approves or rejects it. "
+                    f"Check 🎁 Referrals -> 📜 Withdrawal History any time.",
+                    parse_mode="HTML"
+                )
+
+                # Notify admins immediately with full details
+                for admin_chat_id in _get_admin_chat_ids():
+                    try:
+                        await context.bot.send_message(
+                            chat_id=admin_chat_id,
+                            text=(
+                                f"💸 <b>New Withdrawal Request!</b>\n\n"
+                                f"🆔 Reference: <code>{wid}</code>\n"
+                                f"👤 User: @{_esc(tuser.username or '?')} (<code>{uid}</code>)\n"
+                                f"💵 Amount: ₦{amount:,}\n"
+                                f"🏦 Bank: {_esc(bank.get('bank_name',''))}\n"
+                                f"🔢 Account Number: {_esc(bank.get('account_number',''))}\n"
+                                f"🧾 Account Name: {_esc(bank.get('account_name',''))}\n\n"
+                                f"✅ Approve: <code>/approvewithdraw {wid}</code>\n"
+                                f"❌ Reject: <code>/rejectwithdraw {wid} reason</code>"
+                            ),
+                            parse_mode="HTML"
+                        )
+                    except Exception as _notify_err:
+                        logger.error(f"[Withdraw] Could not notify admin {admin_chat_id}: {_notify_err}")
+
     else:
         # ── No active input flow — this is free-text chat, not a bot setting.
         # Route it to the local help agent (no external AI API — see
-        # help_agent.py). The typing indicator was already shown at the top
-        # of this handler; add a little extra delay proportional to the
-        # reply length so longer answers feel less instant. Never uses
-        # inline buttons here — unmatched questions get a plain list of
-        # things the agent can help with instead.
+        # help_agent.py). Typing indicator + a short human-feeling delay
+        # apply ONLY here (real chat with the agent) — every other bot
+        # feature (buttons, settings input, commands) stays instant.
+        # Never uses inline buttons here — unmatched questions get a plain
+        # list of things the agent can help with instead.
+        await _typing(context, update.effective_chat.id)
+
         reply_text = help_agent.answer_question(text)
         await asyncio.sleep(min(2.0, len(reply_text) / 500))
 
@@ -6006,7 +6161,6 @@ async def _db_session_cleanup_loop():
 async def refresh_scammers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _get_or_register_user(update.effective_user)
     uid = update.effective_user.id
-    await _typing(context, update.effective_chat.id)
     if not is_admin(uid) and not sub.is_pro(uid):
         await update.message.reply_text(
             "🔒 <b>Pro Plan Required</b>\n\n"
@@ -6038,7 +6192,6 @@ async def check_name_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     """Manually check a name against the scammer list. Usage: /checkname John Doe"""
     _get_or_register_user(update.effective_user)
     uid = update.effective_user.id
-    await _typing(context, update.effective_chat.id)
     if not is_admin(uid) and not sub.is_pro(uid):
         await update.message.reply_text(
             "🔒 <b>Pro Plan Required</b>\n\n"
@@ -6226,6 +6379,9 @@ def start_bot():
     application.add_handler(CommandHandler("addbalance",    cmd_addbalance))
     application.add_handler(CommandHandler("deductbalance", cmd_deductbalance))
     application.add_handler(CommandHandler("referrals",     cmd_referrals))
+    application.add_handler(CommandHandler("withdrawals",      cmd_withdrawals))
+    application.add_handler(CommandHandler("approvewithdraw",  cmd_approvewithdraw))
+    application.add_handler(CommandHandler("rejectwithdraw",   cmd_rejectwithdraw))
 
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
