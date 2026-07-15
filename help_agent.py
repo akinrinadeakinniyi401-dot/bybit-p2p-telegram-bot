@@ -1,5 +1,5 @@
 """
-help_agent.py — Local "how to use the bot" guide + basic safety filter.
+help_agent.py — "Agent Nova", the P2P Exchange Bot's local how-to guide.
 
 No external AI API is used. This matches free-text questions against a
 knowledge base (knowledge.txt) hosted on GitHub — exactly the same pattern
@@ -7,6 +7,10 @@ as fraud_check.py's scammers.txt — using keyword + fuzzy text matching
 (difflib, the same tool fraud_check.py already uses). Edit knowledge.txt
 on GitHub and push; the bot picks up the change on its own refresh cycle
 with no redeploy required (a redeploy also works fine).
+
+Persona ("Agent Nova") and off-topic wording below are taken directly
+from P2P_Exchange_Bot_Knowledge_Base.md — keep them in sync if that
+document changes.
 
 knowledge.txt format — one entry per block, separated by a line containing
 only "---":
@@ -44,8 +48,10 @@ from config import KNOWLEDGE_FILE_URL, BOT_OWNER_USERNAME
 
 logger = logging.getLogger(__name__)
 
+AGENT_NAME = "Agent Nova"
+
 REFRESH_INTERVAL  = 30 * 60   # same cadence as fraud_check.py
-MATCH_THRESHOLD   = 0.42      # confidence needed to answer directly
+MATCH_THRESHOLD   = 0.60      # confidence needed to answer directly
 SUGGESTION_COUNT  = 6         # how many topics to suggest when nothing matches
 
 _entries: list       = []     # [{"question": str, "keywords": [str,...], "answer": str}]
@@ -53,18 +59,35 @@ _last_loaded: float  = 0.0
 _load_lock           = threading.Lock()
 
 CONTACT_LINE = (
-    f'For anything else, message the bot owner: '
+    f'For anything else, please contact the bot owner: '
     f'<a href="https://t.me/{BOT_OWNER_USERNAME}">@{BOT_OWNER_USERNAME}</a>.'
 )
-CAPABILITIES_INTRO = "Here's what I can help you with right now:"
+CAPABILITIES_INTRO = "Here's what I can help you with:"
 
 _FALLBACK_TOPICS = [
     "Setting up your Bybit / Flutterwave / Paga API keys",
-    "Starting the auto price bot and order monitor",
-    "Turning on Auto-Pay, Buyer Protection, or Name Match",
+    "Starting the AD Price Bot and Order Monitor",
+    "Turning on Auto Pay, Buyer Protection, or Name Match",
     "Understanding your plan and upgrading to Pro",
-    "Using your referral link and checking your balance",
+    "Using your referral link, balance, and withdrawals",
 ]
+
+GREETING = (
+    f"👋 <b>Hello! I'm {AGENT_NAME}, your P2P Exchange Assistant.</b>\n\n"
+    "I'm here to help you understand and use every feature of this bot. "
+    "Ask me anything about it — for example:"
+)
+
+# Off-topic wording taken verbatim from P2P_Exchange_Bot_Knowledge_Base.md
+OFF_TOPIC_MESSAGE = (
+    "I'm sorry 😅. I'm only able to help with questions about the P2P "
+    "Exchange Bot and its available features."
+)
+
+_GREETING_WORDS = {
+    "hi", "hello", "hey", "hiya", "yo", "sup", "howdy",
+    "good morning", "good afternoon", "good evening",
+}
 
 # ─────────────────────────────────────────
 # 🚫 Off-topic / not-allowed filter
@@ -86,7 +109,7 @@ def is_disallowed(text: str) -> bool:
 
 def disallowed_reply() -> str:
     return (
-        "🚫 I'm not able to respond to that.\n\n"
+        f"🚫 {OFF_TOPIC_MESSAGE}\n\n"
         f"{CAPABILITIES_INTRO}\n\n"
         f"{_capability_list()}\n\n"
         f"{CONTACT_LINE}"
@@ -168,6 +191,16 @@ def _normalize(text: str) -> str:
     return re.sub(r"[^a-z0-9 ]", " ", (text or "").lower()).strip()
 
 
+def _is_greeting(text: str) -> bool:
+    norm = _normalize(text)
+    if not norm:
+        return False
+    if norm in _GREETING_WORDS:
+        return True
+    # Short messages starting with a greeting word (e.g. "hi there", "hello bot")
+    return len(norm.split()) <= 3 and any(norm.startswith(g) for g in _GREETING_WORDS)
+
+
 def _score(user_text: str, entry: dict) -> float:
     norm = _normalize(user_text)
     if not norm:
@@ -175,8 +208,13 @@ def _score(user_text: str, entry: dict) -> float:
 
     kw_score = 0.0
     for kw in entry["keywords"]:
-        if kw and kw in norm:
-            kw_score = max(kw_score, 0.9)
+        if not kw or kw not in norm:
+            continue
+        # Multi-word phrases are specific and reliable signals. Single
+        # generic words (e.g. "status", "account") are common across many
+        # entries, so they only get a modest boost rather than dominating.
+        weight = 0.92 if (" " in kw and len(kw) >= 6) else 0.55
+        kw_score = max(kw_score, weight)
 
     fuzzy_score = SequenceMatcher(None, norm, _normalize(entry["question"])).ratio()
     return max(kw_score, fuzzy_score)
@@ -202,6 +240,9 @@ def answer_question(text: str) -> str:
     if is_disallowed(text):
         return disallowed_reply()
 
+    if _is_greeting(text):
+        return f"{GREETING}\n\n{_capability_list()}"
+
     if not _entries:
         return (
             "I'm still loading my help guide — try again in a moment, "
@@ -220,9 +261,8 @@ def answer_question(text: str) -> str:
         return best_entry["answer"]
 
     return (
-        "I couldn't find an exact answer for that.\n\n"
+        f"{OFF_TOPIC_MESSAGE}\n\n"
         f"{CAPABILITIES_INTRO}\n\n"
         f"{_capability_list()}\n\n"
-        "Try asking about one of these topics, or rephrase your question.\n"
         f"{CONTACT_LINE}"
     )
