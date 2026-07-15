@@ -100,6 +100,9 @@ PAGA_API_KEY    = os.getenv("PAGA_API_KEY",    "")
 # via /awardref once the upgrade has gone through.
 REFERRAL_REWARD_NGN = int(os.getenv("REFERRAL_REWARD_NGN", "5000"))
 
+# Minimum amount a user can withdraw from their referral balance in one go.
+MIN_WITHDRAWAL_NGN = int(os.getenv("MIN_WITHDRAWAL_NGN", "5000"))
+
 # ── Bot owner contact (shown by the help agent / support fallback) ──
 BOT_OWNER_USERNAME = os.getenv("BOT_OWNER_USERNAME", "Segzyi")
 
