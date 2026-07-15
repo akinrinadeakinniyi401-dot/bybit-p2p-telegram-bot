@@ -56,7 +56,8 @@ USERS_DIR      = DISK_PATH / "users"
 SESSION_DIR    = DISK_PATH / "sessions"
 UPGRADE_REQ    = DISK_PATH / "upgrade_requests.json"
 STATS_FILE     = DISK_PATH / "stats.json"
-REFERRALS_FILE = DISK_PATH / "referrals.json"
+REFERRALS_FILE   = DISK_PATH / "referrals.json"
+WITHDRAWALS_FILE = DISK_PATH / "withdrawals.json"
 
 _lock = Lock()
 
@@ -70,6 +71,8 @@ def _init_dirs():
         _write_json(STATS_FILE, {"total_users": 0})
     if not REFERRALS_FILE.exists():
         _write_json(REFERRALS_FILE, {})
+    if not WITHDRAWALS_FILE.exists():
+        _write_json(WITHDRAWALS_FILE, {})
 
 def _read_json(path: Path, default=None):
     """
@@ -149,6 +152,11 @@ def _default_user(user_id: int, username: str, display_name: str) -> dict:
             "balance":             0,      # NGN available balance (admin can adjust)
             "pending_commission":  0,      # informational only — live value comes from referrals.json
             "total_earned":        0,      # lifetime NGN approved into balance
+            "bank": {                      # last-used withdrawal bank details, for reference only
+                "account_number": "",
+                "account_name":   "",
+                "bank_name":      "",
+            },
         }
     }
 
@@ -491,6 +499,7 @@ def _ensure_referral_block(user: dict):
         user["referral"] = {
             "code": "", "referred_by": None,
             "balance": 0, "pending_commission": 0, "total_earned": 0,
+            "bank": {"account_number": "", "account_name": "", "bank_name": ""},
         }
     else:
         ref.setdefault("code", "")
@@ -498,6 +507,7 @@ def _ensure_referral_block(user: dict):
         ref.setdefault("balance", 0)
         ref.setdefault("pending_commission", 0)
         ref.setdefault("total_earned", 0)
+        ref.setdefault("bank", {"account_number": "", "account_name": "", "bank_name": ""})
 
 def get_or_create_referral_code(user_id: int) -> str:
     """Return this user's referral code, generating it on first call."""
@@ -696,6 +706,155 @@ def get_referral_summary() -> dict:
         "approved_amount":     sum(r.get("reward_amount", 0) for r in approved),
         "outstanding_balance": total_balance_owed,
     }
+
+
+# ─────────────────────────────────────────
+# Withdrawals
+# ─────────────────────────────────────────
+# One record per withdrawal request, keyed by a short withdrawal_id (W000001,
+# W000002, ...). Status lifecycle:
+#   "pending"   → submitted, amount already deducted from the user's balance
+#   "completed" → admin approved — balance stays deducted, nothing more happens
+#   "rejected"  → admin rejected — amount is refunded back to the user's balance
+def set_bank_details(user_id: int, account_number: str, account_name: str, bank_name: str):
+    """Save the user's most recently used withdrawal bank details (for reference/history)."""
+    with _lock:
+        user = _read_json(_user_path(user_id))
+        if not user:
+            return False
+        _ensure_referral_block(user)
+        user["referral"]["bank"] = {
+            "account_number": account_number.strip(),
+            "account_name":   account_name.strip(),
+            "bank_name":      bank_name.strip(),
+        }
+        _write_json(_user_path(user_id), user)
+        return True
+
+def get_bank_details(user_id: int) -> dict:
+    user = get_user(user_id)
+    if not user:
+        return {"account_number": "", "account_name": "", "bank_name": ""}
+    _ensure_referral_block(user)
+    return user["referral"]["bank"]
+
+def _read_withdrawals() -> dict:
+    return _read_json(WITHDRAWALS_FILE, {})
+
+def _write_withdrawals(data: dict):
+    _write_json(WITHDRAWALS_FILE, data)
+
+def _next_withdrawal_id(existing: dict) -> str:
+    n = len(existing) + 1
+    wid = f"W{n:06d}"
+    while wid in existing:   # extremely unlikely, but guard against gaps/races
+        n += 1
+        wid = f"W{n:06d}"
+    return wid
+
+def create_withdrawal_request(user_id: int, amount: int, bank: dict, min_amount: int) -> dict:
+    """
+    Validate and submit a withdrawal request. On success, the amount is
+    deducted from the user's available balance IMMEDIATELY (status starts
+    as "pending") — it's only refunded if the admin later rejects it.
+    Returns:
+        {"ok": True,  "withdrawal_id": str, "new_balance": int}
+        {"ok": False, "reason": "below_minimum" | "insufficient", "balance": int}
+        {"ok": False, "reason": "user_missing"}
+    """
+    with _lock:
+        user = _read_json(_user_path(user_id))
+        if not user:
+            return {"ok": False, "reason": "user_missing", "balance": 0}
+        _ensure_referral_block(user)
+        balance = user["referral"]["balance"]
+
+        if amount < min_amount:
+            return {"ok": False, "reason": "below_minimum", "balance": balance}
+        if amount > balance:
+            return {"ok": False, "reason": "insufficient", "balance": balance}
+
+        user["referral"]["balance"] = balance - amount
+        user["referral"]["bank"] = {
+            "account_number": bank.get("account_number", "").strip(),
+            "account_name":   bank.get("account_name", "").strip(),
+            "bank_name":      bank.get("bank_name", "").strip(),
+        }
+        _write_json(_user_path(user_id), user)
+
+        withdrawals = _read_withdrawals()
+        wid = _next_withdrawal_id(withdrawals)
+        withdrawals[wid] = {
+            "withdrawal_id":  wid,
+            "user_id":        user_id,
+            "username":       user.get("username", ""),
+            "display_name":   user.get("display_name", ""),
+            "amount":         amount,
+            "bank":           user["referral"]["bank"],
+            "status":         "pending",
+            "requested_at":   _now(),
+            "resolved_at":    None,
+            "reject_reason":  "",
+        }
+        _write_withdrawals(withdrawals)
+        logger.info(f"[Withdraw] {wid}: user {user_id} requested ₦{amount} — balance now ₦{user['referral']['balance']}")
+        return {"ok": True, "withdrawal_id": wid, "new_balance": user["referral"]["balance"]}
+
+def get_withdrawal(withdrawal_id: str):
+    return _read_withdrawals().get(withdrawal_id)
+
+def get_withdrawals_for(user_id: int) -> list:
+    """This user's full withdrawal history, most recent first."""
+    rows = [w for w in _read_withdrawals().values() if w.get("user_id") == user_id]
+    rows.sort(key=lambda w: w.get("requested_at", ""), reverse=True)
+    return rows
+
+def get_pending_withdrawals() -> list:
+    """All withdrawals awaiting admin action, oldest first (fair queue order)."""
+    rows = [w for w in _read_withdrawals().values() if w.get("status") == "pending"]
+    rows.sort(key=lambda w: w.get("requested_at", ""))
+    return rows
+
+def approve_withdrawal(withdrawal_id: str) -> dict:
+    """Mark a pending withdrawal completed. Balance was already deducted at
+    request time, so nothing more moves — this just confirms it was paid."""
+    with _lock:
+        withdrawals = _read_withdrawals()
+        w = withdrawals.get(withdrawal_id)
+        if not w:
+            return {"ok": False, "reason": "not_found"}
+        if w.get("status") != "pending":
+            return {"ok": False, "reason": "not_pending", "status": w.get("status")}
+        w["status"]      = "completed"
+        w["resolved_at"] = _now()
+        withdrawals[withdrawal_id] = w
+        _write_withdrawals(withdrawals)
+        logger.info(f"[Withdraw] {withdrawal_id} approved/completed")
+        return {"ok": True, "withdrawal": w}
+
+def reject_withdrawal(withdrawal_id: str, reason: str = "") -> dict:
+    """Reject a pending withdrawal and refund the amount back to the user's balance."""
+    with _lock:
+        withdrawals = _read_withdrawals()
+        w = withdrawals.get(withdrawal_id)
+        if not w:
+            return {"ok": False, "reason": "not_found"}
+        if w.get("status") != "pending":
+            return {"ok": False, "reason": "not_pending", "status": w.get("status")}
+
+        user = _read_json(_user_path(w["user_id"]))
+        if user:
+            _ensure_referral_block(user)
+            user["referral"]["balance"] += w.get("amount", 0)
+            _write_json(_user_path(w["user_id"]), user)
+
+        w["status"]         = "rejected"
+        w["resolved_at"]    = _now()
+        w["reject_reason"]  = reason
+        withdrawals[withdrawal_id] = w
+        _write_withdrawals(withdrawals)
+        logger.info(f"[Withdraw] {withdrawal_id} rejected — ₦{w.get('amount',0)} refunded to user {w['user_id']}")
+        return {"ok": True, "withdrawal": w}
 
 
 # ─────────────────────────────────────────
