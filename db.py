@@ -51,11 +51,12 @@ logger = logging.getLogger(__name__)
 # Disk path — Render persistent disk mounts at /data by default
 # Override with DISK_PATH env var if needed
 # ─────────────────────────────────────────
-DISK_PATH   = Path(os.getenv("DISK_PATH", "/data"))
-USERS_DIR   = DISK_PATH / "users"
-SESSION_DIR = DISK_PATH / "sessions"
-UPGRADE_REQ = DISK_PATH / "upgrade_requests.json"
-STATS_FILE  = DISK_PATH / "stats.json"
+DISK_PATH      = Path(os.getenv("DISK_PATH", "/data"))
+USERS_DIR      = DISK_PATH / "users"
+SESSION_DIR    = DISK_PATH / "sessions"
+UPGRADE_REQ    = DISK_PATH / "upgrade_requests.json"
+STATS_FILE     = DISK_PATH / "stats.json"
+REFERRALS_FILE = DISK_PATH / "referrals.json"
 
 _lock = Lock()
 
@@ -67,6 +68,8 @@ def _init_dirs():
         _write_json(UPGRADE_REQ, {})
     if not STATS_FILE.exists():
         _write_json(STATS_FILE, {"total_users": 0})
+    if not REFERRALS_FILE.exists():
+        _write_json(REFERRALS_FILE, {})
 
 def _read_json(path: Path, default=None):
     """
@@ -139,6 +142,13 @@ def _default_user(user_id: int, username: str, display_name: str) -> dict:
             "total_buy_orders":  0,
             "total_sell_orders": 0,
             "last_active":       _now(),
+        },
+        "referral": {
+            "code":                "",     # generated lazily on first access
+            "referred_by":         None,   # user_id of referrer, set once, immutable
+            "balance":             0,      # NGN available balance (admin can adjust)
+            "pending_commission":  0,      # informational only — live value comes from referrals.json
+            "total_earned":        0,      # lifetime NGN approved into balance
         }
     }
 
@@ -444,6 +454,251 @@ def clear_all_old_sessions():
 
 
 # ─────────────────────────────────────────
+# Referral system
+# ─────────────────────────────────────────
+# Every user gets a referral code that's a deterministic, reversible
+# encoding of their own Telegram user_id — so there's no separate code
+# index to keep in sync, and codes can never collide.
+#
+# referrals.json holds one record per REFERRED user (keyed by their
+# user_id), tracking who referred them and the state of their reward:
+#   "none"     → joined via link, not upgraded to Pro yet — no reward owed
+#   "pending"  → upgraded to Pro — commission owed, admin hasn't approved yet
+#   "approved" → admin approved — amount has been moved into referrer's balance
+# ─────────────────────────────────────────
+_B36_ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+def _b36_encode(n: int) -> str:
+    if n == 0:
+        return "0"
+    n = abs(n)
+    digits = []
+    while n:
+        n, r = divmod(n, 36)
+        digits.append(_B36_ALPHABET[r])
+    return "".join(reversed(digits))
+
+def _b36_decode(s: str):
+    try:
+        return int(s, 36)
+    except Exception:
+        return None
+
+def _ensure_referral_block(user: dict):
+    """Backfill the 'referral' block on user dicts created before this feature existed."""
+    ref = user.get("referral")
+    if not isinstance(ref, dict):
+        user["referral"] = {
+            "code": "", "referred_by": None,
+            "balance": 0, "pending_commission": 0, "total_earned": 0,
+        }
+    else:
+        ref.setdefault("code", "")
+        ref.setdefault("referred_by", None)
+        ref.setdefault("balance", 0)
+        ref.setdefault("pending_commission", 0)
+        ref.setdefault("total_earned", 0)
+
+def get_or_create_referral_code(user_id: int) -> str:
+    """Return this user's referral code, generating it on first call."""
+    with _lock:
+        user = _read_json(_user_path(user_id))
+        if not user:
+            return ""
+        _ensure_referral_block(user)
+        code = user["referral"]["code"]
+        if not code:
+            code = "R" + _b36_encode(user_id)
+            user["referral"]["code"] = code
+            _write_json(_user_path(user_id), user)
+        return code
+
+def resolve_referral_code(code: str):
+    """Decode a referral code back into a user_id. Returns None if invalid
+    or the encoded user doesn't actually exist in the DB."""
+    if not code or not code.upper().startswith("R"):
+        return None
+    uid = _b36_decode(code[1:].upper())
+    if uid is None or not _user_path(uid).exists():
+        return None
+    return uid
+
+def _read_referrals() -> dict:
+    return _read_json(REFERRALS_FILE, {})
+
+def _write_referrals(data: dict):
+    _write_json(REFERRALS_FILE, data)
+
+def record_referral_join(new_user_id: int, referrer_id: int, username: str, display_name: str) -> bool:
+    """
+    Link a brand-new user to whoever referred them. Anti-cheat rules:
+      - Only fires for accounts that don't already have a referrer (immutable, one-time).
+      - Self-referral (referrer_id == new_user_id) is rejected.
+      - The referrer must be a real, existing user.
+    Returns True if the link was recorded.
+    """
+    if not referrer_id or referrer_id == new_user_id:
+        return False
+    with _lock:
+        user = _read_json(_user_path(new_user_id))
+        if not user:
+            return False
+        _ensure_referral_block(user)
+        if user["referral"]["referred_by"]:
+            return False
+        if not _user_path(referrer_id).exists():
+            return False
+
+        user["referral"]["referred_by"] = referrer_id
+        _write_json(_user_path(new_user_id), user)
+
+        refs = _read_referrals()
+        refs[str(new_user_id)] = {
+            "referrer_id":           referrer_id,
+            "referred_username":     username or "",
+            "referred_display_name": display_name or "",
+            "joined_at":             _now(),
+            "reward_status":         "none",
+            "reward_amount":         0,
+            "approved_at":           None,
+        }
+        _write_referrals(refs)
+        logger.info(f"[Referral] user {new_user_id} joined via referrer {referrer_id}")
+        return True
+
+def get_referrer(user_id: int):
+    user = get_user(user_id)
+    if not user:
+        return None
+    _ensure_referral_block(user)
+    return user["referral"]["referred_by"]
+
+def get_referral_record(referred_user_id: int):
+    return _read_referrals().get(str(referred_user_id))
+
+def get_referrals_for(referrer_id: int) -> list:
+    """All referral records where this user is the referrer, newest first."""
+    refs = _read_referrals()
+    rows = [r for r in refs.values() if r.get("referrer_id") == referrer_id]
+    rows.sort(key=lambda r: r.get("joined_at", ""), reverse=True)
+    return rows
+
+def mark_reward_pending(referred_user_id: int, reward_amount: int):
+    """
+    Call right after a referred user's FIRST Pro upgrade is approved.
+    Flips 'none' -> 'pending' exactly once — later renewal upgrades for the
+    same user do not re-trigger a reward. Returns the updated record, or
+    None if there's no referral for this user or it was already handled.
+    """
+    with _lock:
+        refs = _read_referrals()
+        rec  = refs.get(str(referred_user_id))
+        if not rec or rec.get("reward_status") != "none":
+            return None
+        rec["reward_status"] = "pending"
+        rec["reward_amount"] = reward_amount
+        refs[str(referred_user_id)] = rec
+        _write_referrals(refs)
+        logger.info(f"[Referral] reward pending: referrer={rec['referrer_id']} referred={referred_user_id} amount={reward_amount}")
+        return rec
+
+def approve_referral_reward(referred_user_id: int) -> dict:
+    """
+    Admin approves the commission for a referral: moves reward_amount from
+    'pending' into the referrer's available balance (idempotent — can't be
+    approved twice). Returns {"ok", "reason", "referrer_id", "amount"}.
+    """
+    with _lock:
+        refs = _read_referrals()
+        rec  = refs.get(str(referred_user_id))
+        if not rec:
+            return {"ok": False, "reason": "no_referral", "referrer_id": None, "amount": 0}
+        if rec.get("reward_status") == "approved":
+            return {"ok": False, "reason": "already_approved", "referrer_id": rec["referrer_id"], "amount": rec.get("reward_amount", 0)}
+        if rec.get("reward_status") != "pending":
+            return {"ok": False, "reason": "not_pending", "referrer_id": rec["referrer_id"], "amount": 0}
+
+        referrer_id = rec["referrer_id"]
+        amount      = rec.get("reward_amount", 0)
+        referrer    = _read_json(_user_path(referrer_id))
+        if not referrer:
+            return {"ok": False, "reason": "referrer_missing", "referrer_id": referrer_id, "amount": amount}
+
+        _ensure_referral_block(referrer)
+        referrer["referral"]["balance"]      += amount
+        referrer["referral"]["total_earned"] += amount
+        _write_json(_user_path(referrer_id), referrer)
+
+        rec["reward_status"] = "approved"
+        rec["approved_at"]   = _now()
+        refs[str(referred_user_id)] = rec
+        _write_referrals(refs)
+
+        logger.info(f"[Referral] approved ₦{amount} to referrer {referrer_id} (referred {referred_user_id})")
+        return {"ok": True, "reason": "", "referrer_id": referrer_id, "amount": amount}
+
+def get_referral_balance(user_id: int) -> dict:
+    user = get_user(user_id)
+    if not user:
+        return {"balance": 0, "total_earned": 0}
+    _ensure_referral_block(user)
+    return {
+        "balance":      user["referral"]["balance"],
+        "total_earned": user["referral"]["total_earned"],
+    }
+
+def adjust_balance(user_id: int, delta: int):
+    """
+    Admin manually adds (positive delta) or deducts (negative delta) NGN
+    from a user's referral balance — used after an off-bot bank payout, or
+    to correct mistakes. Floored at 0. Returns the updated referral block,
+    or None if the user doesn't exist.
+    """
+    with _lock:
+        user = _read_json(_user_path(user_id))
+        if not user:
+            return None
+        _ensure_referral_block(user)
+        user["referral"]["balance"] = max(0, user["referral"]["balance"] + delta)
+        _write_json(_user_path(user_id), user)
+        logger.info(f"[Referral] balance for {user_id} adjusted by {delta:+d} -> ₦{user['referral']['balance']}")
+        return user["referral"]
+
+def get_referral_leaderboard(limit: int = 10) -> list:
+    """Top referrers by total lifetime earnings, for admin analytics."""
+    rows = []
+    for u in get_all_users():
+        _ensure_referral_block(u)
+        count = len(get_referrals_for(u["user_id"]))
+        if count == 0 and not u["referral"]["total_earned"]:
+            continue
+        rows.append({
+            "user_id":      u["user_id"],
+            "username":     u.get("username", ""),
+            "referrals":    count,
+            "balance":      u["referral"]["balance"],
+            "total_earned": u["referral"]["total_earned"],
+        })
+    rows.sort(key=lambda r: r["total_earned"], reverse=True)
+    return rows[:limit]
+
+def get_referral_summary() -> dict:
+    """Global referral stats for the admin /referrals overview."""
+    refs = _read_referrals()
+    pending  = [r for r in refs.values() if r.get("reward_status") == "pending"]
+    approved = [r for r in refs.values() if r.get("reward_status") == "approved"]
+    total_balance_owed = sum(u.get("referral", {}).get("balance", 0) for u in get_all_users())
+    return {
+        "total_referred":      len(refs),
+        "pending_count":       len(pending),
+        "pending_amount":      sum(r.get("reward_amount", 0) for r in pending),
+        "approved_count":      len(approved),
+        "approved_amount":     sum(r.get("reward_amount", 0) for r in approved),
+        "outstanding_balance": total_balance_owed,
+    }
+
+
+# ─────────────────────────────────────────
 # Export for admin
 # ─────────────────────────────────────────
 def export_users_to_excel() -> bytes:
@@ -460,7 +715,8 @@ def export_users_to_excel() -> bytes:
         headers = [
             "User ID", "Username", "Display Name", "Plan",
             "Plan Expires", "Upgrade Pending", "Created At",
-            "Total Buy Orders", "Total Sell Orders", "Last Active"
+            "Total Buy Orders", "Total Sell Orders", "Last Active",
+            "Referred By", "Total Referrals", "Referral Balance (NGN)", "Referral Total Earned (NGN)"
         ]
         header_fill = PatternFill("solid", fgColor="1E3A5F")
         header_font = Font(color="FFFFFF", bold=True)
@@ -474,6 +730,8 @@ def export_users_to_excel() -> bytes:
 
         for row, user in enumerate(get_all_users(), 2):
             stats = user.get("stats", {})
+            _ensure_referral_block(user)
+            ref = user["referral"]
             ws.cell(row=row, column=1,  value=user.get("user_id", ""))
             ws.cell(row=row, column=2,  value=user.get("username", ""))
             ws.cell(row=row, column=3,  value=user.get("display_name", ""))
@@ -484,6 +742,10 @@ def export_users_to_excel() -> bytes:
             ws.cell(row=row, column=8,  value=stats.get("total_buy_orders", 0))
             ws.cell(row=row, column=9,  value=stats.get("total_sell_orders", 0))
             ws.cell(row=row, column=10, value=stats.get("last_active", ""))
+            ws.cell(row=row, column=11, value=ref.get("referred_by") or "—")
+            ws.cell(row=row, column=12, value=len(get_referrals_for(user.get("user_id"))))
+            ws.cell(row=row, column=13, value=ref.get("balance", 0))
+            ws.cell(row=row, column=14, value=ref.get("total_earned", 0))
 
         buf = io.BytesIO()
         wb.save(buf)
