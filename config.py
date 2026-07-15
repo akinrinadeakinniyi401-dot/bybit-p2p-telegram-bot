@@ -93,3 +93,21 @@ FLW_SECRET_KEY    = os.getenv("FLW_SECRET_KEY", "")   # Standard v3 API secret k
 PAGA_PRINCIPAL  = os.getenv("PAGA_PRINCIPAL",  "")
 PAGA_CREDENTIAL = os.getenv("PAGA_CREDENTIAL", "")
 PAGA_API_KEY    = os.getenv("PAGA_API_KEY",    "")
+
+# ── Referral program ──
+# NGN commission paid to a referrer when the person they referred is
+# approved for Pro (first upgrade only). Admin approves payout manually
+# via /awardref once the upgrade has gone through.
+REFERRAL_REWARD_NGN = int(os.getenv("REFERRAL_REWARD_NGN", "5000"))
+
+# ── Bot owner contact (shown by the help agent / support fallback) ──
+BOT_OWNER_USERNAME = os.getenv("BOT_OWNER_USERNAME", "Segzyi")
+
+# ── Help agent knowledge base ──
+# Same pattern as SCAMMERS_FILE_URL in fraud_check.py — hosted on GitHub,
+# edit the file and push; the bot picks it up on its own refresh cycle
+# (no redeploy required, though a redeploy also works fine).
+KNOWLEDGE_FILE_URL = os.getenv(
+    "KNOWLEDGE_FILE_URL",
+    "https://raw.githubusercontent.com/akinrinadeakinniyi401-dot/bybit-p2p-telegram-bot/main/knowledge.txt"
+)
