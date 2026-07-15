@@ -32,11 +32,9 @@ NOTE on formatting:
   handler. HTML mode + escaping avoids that entirely.
 """
 
-import asyncio
 import html
 import logging
 import io
-import random
 from datetime import datetime
 from telegram import Update
 from telegram.ext import ContextTypes
@@ -48,20 +46,6 @@ logger = logging.getLogger(__name__)
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
-
-
-async def _typing(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    """Show 'typing…' and hold briefly before replying — same behavior as
-    bot.py's _typing(), duplicated here to avoid a circular import
-    (bot.py imports this module, not the other way around)."""
-    try:
-        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-    except Exception:
-        pass
-    try:
-        await asyncio.sleep(random.uniform(0.5, 1.4))
-    except Exception:
-        pass
 
 
 def esc(value) -> str:
@@ -87,7 +71,6 @@ def _referrer_line(referred_user_id: int) -> str:
 async def cmd_upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-    await _typing(context, update.effective_chat.id)
     args = context.args
     if len(args) < 2:
         await update.message.reply_text(
@@ -166,7 +149,6 @@ async def cmd_upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_downgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-    await _typing(context, update.effective_chat.id)
     args = context.args
     if not args:
         await update.message.reply_text("Usage: <code>/downgrade &lt;user_id&gt;</code>", parse_mode="HTML")
@@ -209,7 +191,6 @@ async def cmd_downgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_requests(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-    await _typing(context, update.effective_chat.id)
     pending = db.get_pending_requests()
     if not pending:
         await update.message.reply_text("📋 No pending upgrade requests.")
@@ -241,7 +222,6 @@ async def cmd_requests(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_listusers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-    await _typing(context, update.effective_chat.id)
     users = db.get_all_users()
     if not users:
         await update.message.reply_text("No users registered yet.")
@@ -276,7 +256,6 @@ async def cmd_userdata(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Stub — overridden by bot.py's local cmd_userdata definition."""
     if not is_admin(update.effective_user.id):
         return
-    await _typing(context, update.effective_chat.id)
     await update.message.reply_text("⏳ Generating Excel report...")
     try:
         data = db.export_users_to_excel()
@@ -302,7 +281,6 @@ async def cmd_userdata(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_awardref(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-    await _typing(context, update.effective_chat.id)
     args = context.args
     if not args:
         await update.message.reply_text(
@@ -363,7 +341,6 @@ async def cmd_awardref(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _adjust_balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, sign: int, verb: str):
     if not is_admin(update.effective_user.id):
         return
-    await _typing(context, update.effective_chat.id)
     args = context.args
     if len(args) < 2:
         await update.message.reply_text(
@@ -419,7 +396,6 @@ async def cmd_deductbalance(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_referrals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
-    await _typing(context, update.effective_chat.id)
     args = context.args
 
     if args:
@@ -479,3 +455,116 @@ async def cmd_referrals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(msg) > 4000:
         msg = msg[:4000] + "\n...(truncated)"
     await update.message.reply_text(msg, parse_mode="HTML")
+
+
+# ─────────────────────────────────────────
+# /withdrawals — list pending withdrawal requests
+# ─────────────────────────────────────────
+async def cmd_withdrawals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    pending = db.get_pending_withdrawals()
+    if not pending:
+        await update.message.reply_text("💸 No pending withdrawal requests.")
+        return
+
+    lines = [f"💸 <b>Pending Withdrawals ({len(pending)}):</b>\n"]
+    for w in pending:
+        bank = w.get("bank", {})
+        lines.append(
+            f"🆔 <code>{w['withdrawal_id']}</code> — ₦{w['amount']:,}\n"
+            f"   👤 @{esc(w.get('username') or '?')} (<code>{w['user_id']}</code>)\n"
+            f"   🏦 {esc(bank.get('bank_name',''))} — {esc(bank.get('account_number',''))} ({esc(bank.get('account_name',''))})\n"
+            f"   📅 {esc(w.get('requested_at',''))}\n"
+            f"   ✅ Approve: <code>/approvewithdraw {w['withdrawal_id']}</code>\n"
+            f"   ❌ Reject: <code>/rejectwithdraw {w['withdrawal_id']} reason</code>\n"
+        )
+
+    msg = "\n".join(lines)
+    if len(msg) > 4000:
+        msg = msg[:4000] + "\n...(truncated)"
+    await update.message.reply_text(msg, parse_mode="HTML")
+
+
+# ─────────────────────────────────────────
+# /approvewithdraw <withdrawal_id>
+# ─────────────────────────────────────────
+async def cmd_approvewithdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: <code>/approvewithdraw &lt;withdrawal_id&gt;</code>", parse_mode="HTML")
+        return
+    wid = args[0].upper()
+    result = db.approve_withdrawal(wid)
+    if not result["ok"]:
+        reasons = {
+            "not_found":   "No withdrawal request with that ID.",
+            "not_pending": f"That withdrawal is already '{result.get('status','?')}' — can't approve it again.",
+        }
+        await update.message.reply_text(f"❌ {reasons.get(result['reason'], 'Could not process.')}", parse_mode="HTML")
+        return
+
+    w = result["withdrawal"]
+    await update.message.reply_text(
+        f"✅ Withdrawal <code>{wid}</code> marked completed — ₦{w['amount']:,} to @{esc(w.get('username') or w['user_id'])}.",
+        parse_mode="HTML"
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=w["user_id"],
+            text=(
+                f"✅ <b>Withdrawal completed!</b>\n\n"
+                f"₦{w['amount']:,} has been sent to your bank account.\n"
+                f"🆔 Reference: <code>{wid}</code>"
+            ),
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.warning(f"[Admin] Could not notify user {w['user_id']} of withdrawal approval: {e}")
+
+
+# ─────────────────────────────────────────
+# /rejectwithdraw <withdrawal_id> [reason...]
+# ─────────────────────────────────────────
+async def cmd_rejectwithdraw(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    args = context.args
+    if not args:
+        await update.message.reply_text("Usage: <code>/rejectwithdraw &lt;withdrawal_id&gt; [reason]</code>", parse_mode="HTML")
+        return
+    wid    = args[0].upper()
+    reason = " ".join(args[1:]).strip() or "No reason given"
+
+    result = db.reject_withdrawal(wid, reason)
+    if not result["ok"]:
+        reasons = {
+            "not_found":   "No withdrawal request with that ID.",
+            "not_pending": f"That withdrawal is already '{result.get('status','?')}' — can't reject it now.",
+        }
+        await update.message.reply_text(f"❌ {reasons.get(result['reason'], 'Could not process.')}", parse_mode="HTML")
+        return
+
+    w   = result["withdrawal"]
+    bal = db.get_referral_balance(w["user_id"])
+    await update.message.reply_text(
+        f"❌ Withdrawal <code>{wid}</code> rejected — ₦{w['amount']:,} refunded to @{esc(w.get('username') or w['user_id'])}.\n"
+        f"💰 Their balance is now ₦{bal['balance']:,}.",
+        parse_mode="HTML"
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=w["user_id"],
+            text=(
+                f"❌ <b>Withdrawal rejected.</b>\n\n"
+                f"🆔 Reference: <code>{wid}</code>\n"
+                f"Reason: {esc(reason)}\n\n"
+                f"₦{w['amount']:,} has been returned to your referral balance.\n"
+                f"💰 New balance: ₦{bal['balance']:,}"
+            ),
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.warning(f"[Admin] Could not notify user {w['user_id']} of withdrawal rejection: {e}")
