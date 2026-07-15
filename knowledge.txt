@@ -1,0 +1,88 @@
+# knowledge.txt — help agent knowledge base
+#
+# Edit this file and push to GitHub. The bot re-reads it automatically
+# every ~30 minutes (same refresh cycle as scammers.txt), or immediately
+# after a redeploy. Format:
+#
+#   Q: <the question, shown as a suggestion when nothing else matches>
+#   K: <comma-separated keywords/phrases users might actually type>
+#   A: <the answer — can span multiple lines>
+#   ---
+#
+# Keep answers short, plain, and instructional. Add as many entries as
+# you like — just separate each one with a line containing only "---".
+
+Q: How do I set my Bybit API key?
+K: bybit api, api key, set bybit, bybit account, bybit setup, connect bybit
+A: Go to Main Menu -> 🔑 Set APIs -> choose Bybit Account 1 or Account 2, then send your API Key when asked, followed by your API Secret. Your keys are stored securely and are only ever used to act on your own Bybit account.
+---
+
+Q: How do I start the auto price bot?
+K: price bot, auto update, refresh price, start price, ad price bot
+A: Go to Main Menu -> 📊 AD PRICE BOT. Set your Ad ID and UID first, choose Fixed or Floating mode, then tap Start Auto-Update. The bot will keep your ad price refreshed automatically at the interval you set.
+---
+
+Q: How do I turn on Order Monitor?
+K: order monitor, monitor orders, track orders, incoming orders
+A: Go to Main Menu -> 📦 ORDER MONITOR and tap the toggle to turn it on. Once active, the bot watches your incoming P2P orders and alerts you as they come in.
+---
+
+Q: How do I set up Auto-Pay?
+K: auto pay, autopay, automatic payment, auto payment, flutterwave pay, paga pay
+A: Go to Main Menu -> 💳 AUTO-PAY. You can enable Bybit balance auto-pay, Flutterwave auto-pay, or Paga auto-pay depending on which payment API you've connected under Set APIs.
+---
+
+Q: What is Buyer Protection and how do I turn it on?
+K: buyer protection, protect buyer, cancel protection
+A: Buyer Protection flags slow or suspicious seller cancel requests so you get a chance to Accept or Reject them yourself instead of losing coins automatically. Turn it on from the Auto-Pay section and set your threshold in minutes.
+---
+
+Q: What is Name Match?
+K: name match, name matching, buyer name check
+A: Name Match checks the payer's name against the name on file for that order, and against the scammer list, before releasing funds — an extra layer of fraud protection. Toggle it from the Auto-Pay section.
+---
+
+Q: How do I check for scammers or verify a buyer's name?
+K: scammer check, checkname, fraud check, verify buyer, scammer list
+A: Use the /checkname command and send the buyer's name — the bot checks it against the live scammer list. Admins can refresh that list any time with /refreshscammers.
+---
+
+Q: How do I upgrade to Pro?
+K: upgrade, upgrade plan, become pro, pro plan, subscribe
+A: Go to Main Menu -> ⬆️ Upgrade Plan -> Request Upgrade. The admin will review your request and approve it — you'll get a message the moment it's approved.
+---
+
+Q: How do I check my current plan?
+K: my plan, current plan, am i pro, plan status, bot status
+A: Go to Main Menu -> 📡 Bot Status, or just open /menu — your plan (Free or Pro) and expiry date are shown at the top.
+---
+
+Q: How does the referral program work?
+K: referral, refer a friend, referral link, invite friends, referral program
+A: Open Main Menu -> 🎁 Referrals to get your personal invite link. Share it — when someone joins through your link and is later upgraded to Pro, you earn a ₦5,000 commission once the admin approves it. Your Referrals page shows everyone you've invited and their status.
+---
+
+Q: How do I check my referral balance?
+K: my balance, referral balance, how much have i earned, check balance
+A: Open Main Menu -> 🎁 Referrals — your available balance, total lifetime earnings, and full list of people you've referred are shown there.
+---
+
+Q: How do I get paid my referral balance?
+K: withdraw, payout, get paid, cash out, referral payment
+A: Referral payouts are arranged manually with the admin — message them once you have a balance you'd like to withdraw. They'll send your payment and update your balance on the bot.
+---
+
+Q: How do I reset my session?
+K: reset session, reset bot, clear session, restart session
+A: Go to Main Menu -> 🔁 Reset Session. This clears your temporary P2P state (seen orders, running tasks) without touching your saved API keys or settings.
+---
+
+Q: How do I find my public IP for whitelisting?
+K: my ip, whitelist ip, get ip, ip address
+A: Go to Main Menu -> 🌍 Get My IP. Add that IP to the whitelist on your Bybit, Flutterwave, or Paga dashboard so your API keys are allowed to connect.
+---
+
+Q: How do I post or remove an ad?
+K: post ad, remove ad, repost ad, manage ad, ad manager
+A: Open the AD PRICE BOT section and look for the Post/Remove Ad Manager. From there you can clone-post a new ad, repost, or remove an existing one — this is a Pro feature.
+---
