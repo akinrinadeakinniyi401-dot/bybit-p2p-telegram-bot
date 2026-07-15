@@ -32,9 +32,11 @@ NOTE on formatting:
   handler. HTML mode + escaping avoids that entirely.
 """
 
+import asyncio
 import html
 import logging
 import io
+import random
 from datetime import datetime
 from telegram import Update
 from telegram.ext import ContextTypes
@@ -46,6 +48,20 @@ logger = logging.getLogger(__name__)
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
+
+
+async def _typing(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """Show 'typing…' and hold briefly before replying — same behavior as
+    bot.py's _typing(), duplicated here to avoid a circular import
+    (bot.py imports this module, not the other way around)."""
+    try:
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+    except Exception:
+        pass
+    try:
+        await asyncio.sleep(random.uniform(0.5, 1.4))
+    except Exception:
+        pass
 
 
 def esc(value) -> str:
@@ -71,6 +87,7 @@ def _referrer_line(referred_user_id: int) -> str:
 async def cmd_upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
+    await _typing(context, update.effective_chat.id)
     args = context.args
     if len(args) < 2:
         await update.message.reply_text(
@@ -149,6 +166,7 @@ async def cmd_upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_downgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
+    await _typing(context, update.effective_chat.id)
     args = context.args
     if not args:
         await update.message.reply_text("Usage: <code>/downgrade &lt;user_id&gt;</code>", parse_mode="HTML")
@@ -191,6 +209,7 @@ async def cmd_downgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_requests(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
+    await _typing(context, update.effective_chat.id)
     pending = db.get_pending_requests()
     if not pending:
         await update.message.reply_text("📋 No pending upgrade requests.")
@@ -222,6 +241,7 @@ async def cmd_requests(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_listusers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
+    await _typing(context, update.effective_chat.id)
     users = db.get_all_users()
     if not users:
         await update.message.reply_text("No users registered yet.")
@@ -256,6 +276,7 @@ async def cmd_userdata(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Stub — overridden by bot.py's local cmd_userdata definition."""
     if not is_admin(update.effective_user.id):
         return
+    await _typing(context, update.effective_chat.id)
     await update.message.reply_text("⏳ Generating Excel report...")
     try:
         data = db.export_users_to_excel()
@@ -281,6 +302,7 @@ async def cmd_userdata(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_awardref(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
+    await _typing(context, update.effective_chat.id)
     args = context.args
     if not args:
         await update.message.reply_text(
@@ -341,6 +363,7 @@ async def cmd_awardref(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _adjust_balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, sign: int, verb: str):
     if not is_admin(update.effective_user.id):
         return
+    await _typing(context, update.effective_chat.id)
     args = context.args
     if len(args) < 2:
         await update.message.reply_text(
@@ -396,6 +419,7 @@ async def cmd_deductbalance(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_referrals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_user.id):
         return
+    await _typing(context, update.effective_chat.id)
     args = context.args
 
     if args:
