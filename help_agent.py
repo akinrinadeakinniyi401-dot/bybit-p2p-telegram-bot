@@ -4,9 +4,14 @@ help_agent.py — "Agent Nova", the P2P Exchange Bot's local how-to guide.
 No external AI API is used. This matches free-text questions against a
 knowledge base (knowledge.txt) hosted on GitHub — exactly the same pattern
 as fraud_check.py's scammers.txt — using keyword + fuzzy text matching
-(difflib, the same tool fraud_check.py already uses). Edit knowledge.txt
-on GitHub and push; the bot picks up the change on its own refresh cycle
-with no redeploy required (a redeploy also works fine).
+(difflib, the same tool fraud_check.py already uses), plus a lightweight
+Nigerian-pidgin/casual-phrasing normalizer so paraphrased or "pidgin"
+questions (e.g. "why no dey update my ad") still land on the right entry
+without needing a separate knowledge.txt block for every possible way of
+phrasing something.
+
+Edit knowledge.txt on GitHub and push; the bot picks up the change on its
+own refresh cycle with no redeploy required (a redeploy also works fine).
 
 Persona ("Agent Nova") and off-topic wording below are taken directly
 from P2P_Exchange_Bot_Knowledge_Base.md — keep them in sync if that
@@ -28,7 +33,11 @@ only "---":
 
 - Q: is the canonical question — also shown as a "you might be asking"
   suggestion when nothing matches confidently.
-- K: is a comma-separated list of extra keywords/phrases people might type.
+- K: is a comma-separated list of extra keywords/phrases people might type
+  — pack in casual and pidgin variants here too (e.g. "my api dey fail"),
+  not just formally-worded ones. The normalizer in this file also handles
+  common pidgin words automatically, but explicit keywords are still the
+  most reliable signal.
 - A: is the answer. Can span multiple lines until the next Q:/K:/A:/---.
 - Lines starting with # are comments and are ignored.
 
@@ -37,6 +46,7 @@ Usage:
 """
 
 import logging
+import random
 import re
 import threading
 import time
@@ -52,6 +62,7 @@ AGENT_NAME = "Agent Nova"
 
 REFRESH_INTERVAL  = 30 * 60   # same cadence as fraud_check.py
 MATCH_THRESHOLD   = 0.60      # confidence needed to answer directly
+FOLLOWUP_THRESHOLD = 0.50     # slightly more lenient when combined with the last topic
 SUGGESTION_COUNT  = 6         # how many topics to suggest when nothing matches
 
 _entries: list       = []     # [{"question": str, "keywords": [str,...], "answer": str}]
@@ -88,6 +99,54 @@ _GREETING_WORDS = {
     "hi", "hello", "hey", "hiya", "yo", "sup", "howdy",
     "good morning", "good afternoon", "good evening",
 }
+
+# Very short, low-content replies that mean "go on" / "yes" rather than a
+# new question — used to trigger the follow-up path (see _FOLLOWUP_CUES).
+_FOLLOWUP_CUES = {
+    "yes", "yeah", "yep", "ok", "okay", "alright", "sure",
+    "how", "and", "then", "go on", "tell me more", "more",
+    "continue", "please continue", "and then", "what next",
+}
+
+# ─────────────────────────────────────────
+# 🗣️ Casual / Nigerian-pidgin normalization
+# ─────────────────────────────────────────
+# Not a translator — just enough substitution so common casual phrasings
+# score closer to their standard-English equivalent before matching.
+# Multi-word phrases are replaced first (order matters), then single words.
+_PIDGIN_PHRASES = [
+    ("no dey work", "is not working"),
+    ("no dey update", "is not updating"),
+    ("no dey show", "is not showing"),
+    ("no dey send", "is not sending"),
+    ("no dey mark", "is not marking"),
+    ("no dey", "is not"),
+    ("how i fit", "how can i"),
+    ("i fit", "can i"),
+    ("i wan", "i want to"),
+    ("wetin be", "what is"),
+    ("wetin", "what"),
+    ("abeg", "please"),
+    ("how far", "hello"),
+]
+_PIDGIN_WORDS = {
+    "dey":     "is",
+    "fit":     "can",
+    "wan":     "want",
+    "sabi":    "know",
+    "una":     "you",
+    "wahala":  "problem",
+    "waka":    "go",
+    "yarn":    "tell",
+    "shey":    "is",
+    "sef":     "even",
+    "wey":     "that",
+    "dem":     "them",
+    "abi":     "or",
+    "nawa":    "wow",
+    "oga":     "admin",
+}
+
 
 # ─────────────────────────────────────────
 # 🚫 Off-topic / not-allowed filter
@@ -185,10 +244,17 @@ def get_entry_count() -> int:
 
 
 # ─────────────────────────────────────────
-# 🔍 Matching — mirrors fraud_check.py's substring + fuzzy approach
+# 🔍 Matching — mirrors fraud_check.py's substring + fuzzy approach,
+# plus the pidgin normalizer above
 # ─────────────────────────────────────────
 def _normalize(text: str) -> str:
-    return re.sub(r"[^a-z0-9 ]", " ", (text or "").lower()).strip()
+    t = (text or "").lower()
+    t = t.replace("'", "")  # can't -> cant, isn't -> isnt — do this before anything else
+    for phrase, repl in _PIDGIN_PHRASES:
+        t = t.replace(phrase, repl)
+    t = re.sub(r"[^a-z0-9 ]", " ", t)
+    words = [_PIDGIN_WORDS.get(w, w) for w in t.split()]
+    return " ".join(words).strip()
 
 
 def _is_greeting(text: str) -> bool:
@@ -201,6 +267,11 @@ def _is_greeting(text: str) -> bool:
     return len(norm.split()) <= 3 and any(norm.startswith(g) for g in _GREETING_WORDS)
 
 
+def _is_followup_cue(text: str) -> bool:
+    norm = _normalize(text)
+    return bool(norm) and (norm in _FOLLOWUP_CUES) and len(norm.split()) <= 3
+
+
 def _score(user_text: str, entry: dict) -> float:
     norm = _normalize(user_text)
     if not norm:
@@ -208,61 +279,98 @@ def _score(user_text: str, entry: dict) -> float:
 
     kw_score = 0.0
     for kw in entry["keywords"]:
-        if not kw or kw not in norm:
+        if not kw:
+            continue
+        # Normalize the keyword the same way as the user's text — otherwise
+        # a keyword like "my api dey fail" never matches normalized input
+        # like "my api is fail" (pidgin substitution already applied to
+        # one side but not the other).
+        kw_norm = _normalize(kw)
+        if not kw_norm or kw_norm not in norm:
             continue
         # Multi-word phrases are specific and reliable signals. Single
         # generic words (e.g. "status", "account") are common across many
         # entries, so they only get a modest boost rather than dominating.
-        weight = 0.92 if (" " in kw and len(kw) >= 6) else 0.55
+        weight = 0.92 if (" " in kw_norm and len(kw_norm) >= 6) else 0.55
         kw_score = max(kw_score, weight)
 
     fuzzy_score = SequenceMatcher(None, norm, _normalize(entry["question"])).ratio()
     return max(kw_score, fuzzy_score)
 
 
-def _capability_list() -> str:
-    refresh_if_stale()
-    sample = [e["question"] for e in _entries[:SUGGESTION_COUNT]]
-    if not sample:
-        sample = _FALLBACK_TOPICS
-    return "\n".join(f"• {q}" for q in sample)
-
-
-def answer_question(text: str) -> str:
-    """
-    Main entry point. Returns the HTML-safe reply text to send.
-    Never returns an empty string — always returns something useful,
-    including a plain list of likely topics (no buttons) when nothing
-    in the knowledge base confidently matches.
-    """
-    refresh_if_stale()
-
-    if is_disallowed(text):
-        return disallowed_reply()
-
-    if _is_greeting(text):
-        return f"{GREETING}\n\n{_capability_list()}"
-
-    if not _entries:
-        return (
-            "I'm still loading my help guide — try again in a moment, "
-            f"or ask the admin directly. {CONTACT_LINE}"
-        )
-
-    best_entry = None
-    best_score = 0.0
+def _best_match(text: str):
+    best_entry, best_score = None, 0.0
     for entry in _entries:
         s = _score(text, entry)
         if s > best_score:
             best_score = s
             best_entry = entry
+    return best_entry, best_score
+
+
+def _capability_list() -> str:
+    refresh_if_stale()
+    if not _entries:
+        sample = _FALLBACK_TOPICS
+    else:
+        pool = [e["question"] for e in _entries]
+        sample = random.sample(pool, k=min(SUGGESTION_COUNT, len(pool)))
+    return "\n".join(f"• {q}" for q in sample)
+
+
+def answer_question(text: str, last_topic: str = None):
+    """
+    Main entry point. Returns (reply_text, matched_topic):
+      - reply_text is the HTML-safe string to send. Never empty — always
+        something useful, including a plain list of likely topics (no
+        buttons) when nothing in the knowledge base confidently matches.
+      - matched_topic is the canonical Q: text of whatever matched (or
+        None), so the caller can pass it back in as `last_topic` on the
+        person's next message — this lets a short follow-up like "how"
+        or "ok tell me more" still resolve to the same topic instead of
+        being treated as a brand new, unmatched question.
+
+    Callers that don't need follow-up memory can ignore the second value.
+    """
+    refresh_if_stale()
+
+    if is_disallowed(text):
+        return disallowed_reply(), None
+
+    if _is_greeting(text):
+        return f"{GREETING}\n\n{_capability_list()}", None
+
+    if not _entries:
+        return (
+            "I'm still loading my help guide — try again in a moment, "
+            f"or ask the admin directly. {CONTACT_LINE}"
+        ), None
+
+    # A bare "yes"/"how"/"tell me more" isn't a new question — if we know
+    # what topic they were just looking at, re-serve that answer instead
+    # of falling through to the generic off-topic message.
+    if last_topic and _is_followup_cue(text):
+        for entry in _entries:
+            if entry["question"] == last_topic:
+                return entry["answer"], last_topic
+
+    best_entry, best_score = _best_match(text)
+
+    # If scoring alone falls just short, try scoring the message combined
+    # with the previous topic — catches short follow-ups that add a
+    # missing detail (e.g. previous: "how do i set my ad id", next: "the
+    # interval one") without a full standalone match on their own.
+    if (not best_entry or best_score < MATCH_THRESHOLD) and last_topic:
+        combined_entry, combined_score = _best_match(f"{last_topic} {text}")
+        if combined_entry and combined_score >= FOLLOWUP_THRESHOLD and combined_score > best_score:
+            best_entry, best_score = combined_entry, combined_score
 
     if best_entry and best_score >= MATCH_THRESHOLD:
-        return best_entry["answer"]
+        return best_entry["answer"], best_entry["question"]
 
     return (
         f"{OFF_TOPIC_MESSAGE}\n\n"
         f"{CAPABILITIES_INTRO}\n\n"
         f"{_capability_list()}\n\n"
         f"{CONTACT_LINE}"
-    )
+    ), None
