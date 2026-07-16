@@ -5939,7 +5939,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # list of things the agent can help with instead.
         await _typing(context, update.effective_chat.id)
 
-        reply_text = help_agent.answer_question(text)
+        last_topic = _state.get("last_help_topic")
+        reply_text, matched_topic = help_agent.answer_question(text, last_topic=last_topic)
+        _state["last_help_topic"] = matched_topic  # None clears it — next message starts fresh
+
         await asyncio.sleep(min(2.0, len(reply_text) / 500))
 
         try:
