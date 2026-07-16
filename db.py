@@ -564,6 +564,7 @@ def record_referral_join(new_user_id: int, referrer_id: int, username: str, disp
 
         refs = _read_referrals()
         refs[str(new_user_id)] = {
+            "referred_user_id":      new_user_id,
             "referrer_id":           referrer_id,
             "referred_username":     username or "",
             "referred_display_name": display_name or "",
@@ -591,6 +592,19 @@ def get_referrals_for(referrer_id: int) -> list:
     refs = _read_referrals()
     rows = [r for r in refs.values() if r.get("referrer_id") == referrer_id]
     rows.sort(key=lambda r: r.get("joined_at", ""), reverse=True)
+    return rows
+
+def get_pending_referrals_for_referrer(referrer_id: int) -> list:
+    """Pending (uncommissioned) referrals where this user is the REFERRER —
+    used so /awardref can accept the referrer's own ID, not just the
+    referred user's ID, and still find the right record(s) to approve."""
+    refs = _read_referrals()
+    rows = [
+        {**r, "referred_user_id": r.get("referred_user_id") or int(k)}
+        for k, r in refs.items()
+        if r.get("referrer_id") == referrer_id and r.get("reward_status") == "pending"
+    ]
+    rows.sort(key=lambda r: r.get("joined_at", ""))
     return rows
 
 def mark_reward_pending(referred_user_id: int, reward_amount: int):
@@ -663,6 +677,13 @@ def adjust_balance(user_id: int, delta: int):
     from a user's referral balance — used after an off-bot bank payout, or
     to correct mistakes. Floored at 0. Returns the updated referral block,
     or None if the user doesn't exist.
+
+    A positive delta also adds to total_earned (lifetime) — from the
+    user's point of view, money the admin credits to their balance is
+    "earned" regardless of whether it came through /awardref or a manual
+    top-up, so both paths keep that figure consistent. Deductions (e.g.
+    correcting a mistake) do NOT reduce total_earned — it's a lifetime
+    total, not a running balance.
     """
     with _lock:
         user = _read_json(_user_path(user_id))
@@ -670,6 +691,8 @@ def adjust_balance(user_id: int, delta: int):
             return None
         _ensure_referral_block(user)
         user["referral"]["balance"] = max(0, user["referral"]["balance"] + delta)
+        if delta > 0:
+            user["referral"]["total_earned"] += delta
         _write_json(_user_path(user_id), user)
         logger.info(f"[Referral] balance for {user_id} adjusted by {delta:+d} -> ₦{user['referral']['balance']}")
         return user["referral"]
