@@ -9,8 +9,8 @@ Commands:
   /listusers                      — list all users with plan status
 
   /referrals [user_id]              — referral analytics overview, or one user's detail
-  /awardref <referred_user_id>      — approve a pending referral commission (moves it
-                                       from "pending" into the referrer's available balance)
+  /awardref <user_id>                — approve a pending referral commission (accepts
+                                        either the referrer's ID or the referred user's ID)
   /addbalance <user_id> <amount>    — add NGN to a user's referral balance
   /deductbalance <user_id> <amount> — deduct NGN from a user's referral balance
 
@@ -108,9 +108,9 @@ async def cmd_upgrade(update: Update, context: ContextTypes.DEFAULT_TYPE):
             rname = esc(referrer.get("username") or referrer.get("display_name") or str(referrer_id)) if referrer else str(referrer_id)
             ref_line = (
                 f"\n🎁 <b>Referral commission pending!</b>\n"
-                f"This user was referred by @{rname} (<code>{referrer_id}</code>).\n"
-                f"💰 ₦{REFERRAL_REWARD_NGN:,} is now owed.\n"
-                f"Approve payout: <code>/awardref {target_id}</code>\n"
+                f"This user (<code>{target_id}</code>) was referred by @{rname} — "
+                f"the ₦{REFERRAL_REWARD_NGN:,} commission goes to @{rname}, not this user.\n"
+                f"Approve payout to @{rname}: <code>/awardref {referrer_id}</code>\n"
             )
 
     try:
@@ -276,30 +276,63 @@ async def cmd_userdata(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────
-# /awardref <referred_user_id> — approve a pending referral commission
+# /awardref <user_id> — approve a pending referral commission (referrer ID or referred-user ID)
 # ─────────────────────────────────────────
 async def cmd_awardref(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Approves a pending referral commission — pays the REFERRER (the person
+    who invited someone), not the new user. You can pass either ID:
+      - The referrer's own user_id (the person who should get paid) — the
+        common case, since that's who you're thinking of when you approve.
+      - OR the referred user's ID (the invitee who just upgraded) — this
+        is what /requests and the /upgrade confirmation message show you.
+    If a referrer has more than one pending commission, this lists them
+    so you can pick the specific one with the referred user's ID.
+    """
     if not is_admin(update.effective_user.id):
         return
     args = context.args
     if not args:
         await update.message.reply_text(
-            "Usage: <code>/awardref &lt;referred_user_id&gt;</code>\n\n"
-            "Tip: this ID is the person who WAS referred (the new Pro user), "
-            "not the referrer — you'll find it on their upgrade confirmation message.",
+            "Usage: <code>/awardref &lt;user_id&gt;</code>\n\n"
+            "You can pass EITHER the referrer's ID (the person to be paid) "
+            "OR the referred user's ID (the invitee who just upgraded) — "
+            "either one works.",
             parse_mode="HTML"
         )
         return
     try:
-        referred_id = int(args[0])
+        given_id = int(args[0])
     except ValueError:
         await update.message.reply_text("❌ Invalid user ID.", parse_mode="HTML")
         return
 
-    result = db.approve_referral_reward(referred_id)
+    # First try: treat given_id as the REFERRED user (original behavior).
+    result = db.approve_referral_reward(given_id)
+
+    # If that didn't work because there's simply no referral record under
+    # this ID, the admin may have passed the REFERRER's ID instead — check
+    # for that before giving up.
+    if not result["ok"] and result["reason"] == "no_referral":
+        pending = db.get_pending_referrals_for_referrer(given_id)
+        if len(pending) == 1:
+            result = db.approve_referral_reward(pending[0]["referred_user_id"])
+        elif len(pending) > 1:
+            lines = [
+                f"@{esc(db.get_user(given_id).get('username','?') if db.get_user(given_id) else given_id)} "
+                f"has {len(pending)} pending commissions — specify which one:\n"
+            ]
+            for p in pending:
+                lines.append(
+                    f"• <code>/awardref {p['referred_user_id']}</code> — "
+                    f"{esc(p.get('referred_username') or '?')} (₦{p.get('reward_amount',0):,})"
+                )
+            await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+            return
+
     if not result["ok"]:
         reasons = {
-            "no_referral":      "That user has no referral record on file.",
+            "no_referral":      "No pending referral commission found for that ID — checked it both as a referrer and as a referred user.",
             "already_approved": f"Already approved — ₦{result['amount']:,} was already added to the referrer's balance.",
             "not_pending":      "This referral isn't pending yet — the referred user may not have been upgraded to Pro yet.",
             "referrer_missing": "The referrer's account could not be found in the database.",
@@ -314,8 +347,8 @@ async def cmd_awardref(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bal         = db.get_referral_balance(referrer_id)
 
     await update.message.reply_text(
-        f"✅ ₦{amount:,} commission approved for @{uname} (<code>{referrer_id}</code>).\n"
-        f"💰 New available balance: ₦{bal['balance']:,}",
+        f"✅ ₦{amount:,} commission approved for @{uname} (<code>{referrer_id}</code>) — this is the person who made the referral.\n"
+        f"💰 Their new available balance: ₦{bal['balance']:,}",
         parse_mode="HTML"
     )
 
