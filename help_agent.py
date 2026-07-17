@@ -127,20 +127,51 @@ CLOSING_REPLY = "You're welcome! You can reach out to me any time you need furth
 # score closer to their standard-English equivalent before matching.
 # Multi-word phrases are replaced first (order matters), then single words.
 _PIDGIN_PHRASES = [
+    # "not working" family
     ("no dey work", "is not working"),
     ("no dey update", "is not updating"),
     ("no dey show", "is not showing"),
     ("no dey send", "is not sending"),
     ("no dey mark", "is not marking"),
+    ("no dey connect", "is not connecting"),
+    ("no dey respond", "is not responding"),
+    ("no dey open", "is not opening"),
+    ("no dey save", "is not saving"),
+    ("e no work", "it is not working"),
+    ("e no dey work", "it is not working"),
+    ("e no dey show", "it is not showing"),
     ("no dey", "is not"),
+    # ability / permission
     ("how i fit", "how can i"),
+    ("how you fit", "how can you"),
     ("i fit", "can i"),
+    ("you fit", "can you"),
+    ("i no fit", "i cannot"),
+    ("i no sabi", "i do not know"),
+    # wants / needs
     ("i wan", "i want to"),
+    ("i wan sabi", "i want to know"),
+    ("i need make", "i need to"),
+    ("make i", "let me"),
+    ("make you", "please"),
+    ("gimme", "give me"),
+    ("gi mi", "give me"),
+    # question openers
     ("wetin be", "what is"),
-    ("wetin", "what"),
-    ("abeg", "please"),
+    ("wetin dey happen", "what is happening"),
+    ("wetin i go do", "what should i do"),
+    ("how e go be", "how will it be"),
+    ("how i go do am", "how do i do it"),
     ("how far", "hello"),
-    # Common one-word merges of two-word feature names
+    ("wetin", "what"),
+    # politeness / filler
+    ("abeg help", "please help"),
+    ("abeg", "please"),
+    ("abeg no vex", "please do not be upset"),
+    ("na so", "that is how it is"),
+    ("na wa o", "wow"),
+    ("help me sha", "please help me"),
+    # common one-word merges of two-word feature names
     ("autopay",     "auto pay"),
     ("auto-pay",    "auto pay"),
 ]
@@ -160,6 +191,21 @@ _PIDGIN_WORDS = {
     "abi":     "or",
     "nawa":    "wow",
     "oga":     "admin",
+    "chai":    "wow",
+    "omo":     "wow",
+    "sha":     "just",
+    "kuku":    "just",
+    "vex":     "upset",
+    "yeye":    "useless",
+    "wetin":   "what",
+    "wia":     "where",
+    "wusai":   "where",
+    "nawao":   "wow",
+    "gan":     "really",
+    "bam":     "immediately",
+    "sharp":   "quickly",
+    "jare":    "please",
+    "abegi":   "please",
 }
 
 
@@ -259,9 +305,27 @@ def get_entry_count() -> int:
 
 
 # ─────────────────────────────────────────
-# 🔍 Matching — mirrors fraud_check.py's substring + fuzzy approach,
-# plus the pidgin normalizer above
+# 🔍 Matching — content-word overlap (not raw character similarity)
 # ─────────────────────────────────────────
+# Character-level fuzzy matching (e.g. plain difflib on full sentences) is
+# unreliable here: "How to get my IP" and "How do I upgrade my plan?" share
+# enough letters/structure ("how", "my", sentence shape) to score deceptively
+# high even though they're about completely different things. Instead:
+# strip out generic connector words (how/what/who/is/do/my/the/...), keep
+# only the words that actually carry the topic ("get", "ip" / "upgrade",
+# "plan"), and score by how much of the user's real content is covered by
+# an entry's question + keywords — regardless of word order or exact
+# phrasing. This is also why the keyword lists in knowledge.txt matter:
+# every extra phrase you add there (including pidgin ones) directly grows
+# each entry's content-word pool.
+_STOPWORDS = {
+    "a", "an", "the", "to", "of", "in", "on", "for", "and", "or", "is", "are",
+    "was", "were", "do", "does", "did", "i", "my", "me", "you", "your", "it",
+    "its", "this", "that", "am", "be", "been", "with", "how", "what", "who",
+    "whom", "why", "when", "where", "which", "so", "if", "as", "at", "by",
+}
+
+
 def _normalize(text: str) -> str:
     t = (text or "").lower()
     t = t.replace("'", "")  # can't -> cant, isn't -> isnt — do this before anything else
@@ -270,6 +334,26 @@ def _normalize(text: str) -> str:
     t = re.sub(r"[^a-z0-9 ]", " ", t)
     words = [_PIDGIN_WORDS.get(w, w) for w in t.split()]
     return " ".join(words).strip()
+
+
+def _content_words(norm_text: str) -> set:
+    """The words in a normalized string that actually carry topic meaning —
+    everything except generic connector/question words."""
+    return {w for w in norm_text.split() if w not in _STOPWORDS and len(w) > 1}
+
+
+def _entry_content_words(entry: dict) -> set:
+    """All content words from an entry's question + every keyword phrase,
+    cached on the entry dict after the first call (rebuilt each time
+    knowledge.txt reloads, since _entries is replaced wholesale then)."""
+    cached = entry.get("_content_words")
+    if cached is not None:
+        return cached
+    words = set(_content_words(_normalize(entry["question"])))
+    for kw in entry["keywords"]:
+        words |= _content_words(_normalize(kw))
+    entry["_content_words"] = words
+    return words
 
 
 def _is_greeting(text: str) -> bool:
@@ -304,25 +388,37 @@ def _score(user_text: str, entry: dict) -> float:
     if not norm:
         return 0.0
 
+    # 1) Explicit keyword hit — an exact phrase from knowledge.txt appearing
+    #    verbatim (after normalization) in the user's message. Still the
+    #    strongest, most deliberate signal a maintainer can give.
     kw_score = 0.0
     for kw in entry["keywords"]:
         if not kw:
             continue
-        # Normalize the keyword the same way as the user's text — otherwise
-        # a keyword like "my api dey fail" never matches normalized input
-        # like "my api is fail" (pidgin substitution already applied to
-        # one side but not the other).
         kw_norm = _normalize(kw)
         if not kw_norm or kw_norm not in norm:
             continue
-        # Multi-word phrases are specific and reliable signals. Single
-        # generic words (e.g. "status", "account") are common across many
-        # entries, so they only get a modest boost rather than dominating.
-        weight = 0.92 if (" " in kw_norm and len(kw_norm) >= 6) else 0.55
+        weight = 0.95 if len(_content_words(kw_norm)) >= 2 else 0.65
         kw_score = max(kw_score, weight)
 
-    fuzzy_score = SequenceMatcher(None, norm, _normalize(entry["question"])).ratio()
-    return max(kw_score, fuzzy_score)
+    # 2) Content-word overlap — what fraction of the MEANINGFUL words in
+    #    the user's message are covered by this entry's question/keywords,
+    #    in any order, any phrasing. This is what actually fixes cases like
+    #    "how to get my ip" vs "how to upgrade my plan": once "how", "to",
+    #    "my" are stripped out as noise, the remaining words ("get", "ip"
+    #    vs "upgrade", "plan") don't overlap with the wrong entry at all.
+    query_words = _content_words(norm)
+    token_score = 0.0
+    if query_words:
+        entry_words = _entry_content_words(entry)
+        token_score = len(query_words & entry_words) / len(query_words)
+
+    # 3) Light fuzzy fallback — catches typos and near-identical phrasing
+    #    that content-word overlap might miss, but heavily down-weighted so
+    #    it can never win purely on sentence-shape/character similarity.
+    fuzzy_score = SequenceMatcher(None, norm, _normalize(entry["question"])).ratio() * 0.55
+
+    return max(kw_score, token_score, fuzzy_score)
 
 
 def _best_match(text: str):
