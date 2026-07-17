@@ -100,13 +100,25 @@ _GREETING_WORDS = {
     "good morning", "good afternoon", "good evening",
 }
 
-# Very short, low-content replies that mean "go on" / "yes" rather than a
-# new question — used to trigger the follow-up path (see _FOLLOWUP_CUES).
+# Very short, low-content replies that mean "go on" / "give me more" rather
+# than a new question — used to trigger the follow-up path.
 _FOLLOWUP_CUES = {
-    "yes", "yeah", "yep", "ok", "okay", "alright", "sure",
-    "how", "and", "then", "go on", "tell me more", "more",
-    "continue", "please continue", "and then", "what next",
+    "yes", "yeah", "yep", "how", "and", "then", "go on",
+    "tell me more", "more", "continue", "please continue",
+    "and then", "what next",
 }
+
+# Replies that mean the person is satisfied and done, NOT asking for more —
+# these get a fixed closing reply instead of being treated as a new
+# question or a request to continue.
+_CLOSING_CUES = {
+    "ok", "okay", "alright", "alright then", "sure", "fine", "cool",
+    "thanks", "thank you", "thanks a lot", "thank you so much",
+    "thank you for your assistance", "thank you for your help",
+    "understood", "got it", "noted", "nice one", "great thanks",
+}
+
+CLOSING_REPLY = "You're welcome! You can reach out to me any time you need further assistance. 😊"
 
 # ─────────────────────────────────────────
 # 🗣️ Casual / Nigerian-pidgin normalization
@@ -128,6 +140,9 @@ _PIDGIN_PHRASES = [
     ("wetin", "what"),
     ("abeg", "please"),
     ("how far", "hello"),
+    # Common one-word merges of two-word feature names
+    ("autopay",     "auto pay"),
+    ("auto-pay",    "auto pay"),
 ]
 _PIDGIN_WORDS = {
     "dey":     "is",
@@ -272,6 +287,18 @@ def _is_followup_cue(text: str) -> bool:
     return bool(norm) and (norm in _FOLLOWUP_CUES) and len(norm.split()) <= 3
 
 
+def _is_closing_cue(text: str) -> bool:
+    norm = _normalize(text)
+    if not norm:
+        return False
+    if norm in _CLOSING_CUES:
+        return True
+    # Allow short variations like "ok thanks" / "alright thank you"
+    return len(norm.split()) <= 6 and any(
+        norm == c or norm.startswith(c) or norm.endswith(c) for c in _CLOSING_CUES
+    )
+
+
 def _score(user_text: str, entry: dict) -> float:
     norm = _normalize(user_text)
     if not norm:
@@ -336,6 +363,9 @@ def answer_question(text: str, last_topic: str = None):
 
     if is_disallowed(text):
         return disallowed_reply(), None
+
+    if _is_closing_cue(text):
+        return CLOSING_REPLY, None
 
     if _is_greeting(text):
         return f"{GREETING}\n\n{_capability_list()}", None
