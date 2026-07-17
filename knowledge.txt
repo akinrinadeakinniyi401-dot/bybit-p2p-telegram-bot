@@ -29,12 +29,17 @@
 ### GENERAL / GETTING STARTED (FAQ 1-8, 10, 14-15) ###
 
 Q: What is this bot and what does it do?
-K: what is this bot, what does this bot do, what is agent nova, what can this bot do, bot description
+K: what is this bot, what does this bot do, what is agent nova, what can this bot do, bot description, what can you do, what do you do
 A: 👋 I'm Agent Nova, your P2P Exchange Assistant. This bot automates Bybit P2P trading for you — it can auto-update your ad prices, monitor incoming orders in real time, auto-pay buyers, protect you from slow-releasing buyers, check names against a fraud/scammer list, and more. Everything runs from the /menu dashboard.
 ---
 
+Q: What is your name?
+K: what is your name, who are you, whats your name, your name
+A: My name is Agent Nova — I'm your P2P Exchange Assistant! I'm here to help you understand and use every feature of this bot.
+---
+
 Q: How do I start using the bot and open the main menu?
-K: how do i start using the bot, how do i open the main menu, getting started, new user, how to start, first steps, setup guide, onboarding, before i can use the bot
+K: how do i start using the bot, how do i open the main menu, getting started, new user, how to start, first steps, setup guide, onboarding, before i can use the bot, how to use the bot, how to use this bot, how does this bot work
 A: Open /menu to see your dashboard — it shows your Telegram User ID, current plan, active Bybit account, and a setup progress counter (0/5 to 5/5). Quickest path: 1) Set your Bybit API key under API Settings (free). 2) Request an upgrade if you want Pro features. 3) Set your AD ID in the AD Price Bot section. 4) Fetch your AD details. 5) Start Order Monitor. Only one Bybit account can be active at a time.
 ---
 
@@ -185,6 +190,11 @@ K: what is set ad id, why do i need fetch ad details, fetch ad details required,
 A: Set AD ID is where you paste in the Advertisement ID copied from My Ads List — the bot saves it as the one it will manage. Fetch AD Details then pulls the ad's payment methods, currency, and current settings from Bybit — this step is required before any editing, posting, or price updates can begin.
 ---
 
+Q: How do I set my Bybit UID in the bot?
+K: how do i set my uid, how to set my uid in the bot, set my uid, bybit uid, where do i find my uid
+A: Your Bybit UID is the numeric ID on your Bybit P2P profile page (tap your username/avatar on any P2P ad to see it). Set it alongside your Ad ID in the AD Price Bot section — the bot uses it to correctly match incoming orders and buyer/seller details to your account.
+---
+
 Q: Why isn't my ad updating / why no dey update my ad?
 K: why isnt my ad updating, why no dey update my ad, ad not updating, price bot not working, ad price stuck
 A: Common causes: Auto Update hasn't been started yet (tap Start Auto Update), AD Details haven't been fetched (do that first), your Bybit API permissions don't cover P2P ad editing, or (for Floating Mode) your NGN/USDT reference price hasn't been set. Check each of these in order.
@@ -262,10 +272,15 @@ K: what is sell message, how do i set my sell message, set message count, auto m
 A: Sell Message automatically sends a message to the buyer on every new Sell order. Use Set Sell Message to save the exact text sent, and Set Message Count to choose how many times it repeats (e.g. "3" sends it three times).
 ---
 
+Q: How do I release an order?
+K: how to release order, how to release sell order, how do i release an order, release crypto to buyer, confirm payment received, release coins
+A: Releasing an order means confirming you've received payment and releasing the crypto to the buyer — this is done on the order screen in the Bybit P2P app itself (tap Confirm/Release once funds show in your bank account). The bot supports you around this: Order Monitor alerts you the moment a new order comes in, Sell Message can auto-notify the buyer while you wait, and Buyer Protection flags buyers with a history of slow releases so you know to double-check before releasing.
+---
+
 ### AUTO PAY (FAQ 87-96) ###
 
 Q: What is Auto Pay and does it send money?
-K: what is auto pay, does auto pay send money, how does auto pay work, bot no dey mark paid
+K: what is auto pay, does auto pay send money, how does auto pay work, bot no dey mark paid, how to use auto pay, how do i use auto pay
 A: Auto Pay works together with Order Monitor — when a Buy order is detected, Auto Pay performs whichever actions you've enabled. Enable Auto Pay (Bybit) only marks the order as Paid on Bybit; it does NOT send money by itself. To actually move money automatically you need Flutterwave Pay or Paga Pay enabled, each with its own API set up first. If the bot isn't marking orders paid, check that Order Monitor is running and Auto Pay (Bybit) is toggled on.
 ---
 
@@ -297,7 +312,7 @@ A: Buy Volume (24 Hours), inside the Auto Pay section, displays your total Buy v
 ### REFERRALS & WITHDRAWALS (FAQ 97-99) ###
 
 Q: How do referrals work and where is my referral link?
-K: how do referrals work, where is my referral link, how do i earn referral commission, referral program, invite friends, check my balance, check referral balance, how much have i earned, my referral balance, view my earnings
+K: how do referrals work, where is my referral link, how do i earn referral commission, referral program, invite friends, check my balance, check referral balance, how much have i earned, my referral balance, view my earnings, how much will i earn per referral, how much do i earn per referral, referral commission amount, how much per referral
 A: Every user gets a unique referral link, found under Main Menu -> 🎁 Referrals. Invite people using it — whenever someone you referred upgrades to Pro, you earn a ₦5,000 commission once the admin approves it. Your Referrals dashboard shows Total Referrals, how many Upgraded to Pro, your Available Balance, and Lifetime Earnings.
 ---
 
