@@ -1,354 +1,502 @@
-# knowledge.txt — Agent Nova's knowledge base
-#
-# Source: P2P_Exchange_Bot_Knowledge_Base.md (feature reference) and
-# Agent_Nova_FAQ_Training_Questions.md (the 108 questions this file is
-# built to answer). Every numbered question from that FAQ file maps to
-# one of the entries below — most entries answer several of the numbered
-# questions at once, since many of them are just different phrasings of
-# the same underlying topic.
-#
-# Architecture note for whoever maintains this: keep everything in ONE
-# file like this rather than splitting into per-section files on GitHub.
-# The bot does a single HTTP fetch and treats every entry as flat and
-# independent — splitting into multiple files would mean multiple fetches,
-# more moving parts, and no real benefit, since organization here is just
-# for human readability (the ### section comments below), not function.
-# A single file stays easy to search, diff, and edit even at several
-# hundred entries.
-#
-# Format — one entry per block, separated by a line containing only "---":
-#
-#   Q: <the question, shown as a suggestion when nothing else matches>
-#   K: <comma-separated keywords/phrases users might actually type —
-#       include casual and pidgin variants here, not just formal ones>
-#   A: <the answer — can span multiple lines>
-#   ---
-#
-# Lines starting with # are comments and are ignored.
-
-### GENERAL / GETTING STARTED (FAQ 1-8, 10, 14-15) ###
-
-Q: What is this bot and what does it do?
-K: what is this bot, what does this bot do, what is agent nova, what can this bot do, bot description, what can you do, what do you do
-A: 👋 I'm Agent Nova, your P2P Exchange Assistant. This bot automates Bybit P2P trading for you — it can auto-update your ad prices, monitor incoming orders in real time, auto-pay buyers, protect you from slow-releasing buyers, check names against a fraud/scammer list, and more. Everything runs from the /menu dashboard.
----
-
-Q: What is your name?
-K: what is your name, who are you, whats your name, your name
-A: My name is Agent Nova — I'm your P2P Exchange Assistant! I'm here to help you understand and use every feature of this bot.
----
-
-Q: How do I start using the bot and open the main menu?
-K: how do i start using the bot, how do i open the main menu, getting started, new user, how to start, first steps, setup guide, onboarding, before i can use the bot, how to use the bot, how to use this bot, how does this bot work
-A: Open /menu to see your dashboard — it shows your Telegram User ID, current plan, active Bybit account, and a setup progress counter (0/5 to 5/5). Quickest path: 1) Set your Bybit API key under API Settings (free). 2) Request an upgrade if you want Pro features. 3) Set your AD ID in the AD Price Bot section. 4) Fetch your AD details. 5) Start Order Monitor. Only one Bybit account can be active at a time.
----
-
-Q: What features does the bot have?
-K: what features does the bot have, can this bot automate my p2p trading, list of features, what can i do with this bot
-A: The bot covers: AD Price Bot (auto price updates), Post/Remove Ad, Order Monitor + Chat Monitor, Auto Pay (Bybit, Flutterwave, Paga), Buyer Protection, Buy Volume analytics, a scammer/fraud checker, a referral program with withdrawals, and full API management for Bybit, Flutterwave, and Paga. Yes — it's built specifically to automate P2P trading end to end.
----
-
-Q: Is the bot safe to use?
-K: is the bot safe to use, is this bot secure, is my api key safe, data safety
-A: Your API keys are stored securely and are only ever used to act on your own account — they're never shared. Features like Buyer Protection, Name Match, and the scammer checklist exist specifically to protect you from fraud during trading. As with any API key, only whitelist the IPs you need and never share your keys with anyone else, including people claiming to be support.
----
-
-Q: Can I use the bot on my phone?
-K: can i use the bot on my phone, mobile use, telegram on phone
-A: Yes — this is a Telegram bot, so it works anywhere Telegram works: phone, tablet, or desktop. There's nothing to install beyond the Telegram app itself.
----
-
-Q: Does the bot only work with Bybit?
-K: does the bot only work with bybit, other exchanges, non bybit exchange
-A: The P2P trading and ad automation features are built specifically for Bybit. Flutterwave and Paga are supported separately as payment rails for Auto Pay (sending money to buyers), not as trading platforms.
----
-
-Q: How do I contact support or get help?
-K: how do i contact support, where can i get help, contact admin, talk to owner, need human help
-A: I can answer most questions about how the bot works right here. For anything I can't help with, or for account-specific issues (like approving upgrades or fixing a stuck request), message the bot owner directly.
----
-
-### SUBSCRIPTION / PLAN (FAQ 11-13) ###
-
-Q: Do I need a subscription and what plan am I currently using?
-K: do i need a subscription, what plan am i currently using, am i pro, my plan, current plan, plan status, bot status
-A: Basic setup (API key management) is free. Most automation features — AD Price Bot, Order Monitor, Auto Pay, Buyer Protection, ad posting — are Pro-only. Check /menu or Bot Status to see your current plan and expiry date.
----
-
-Q: How do I upgrade my plan?
-K: how do i upgrade my plan, upgrade, upgrade plan, become pro, pro plan, subscribe
-A: New users can request a subscription upgrade from the Upgrade Plan menu. The admin reviews your request and approves it manually — you'll get a message the moment it's approved.
----
-
-### SETUP PROGRESS (FAQ 16-24) ###
-
-Q: How do I complete setup and what does my setup progress mean?
-K: how do i complete the setup, why does my setup show 2 5, what does 5 5 setup mean, which setup should i do first, can i skip any setup step, how do i know setup is complete, setup progress explained
-A: Your dashboard shows setup progress from 0/5 to 5/5. Each number represents one completed step: 1) Bybit API connected, 2) AD ID set, 3) AD details fetched, 4) Order Monitor started, 5) at least one automation (price bot or auto-pay) turned on. If you're at 2/5, it means you've done the first two but not the rest yet — you can't really skip steps like Fetch AD Details, since later features depend on it. Do them in order and your progress will climb to 5/5.
----
-
-Q: Why are some features locked or why can't I use some buttons?
-K: why are some features locked, why cant i use some buttons, feature locked, button not working, greyed out button
-A: Two common reasons: 1) The feature is Pro-only and you're still on the Free plan — request an upgrade. 2) A step earlier in setup hasn't been done yet (e.g. trying to start Auto Update before fetching AD details). Check your setup progress on /menu to see what's still missing.
----
-
-Q: What should I do after connecting my API?
-K: what should i do after connecting my api, next step after api, after api setup
-A: After connecting your Bybit API and confirming it with /pingbybit, head to the AD Price Bot section: open My Ads List, set your Ad ID, then Fetch AD Details. From there you can start the price bot and Order Monitor.
----
-
-### BYBIT API (FAQ 26-35) ###
-
-Q: How do I connect my Bybit API?
-K: how do i connect my bybit api, connect bybit, set bybit api, bybit setup, bybit account
-A: Go to API Settings -> Set Bybit Account 1 API (or Account 2). Paste your API Key, then your Secret Key when prompted. Run /pingbybit afterward to confirm the connection works.
----
-
-Q: Where do I get my Bybit API Key and Secret Key?
-K: where do i get my api key, where do i get my secret key, bybit api dashboard, create bybit api key
-A: On Bybit, go to your account's API Management page and create a new API key there. Bybit will show you the API Key and Secret Key together only once at creation — copy both immediately and paste them into the bot under API Settings.
----
-
-Q: Why is my Bybit API connection failing / my api dey fail?
-K: why is my api connection failing, my api dey fail, my bybit api dey fail, bybit connection error, api not working, bybit api fail, my bybit api isnt working, my bybit api is not working, api isnt working what should i do
-A: A few common causes: your API Key/Secret was mistyped or copied with extra spaces, the key doesn't have P2P/trading permissions enabled, or your bot's current IP isn't whitelisted on the Bybit API key (use Get My IP to find it and add it under IP restriction on Bybit). Run /pingbybit after fixing to confirm.
----
-
-Q: What permissions should my Bybit API have?
-K: what permissions should my api have, bybit api permissions, p2p permission
-A: Enable read and trade permissions for P2P/Spot on your Bybit API key — without P2P permission specifically, ad management and order actions will fail even if the key otherwise looks connected.
----
-
-Q: How do I test my Bybit connection / what does /pingbybit do?
-K: how do i test my bybit connection, what does pingbybit do, pingbybit
-A: Run /pingbybit any time — it checks whether your Bybit API connection is working correctly. Use it right after adding your keys, or whenever something seems off. A successful result means your account is ready for trading.
----
-
-Q: Can I update my Bybit API later, and how do I delete it?
-K: can i update my api later, how do i delete my bybit api, change bybit api key, remove bybit api
-A: Yes — just go back to API Settings -> Set Bybit Account 1/2 API and enter new values to overwrite the old ones. To remove a saved key entirely, use Delete APIs and select the one you want to delete.
----
-
-### FLUTTERWAVE (FAQ 36-43, 50) ###
-
-Q: How do I connect Flutterwave / how i fit connect flutterwave?
-K: how do i connect flutterwave, how i fit connect flutterwave, where do i find my flutterwave api, connect flutterwave, flutterwave setup
-A: Go to API Settings -> Set Flutterwave API and enter your Flutterwave credentials (Public Key, Secret Hash, and Secret Key — found on your Flutterwave dashboard under Settings -> API). Run /pingflutterwave afterward to confirm it's connected.
----
-
-Q: What does /pingflutterwave do and why isn't Flutterwave connecting?
-K: what does pingflutterwave do, why is flutterwave not connecting, flutterwave connection failing, flutterwave error
-A: /pingflutterwave checks your Flutterwave API connection and downloads every bank supported for transfers. If it's failing, double check your Public Key/Secret Hash/Secret Key were copied correctly with no extra spaces, and that your Flutterwave account is fully verified for transfers.
----
-
-Q: Which banks does Flutterwave support and can it send payments automatically?
-K: which banks does flutterwave support, can flutterwave send payments automatically, flutterwave auto pay, flutterwave bank list
-A: /pingflutterwave downloads the full list of banks Flutterwave currently supports for transfers. Yes — once connected and Flutterwave Pay is enabled under Auto Pay, it sends money to buyers automatically when a sell order is marked paid.
----
-
-Q: Do I need Flutterwave for Auto Pay, and how do I remove my Flutterwave API?
-K: do i need flutterwave for auto pay, how do i remove my flutterwave api, delete flutterwave api
-A: No — Flutterwave is one option for Auto Pay, not a requirement. You can use Paga instead, or use Bybit Auto Pay (which only marks orders paid, without moving money). To remove a saved Flutterwave key, use Delete APIs.
----
-
-Q: Should I use Flutterwave or Paga?
-K: should i use flutterwave or paga, flutterwave vs paga, which payment is better
-A: Both work the same way for Auto Pay — pick whichever platform you already have a verified business account with, or whichever offers better transfer speed/fees for your bank. You can even have both connected and choose per situation.
----
-
-### PAGA (FAQ 44-49) ###
-
-Q: How do I connect Paga?
-K: how do i connect paga, connect paga, paga setup, paga business account
-A: Go to API Settings -> Set Paga API and enter your Paga Business credentials (Principal, Credential, and API/Hash Key — found on your Paga Business dashboard). Run /pingpaga afterward to confirm it's connected.
----
-
-Q: What does /pingpaga do and why isn't Paga working?
-K: what does pingpaga do, why isnt paga working, paga connection failing, paga error, where do i get my paga api
-A: /pingpaga checks your Paga Business API connection and downloads the supported transfer banks. If it's not working, double-check your Principal/Credential/API Key were copied exactly from your Paga Business dashboard with no extra spaces.
----
-
-Q: Which banks does Paga support and can it send payments automatically?
-K: which banks does paga support, can paga send payments automatically, paga auto pay, paga bank list
-A: /pingpaga downloads the current list of banks Paga supports for transfers. Yes — once connected and Paga Pay is enabled under Auto Pay, it sends money to buyers automatically when a sell order is marked paid.
----
-
-### AD PRICE BOT (FAQ 51-76) ###
-
-Q: What is the AD Price Bot and how do I use it?
-K: what is the ad price bot, how do i use the ad price bot, ad price bot benefits, why use price bot
-A: The AD Price Bot automatically edits your Bybit advertisement price so you don't have to manually update it every few minutes. Setup: 1) My Ads List — fetch every ad linked to your account and copy the Ad ID you want to manage. 2) Set AD ID — paste it in. 3) Fetch AD Details — required before editing can begin. 4) Set Interval — how often it updates (e.g. "3" = every 3 minutes). 5) Choose Fixed Mode or Floating Mode. Then Update Once Now to test, or Start Auto Update to run continuously.
----
-
-Q: Where do I find my Ad ID and how do I use My Ads List?
-K: where do i find my ad id, where i see my ad id, my ads list, advertisement id, find ad id
-A: Open My Ads List — the bot fetches every advertisement linked to your Bybit account and shows their IDs, with color indicators (🔴 red = currently offline, 🟢 green = currently online/active). Copy the Ad ID you want to manage from there.
----
-
-Q: What is Set AD ID and why do I need Fetch AD Details?
-K: what is set ad id, why do i need fetch ad details, fetch ad details required, do i need to fetch my ad before posting
-A: Set AD ID is where you paste in the Advertisement ID copied from My Ads List — the bot saves it as the one it will manage. Fetch AD Details then pulls the ad's payment methods, currency, and current settings from Bybit — this step is required before any editing, posting, or price updates can begin.
----
-
-Q: How do I set my Bybit UID in the bot?
-K: how do i set my uid, how to set my uid in the bot, set my uid, bybit uid, where do i find my uid
-A: Your Bybit UID is the numeric ID on your Bybit P2P profile page (tap your username/avatar on any P2P ad to see it). Set it alongside your Ad ID in the AD Price Bot section — the bot uses it to correctly match incoming orders and buyer/seller details to your account.
----
-
-Q: Why isn't my ad updating / why no dey update my ad?
-K: why isnt my ad updating, why no dey update my ad, ad not updating, price bot not working, ad price stuck
-A: Common causes: Auto Update hasn't been started yet (tap Start Auto Update), AD Details haven't been fetched (do that first), your Bybit API permissions don't cover P2P ad editing, or (for Floating Mode) your NGN/USDT reference price hasn't been set. Check each of these in order.
----
-
-Q: What is Set Interval and what interval should I use?
-K: what is set interval, what interval should i use, ad update interval, how often does ad update
-A: Set Interval controls how many minutes pass between each automatic price update — for example "3" means every 3 minutes. Shorter intervals keep your price more competitive but make more API calls; most users run somewhere between 1 and 5 minutes.
----
-
-Q: What is Fixed Mode and Floating Mode, and which coins use them?
-K: what is fixed mode, what is floating mode, which coins use fixed mode, which coins use floating mode, fixed vs floating
-A: Fixed Mode is best for USDT/USDC — you set an Increment (e.g. "10") and the bot adds ₦10 to the price on every update. Floating Mode is best for BTC/ETH — you set a Float percentage (e.g. "110") plus an NGN/USDT Reference Price copied from the Bybit ad page, and the bot calculates your price off that reference.
----
-
-Q: What is Set Increment and Set Float?
-K: what is set increment, what is set float, increment amount, float percentage
-A: Set Increment (Fixed Mode) is the fixed amount added to your ad price on every update. Set Float (Floating Mode) is the percentage used to calculate your price relative to the NGN/USDT reference price.
----
-
-Q: What is the NGN/USDT Reference Price and where do I find it?
-K: what is the ngn usdt reference price, where do i find the reference price, ngn usdt reference, reference price location
-A: It's the current NGN/USDT rate shown on the Bybit advertisement page for the coin you're floating against. Copy that number and paste it into Set NGN/USDT Ref inside the bot — Floating Mode uses it as the base for calculating your ad price.
----
-
-Q: What does Update Once Now and Start Auto Update do, and how do I stop it?
-K: what does update once now do, what does start auto update do, how do i stop auto update, stop price bot
-A: Update Once Now updates your ad price a single time immediately — good for testing your settings. Start Auto Update runs continuously, editing the ad on the interval you set. To stop it, open the AD Price Bot section and tap the stop/toggle button — it runs until you turn it off.
----
-
-Q: Can I edit or manage multiple ads?
-K: can i edit multiple ads, manage multiple ads, several ads at once
-A: You manage one Ad ID at a time through Set AD ID — to switch to a different ad, set a new Ad ID and Fetch AD Details again for that one.
----
-
-Q: How do I post my advertisement?
-K: how do i post my advertisement, post ad, post advertisement, go online, why cant i post my ad, why can't i post my ad
-A: 1) Open My Ads List and copy the Ad ID with the red indicator (offline). 2) Open Post / Remove AD. 3) Click Set Manage AD ID and paste it. 4) Click Fetch Manage AD. 5) Click Post AD (Go Online). If posting fails, make sure you fetched the ad's details first and that your API has P2P permissions.
----
-
-Q: How do I remove my advertisement?
-K: how do i remove my advertisement, remove ad, remove advertisement, go offline, why cant i remove my ad
-A: 1) Open My Ads List and copy the Ad ID with the green indicator (online). 2) Open Post / Remove AD. 3) Click Set Manage AD ID and paste it. 4) Click Fetch Manage AD. 5) Click Remove AD (Go Offline).
----
-
-Q: Why are some Ad IDs red and others green?
-K: why are some ad ids red and others green, red green indicator meaning, ad color meaning
-A: The color shows the ad's current status on Bybit: 🔴 red means the ad is currently offline (not live), 🟢 green means it's online and active. Use red ads with Post AD, and green ads with Remove AD.
----
-
-### ORDER MONITOR & CHAT MONITOR (FAQ 77-86) ###
-
-Q: What is Order Monitor and how often does it check?
-K: what is order monitor, how often does it check orders, order monitor benefits, why use order monitor
-A: Order Monitor checks your Bybit P2P account every 10 seconds for new orders. Once you tap Start Monitoring, the bot immediately sends you the order details whenever a new one arrives — you never miss an order, and it powers the bot's other safety features (Buyer Protection, Name Match, fraud checks).
----
-
-Q: How do I start monitoring my orders?
-K: how do i start monitoring, start order monitoring, turn on order monitor
-A: Open Order Monitor and tap Start Monitoring. It then checks for new orders every 10 seconds and alerts you immediately when one comes in.
----
-
-Q: What is Chat Monitor and can I reply to buyers from Telegram?
-K: what is chat monitor, can i reply to buyers from telegram, bybit chat in telegram, reply from telegram
-A: When Chat Monitor is enabled, every Bybit chat message is forwarded into Telegram, and yes — you can reply directly from Telegram; the bot sends your reply back into the Bybit chat automatically.
----
-
-Q: What does Check Orders Now and Clear Seen Orders do?
-K: what does check orders now do, what does clear seen orders do, check active orders, reset seen orders
-A: Check Orders Now shows all your active orders immediately, without waiting for the next automatic check. Clear Seen Orders resets your viewed-orders count back to zero — useful if you want the bot to re-alert on orders it's already shown you.
----
-
-Q: What is Sell Message and how do I set it?
-K: what is sell message, how do i set my sell message, set message count, auto message buyer
-A: Sell Message automatically sends a message to the buyer on every new Sell order. Use Set Sell Message to save the exact text sent, and Set Message Count to choose how many times it repeats (e.g. "3" sends it three times).
----
-
-Q: How do I release an order?
-K: how to release order, how to release sell order, how do i release an order, release crypto to buyer, confirm payment received, release coins
-A: Releasing an order means confirming you've received payment and releasing the crypto to the buyer — this is done on the order screen in the Bybit P2P app itself (tap Confirm/Release once funds show in your bank account). The bot supports you around this: Order Monitor alerts you the moment a new order comes in, Sell Message can auto-notify the buyer while you wait, and Buyer Protection flags buyers with a history of slow releases so you know to double-check before releasing.
----
-
-### AUTO PAY (FAQ 87-96) ###
-
-Q: What is Auto Pay and does it send money?
-K: what is auto pay, does auto pay send money, how does auto pay work, bot no dey mark paid, how to use auto pay, how do i use auto pay
-A: Auto Pay works together with Order Monitor — when a Buy order is detected, Auto Pay performs whichever actions you've enabled. Enable Auto Pay (Bybit) only marks the order as Paid on Bybit; it does NOT send money by itself. To actually move money automatically you need Flutterwave Pay or Paga Pay enabled, each with its own API set up first. If the bot isn't marking orders paid, check that Order Monitor is running and Auto Pay (Bybit) is toggled on.
----
-
-Q: What is Bybit Auto Pay, Flutterwave Auto Pay, and Paga Auto Pay?
-K: what is bybit auto pay, what is flutterwave auto pay, what is paga auto pay
-A: Bybit Auto Pay marks Buy orders as Paid on Bybit — no money movement. Flutterwave Auto Pay and Paga Auto Pay each send money from your connected Flutterwave/Paga account automatically once a sell order is confirmed paid. You can also Set Sender Name, shown on Flutterwave transfer remarks.
----
-
-Q: Can Auto Pay work without Order Monitor?
-K: can auto pay work without order monitor, does auto pay need order monitor
-A: No — Auto Pay relies on Order Monitor to detect new Buy orders in the first place. Make sure Order Monitor / Start Monitoring is running for Auto Pay to do anything.
----
-
-Q: What is Buyer Protection and why was my order blocked by it?
-K: what is buyer protection, why was my order blocked by buyer protection, buyer protection threshold, protect buyer, cancel protection, set up buyer protection
-A: Buyer Protection protects you from buyers with a long average release time. Set a threshold in minutes — e.g. 15 — and any buyer whose average release time exceeds that gets flagged; Auto Pay won't approve their order automatically. If your order was blocked, it's because that specific buyer's release history crossed your threshold — check View Unpaid Orders to see it and decide manually.
----
-
-Q: What is View Unpaid Orders?
-K: what is view unpaid orders, unpaid orders list, blocked orders
-A: View Unpaid Orders shows every order that Buyer Protection has blocked from automatic payment, so you can review and handle them manually.
----
-
-Q: What is Buy Volume (24 Hours)?
-K: what is buy volume 24 hours, buy volume analytics, how much have i bought, 24 hour volume
-A: Buy Volume (24 Hours), inside the Auto Pay section, displays your total Buy volume over the last 24 hours — useful for tracking your own trading activity, resetting automatically every 24 hours.
----
-
-### REFERRALS & WITHDRAWALS (FAQ 97-99) ###
-
-Q: How do referrals work and where is my referral link?
-K: how do referrals work, where is my referral link, how do i earn referral commission, referral program, invite friends, check my balance, check referral balance, how much have i earned, my referral balance, view my earnings, how much will i earn per referral, how much do i earn per referral, referral commission amount, how much per referral
-A: Every user gets a unique referral link, found under Main Menu -> 🎁 Referrals. Invite people using it — whenever someone you referred upgrades to Pro, you earn a ₦5,000 commission once the admin approves it. Your Referrals dashboard shows Total Referrals, how many Upgraded to Pro, your Available Balance, and Lifetime Earnings.
----
-
-Q: How do I withdraw my referral balance?
-K: withdraw, payout, get paid, cash out, referral payment, withdraw balance, withdraw money, withdraw my balance, withdraw my earnings
-A: Open Main Menu -> 🎁 Referrals -> 💸 Withdraw. You'll be asked for your bank account number, account name, and bank name, then the amount — minimum ₦5,000. If your balance is below what you request, it fails with an insufficient balance message and nothing is deducted. If valid, the amount is deducted immediately and the request goes to Pending Processing; the admin then approves (marked Completed, money stays deducted) or rejects it (automatically refunded to your balance).
----
-
-Q: How do I check my withdrawal history or status?
-K: withdrawal history, withdrawal status, pending withdrawal, is my withdrawal approved
-A: Open Main Menu -> 🎁 Referrals -> 📜 Withdrawal History to see every withdrawal you've requested and its status: ⏳ Pending, ✅ Completed, or ❌ Rejected (with a reason, if one was given).
----
-
-### BOT STATUS, IP, RESET, ACCOUNTS (FAQ 100-108) ###
-
-Q: What is Bot Status?
-K: what is bot status, my stats, total orders, running services
-A: Bot Status displays your current active Bybit account, total Buy orders seen, total Sell orders seen, and which services are currently running.
----
-
-Q: What does Get My IP do and why do I need to whitelist it?
-K: what does get my ip do, why did my ip change, why do i need to whitelist my ip, get ip, ip address, ip whitelist
-A: Get My IP shows the bot's current public IP address. Whitelist that exact IP on Bybit, Flutterwave, and Paga under each platform's API/security settings — without whitelisting, those platforms will reject the bot's API calls. Note the IP can change periodically, so re-check it if API calls suddenly start failing.
----
-
-Q: What does Reset Session do — will it delete my APIs?
-K: what does reset session do, will reset session delete my apis, reset bot, clear session, restart session
-A: Reset Session resets every active feature back to its default state (running tasks, seen orders, temporary settings) — useful for troubleshooting. No — it does NOT delete your saved API keys.
----
-
-Q: How do I switch between Account 1 and Account 2, and why can't I switch?
-K: how do i switch between account 1 and account 2, why cant i switch accounts, how to change account 2, switch bybit account, change bybit account, how do i switch to another account, switch to another account
-A: Only one Bybit account can be active at a time. Before switching: 1) Stop every active bot service (price bot, order monitor, auto-pay, etc). 2) Switch accounts under API Settings. 3) Start the services again. If switching seems stuck, make sure every service was actually stopped first — services left running on the old account can block the switch.
----
-
-Q: How do I stop all active sessions?
-K: how do i stop all active sessions, stop everything, turn off all features, stop all bot services
-A: Go through each running feature (AD Price Bot Auto Update, Order Monitor, Chat Monitor, Auto Pay) and tap its stop/toggle button, or use Reset Session to reset everything back to default at once (this doesn't delete your saved API keys).
----
+"""
+help_agent.py — "Agent Nova", the P2P Exchange Bot's local how-to guide.
+
+No external AI API is used. This matches free-text questions against a
+knowledge base (knowledge.txt) hosted on GitHub — exactly the same pattern
+as fraud_check.py's scammers.txt — using keyword + fuzzy text matching
+(difflib, the same tool fraud_check.py already uses), plus a lightweight
+Nigerian-pidgin/casual-phrasing normalizer so paraphrased or "pidgin"
+questions (e.g. "why no dey update my ad") still land on the right entry
+without needing a separate knowledge.txt block for every possible way of
+phrasing something.
+
+Edit knowledge.txt on GitHub and push; the bot picks up the change on its
+own refresh cycle with no redeploy required (a redeploy also works fine).
+
+Persona ("Agent Nova") and off-topic wording below are taken directly
+from P2P_Exchange_Bot_Knowledge_Base.md — keep them in sync if that
+document changes.
+
+knowledge.txt format — one entry per block, separated by a line containing
+only "---":
+
+    Q: How do I set my Bybit API key?
+    K: bybit api, api key, set bybit, bybit account, bybit setup
+    A: Go to Main Menu -> Set APIs -> choose Bybit Account 1 or 2, then
+    send your API Key, then your API Secret when prompted. Your keys are
+    stored securely and only used for your own account.
+    ---
+    Q: How do I start the auto price bot?
+    K: price bot, auto update, refresh price, start price
+    A: ...
+    ---
+
+- Q: is the canonical question — also shown as a "you might be asking"
+  suggestion when nothing matches confidently.
+- K: is a comma-separated list of extra keywords/phrases people might type
+  — pack in casual and pidgin variants here too (e.g. "my api dey fail"),
+  not just formally-worded ones. The normalizer in this file also handles
+  common pidgin words automatically, but explicit keywords are still the
+  most reliable signal.
+- A: is the answer. Can span multiple lines until the next Q:/K:/A:/---.
+- Lines starting with # are comments and are ignored.
+
+Usage:
+    from help_agent import answer_question, is_disallowed, load_knowledge
+"""
+
+import logging
+import random
+import re
+import threading
+import time
+from difflib import SequenceMatcher
+
+import requests
+
+from config import KNOWLEDGE_FILE_URL, BOT_OWNER_USERNAME
+
+logger = logging.getLogger(__name__)
+
+AGENT_NAME = "Agent Nova"
+
+REFRESH_INTERVAL  = 30 * 60   # same cadence as fraud_check.py
+MATCH_THRESHOLD   = 0.60      # confidence needed to answer directly
+FOLLOWUP_THRESHOLD = 0.50     # slightly more lenient when combined with the last topic
+SUGGESTION_COUNT  = 6         # how many topics to suggest when nothing matches
+
+_entries: list       = []     # [{"question": str, "keywords": [str,...], "answer": str}]
+_last_loaded: float  = 0.0
+_load_lock           = threading.Lock()
+
+CONTACT_LINE = (
+    f'For anything else, please contact the bot owner: '
+    f'<a href="https://t.me/{BOT_OWNER_USERNAME}">@{BOT_OWNER_USERNAME}</a>.'
+)
+CAPABILITIES_INTRO = "Here's what I can help you with:"
+
+_FALLBACK_TOPICS = [
+    "Setting up your Bybit / Flutterwave / Paga API keys",
+    "Starting the AD Price Bot and Order Monitor",
+    "Turning on Auto Pay, Buyer Protection, or Name Match",
+    "Understanding your plan and upgrading to Pro",
+    "Using your referral link, balance, and withdrawals",
+]
+
+GREETING = (
+    f"👋 <b>Hello! I'm {AGENT_NAME}, your P2P Exchange Assistant.</b>\n\n"
+    "I'm here to help you understand and use every feature of this bot. "
+    "Ask me anything about it — for example:"
+)
+
+# Off-topic wording taken verbatim from P2P_Exchange_Bot_Knowledge_Base.md
+OFF_TOPIC_MESSAGE = (
+    "I'm sorry 😅. I'm only able to help with questions about the P2P "
+    "Exchange Bot and its available features."
+)
+
+_GREETING_WORDS = {
+    "hi", "hello", "hey", "hiya", "yo", "sup", "howdy",
+    "good morning", "good afternoon", "good evening",
+}
+
+# Very short, low-content replies that mean "go on" / "give me more" rather
+# than a new question — used to trigger the follow-up path.
+_FOLLOWUP_CUES = {
+    "yes", "yeah", "yep", "how", "and", "then", "go on",
+    "tell me more", "more", "continue", "please continue",
+    "and then", "what next",
+}
+
+# Replies that mean the person is satisfied and done, NOT asking for more —
+# these get a fixed closing reply instead of being treated as a new
+# question or a request to continue.
+_CLOSING_CUES = {
+    "ok", "okay", "alright", "alright then", "sure", "fine", "cool",
+    "thanks", "thank you", "thanks a lot", "thank you so much",
+    "thank you for your assistance", "thank you for your help",
+    "understood", "got it", "noted", "nice one", "great thanks",
+}
+
+CLOSING_REPLY = "You're welcome! You can reach out to me any time you need further assistance. 😊"
+
+# ─────────────────────────────────────────
+# 🗣️ Casual / Nigerian-pidgin normalization
+# ─────────────────────────────────────────
+# Not a translator — just enough substitution so common casual phrasings
+# score closer to their standard-English equivalent before matching.
+# Multi-word phrases are replaced first (order matters), then single words.
+_PIDGIN_PHRASES = [
+    # "not working" family
+    ("no dey work", "is not working"),
+    ("no dey update", "is not updating"),
+    ("no dey show", "is not showing"),
+    ("no dey send", "is not sending"),
+    ("no dey mark", "is not marking"),
+    ("no dey connect", "is not connecting"),
+    ("no dey respond", "is not responding"),
+    ("no dey open", "is not opening"),
+    ("no dey save", "is not saving"),
+    ("e no work", "it is not working"),
+    ("e no dey work", "it is not working"),
+    ("e no dey show", "it is not showing"),
+    ("no dey", "is not"),
+    # ability / permission
+    ("how i fit", "how can i"),
+    ("how you fit", "how can you"),
+    ("i fit", "can i"),
+    ("you fit", "can you"),
+    ("i no fit", "i cannot"),
+    ("i no sabi", "i do not know"),
+    # wants / needs
+    ("i wan", "i want to"),
+    ("i wan sabi", "i want to know"),
+    ("i need make", "i need to"),
+    ("make i", "let me"),
+    ("make you", "please"),
+    ("gimme", "give me"),
+    ("gi mi", "give me"),
+    # question openers
+    ("wetin be", "what is"),
+    ("wetin dey happen", "what is happening"),
+    ("wetin i go do", "what should i do"),
+    ("how e go be", "how will it be"),
+    ("how i go do am", "how do i do it"),
+    ("how far", "hello"),
+    ("wetin", "what"),
+    # politeness / filler
+    ("abeg help", "please help"),
+    ("abeg", "please"),
+    ("abeg no vex", "please do not be upset"),
+    ("na so", "that is how it is"),
+    ("na wa o", "wow"),
+    ("help me sha", "please help me"),
+    # common one-word merges of two-word feature names
+    ("autopay",     "auto pay"),
+    ("auto-pay",    "auto pay"),
+]
+_PIDGIN_WORDS = {
+    "dey":     "is",
+    "fit":     "can",
+    "wan":     "want",
+    "sabi":    "know",
+    "una":     "you",
+    "wahala":  "problem",
+    "waka":    "go",
+    "yarn":    "tell",
+    "shey":    "is",
+    "sef":     "even",
+    "wey":     "that",
+    "dem":     "them",
+    "abi":     "or",
+    "nawa":    "wow",
+    "oga":     "admin",
+    "chai":    "wow",
+    "omo":     "wow",
+    "sha":     "just",
+    "kuku":    "just",
+    "vex":     "upset",
+    "yeye":    "useless",
+    "wetin":   "what",
+    "wia":     "where",
+    "wusai":   "where",
+    "nawao":   "wow",
+    "gan":     "really",
+    "bam":     "immediately",
+    "sharp":   "quickly",
+    "jare":    "please",
+    "abegi":   "please",
+}
+
+
+# ─────────────────────────────────────────
+# 🚫 Off-topic / not-allowed filter
+# ─────────────────────────────────────────
+# Pattern-level block list — deliberately broad rather than exhaustive.
+# The goal is simply to refuse and redirect the user, not to moderate
+# precisely. Anything that matches never reaches the knowledge matcher.
+_DISALLOWED_PATTERNS = [
+    r"\bsex\w*\b", r"\bnude\w*\b", r"\bnaked\b", r"\bporn\w*\b",
+    r"\bxxx\b", r"\bhorny\b", r"\bnsfw\b", r"\bnudes?\b",
+    r"\bdick\s*pic\w*\b", r"\bboobs?\b",
+]
+_disallowed_re = re.compile("|".join(_DISALLOWED_PATTERNS), re.IGNORECASE)
+
+
+def is_disallowed(text: str) -> bool:
+    return bool(_disallowed_re.search(text or ""))
+
+
+def disallowed_reply() -> str:
+    return (
+        f"🚫 {OFF_TOPIC_MESSAGE}\n\n"
+        f"{CAPABILITIES_INTRO}\n\n"
+        f"{_capability_list()}\n\n"
+        f"{CONTACT_LINE}"
+    )
+
+
+# ─────────────────────────────────────────
+# 📥 Load knowledge base from GitHub
+# ─────────────────────────────────────────
+def load_knowledge() -> int:
+    """Fetch and parse knowledge.txt. Returns number of entries loaded."""
+    global _entries, _last_loaded
+
+    if not KNOWLEDGE_FILE_URL:
+        logger.warning("[HelpAgent] KNOWLEDGE_FILE_URL not set — help agent disabled")
+        return 0
+
+    try:
+        resp = requests.get(KNOWLEDGE_FILE_URL, timeout=10)
+        if resp.status_code != 200:
+            logger.error(f"[HelpAgent] Failed to fetch knowledge.txt — HTTP {resp.status_code}")
+            return 0
+
+        parsed = []
+        cur = {"q": "", "k": [], "a": []}
+
+        def _flush():
+            if cur["q"] and cur["a"]:
+                parsed.append({
+                    "question": cur["q"],
+                    "keywords": cur["k"],
+                    "answer":   " ".join(cur["a"]).strip(),
+                })
+
+        for raw_line in resp.text.splitlines():
+            stripped = raw_line.strip()
+            if stripped == "---":
+                _flush()
+                cur = {"q": "", "k": [], "a": []}
+                continue
+            if not stripped or stripped.startswith("#"):
+                continue
+            if stripped.startswith("Q:"):
+                cur["q"] = stripped[2:].strip()
+            elif stripped.startswith("K:"):
+                cur["k"] = [kw.strip().lower() for kw in stripped[2:].split(",") if kw.strip()]
+            elif stripped.startswith("A:"):
+                cur["a"] = [stripped[2:].strip()]
+            elif cur["a"]:
+                cur["a"].append(stripped)
+        _flush()
+
+        with _load_lock:
+            _entries     = parsed
+            _last_loaded = time.time()
+
+        logger.info(f"[HelpAgent] Loaded {len(parsed)} knowledge entries")
+        return len(parsed)
+
+    except Exception as e:
+        logger.error(f"[HelpAgent] Error loading knowledge.txt: {e}")
+        return 0
+
+
+def refresh_if_stale():
+    age = time.time() - _last_loaded
+    if not _entries or age > REFRESH_INTERVAL:
+        load_knowledge()
+
+
+def get_entry_count() -> int:
+    return len(_entries)
+
+
+# ─────────────────────────────────────────
+# 🔍 Matching — content-word overlap (not raw character similarity)
+# ─────────────────────────────────────────
+# Character-level fuzzy matching (e.g. plain difflib on full sentences) is
+# unreliable here: "How to get my IP" and "How do I upgrade my plan?" share
+# enough letters/structure ("how", "my", sentence shape) to score deceptively
+# high even though they're about completely different things. Instead:
+# strip out generic connector words (how/what/who/is/do/my/the/...), keep
+# only the words that actually carry the topic ("get", "ip" / "upgrade",
+# "plan"), and score by how much of the user's real content is covered by
+# an entry's question + keywords — regardless of word order or exact
+# phrasing. This is also why the keyword lists in knowledge.txt matter:
+# every extra phrase you add there (including pidgin ones) directly grows
+# each entry's content-word pool.
+_STOPWORDS = {
+    "a", "an", "the", "to", "of", "in", "on", "for", "and", "or", "is", "are",
+    "was", "were", "do", "does", "did", "i", "my", "me", "you", "your", "it",
+    "its", "this", "that", "am", "be", "been", "with", "how", "what", "who",
+    "whom", "why", "when", "where", "which", "so", "if", "as", "at", "by",
+}
+
+
+def _normalize(text: str) -> str:
+    t = (text or "").lower()
+    t = t.replace("'", "")  # can't -> cant, isn't -> isnt — do this before anything else
+    for phrase, repl in _PIDGIN_PHRASES:
+        t = t.replace(phrase, repl)
+    t = re.sub(r"[^a-z0-9 ]", " ", t)
+    words = [_PIDGIN_WORDS.get(w, w) for w in t.split()]
+    return " ".join(words).strip()
+
+
+def _content_words(norm_text: str) -> set:
+    """The words in a normalized string that actually carry topic meaning —
+    everything except generic connector/question words."""
+    return {w for w in norm_text.split() if w not in _STOPWORDS and len(w) > 1}
+
+
+def _entry_content_words(entry: dict) -> set:
+    """All content words from an entry's question + every keyword phrase,
+    cached on the entry dict after the first call (rebuilt each time
+    knowledge.txt reloads, since _entries is replaced wholesale then)."""
+    cached = entry.get("_content_words")
+    if cached is not None:
+        return cached
+    words = set(_content_words(_normalize(entry["question"])))
+    for kw in entry["keywords"]:
+        words |= _content_words(_normalize(kw))
+    entry["_content_words"] = words
+    return words
+
+
+def _is_greeting(text: str) -> bool:
+    norm = _normalize(text)
+    if not norm:
+        return False
+    if norm in _GREETING_WORDS:
+        return True
+    # Short messages starting with a greeting word (e.g. "hi there", "hello bot")
+    return len(norm.split()) <= 3 and any(norm.startswith(g) for g in _GREETING_WORDS)
+
+
+def _is_followup_cue(text: str) -> bool:
+    norm = _normalize(text)
+    return bool(norm) and (norm in _FOLLOWUP_CUES) and len(norm.split()) <= 3
+
+
+def _is_closing_cue(text: str) -> bool:
+    norm = _normalize(text)
+    if not norm:
+        return False
+    if norm in _CLOSING_CUES:
+        return True
+    # Allow short variations like "ok thanks" / "alright thank you"
+    return len(norm.split()) <= 6 and any(
+        norm == c or norm.startswith(c) or norm.endswith(c) for c in _CLOSING_CUES
+    )
+
+
+def _score(user_text: str, entry: dict) -> float:
+    norm = _normalize(user_text)
+    if not norm:
+        return 0.0
+
+    # 1) Explicit keyword hit — an exact phrase from knowledge.txt appearing
+    #    verbatim (after normalization) in the user's message. Still the
+    #    strongest, most deliberate signal a maintainer can give.
+    kw_score = 0.0
+    for kw in entry["keywords"]:
+        if not kw:
+            continue
+        kw_norm = _normalize(kw)
+        if not kw_norm or kw_norm not in norm:
+            continue
+        weight = 0.95 if len(_content_words(kw_norm)) >= 2 else 0.65
+        kw_score = max(kw_score, weight)
+
+    # 2) Content-word overlap — what fraction of the MEANINGFUL words in
+    #    the user's message are covered by this entry's question/keywords,
+    #    in any order, any phrasing. This is what actually fixes cases like
+    #    "how to get my ip" vs "how to upgrade my plan": once "how", "to",
+    #    "my" are stripped out as noise, the remaining words ("get", "ip"
+    #    vs "upgrade", "plan") don't overlap with the wrong entry at all.
+    query_words = _content_words(norm)
+    token_score = 0.0
+    if query_words:
+        entry_words = _entry_content_words(entry)
+        token_score = len(query_words & entry_words) / len(query_words)
+
+    # 3) Light fuzzy fallback — catches typos and near-identical phrasing
+    #    that content-word overlap might miss, but heavily down-weighted so
+    #    it can never win purely on sentence-shape/character similarity.
+    fuzzy_score = SequenceMatcher(None, norm, _normalize(entry["question"])).ratio() * 0.55
+
+    return max(kw_score, token_score, fuzzy_score)
+
+
+def _best_match(text: str):
+    best_entry, best_score = None, 0.0
+    for entry in _entries:
+        s = _score(text, entry)
+        if s > best_score:
+            best_score = s
+            best_entry = entry
+    return best_entry, best_score
+
+
+def _capability_list() -> str:
+    refresh_if_stale()
+    if not _entries:
+        sample = _FALLBACK_TOPICS
+    else:
+        pool = [e["question"] for e in _entries]
+        sample = random.sample(pool, k=min(SUGGESTION_COUNT, len(pool)))
+    return "\n".join(f"• {q}" for q in sample)
+
+
+def answer_question(text: str, last_topic: str = None):
+    """
+    Main entry point. Returns (reply_text, matched_topic):
+      - reply_text is the HTML-safe string to send. Never empty — always
+        something useful, including a plain list of likely topics (no
+        buttons) when nothing in the knowledge base confidently matches.
+      - matched_topic is the canonical Q: text of whatever matched (or
+        None), so the caller can pass it back in as `last_topic` on the
+        person's next message — this lets a short follow-up like "how"
+        or "ok tell me more" still resolve to the same topic instead of
+        being treated as a brand new, unmatched question.
+
+    Callers that don't need follow-up memory can ignore the second value.
+    """
+    refresh_if_stale()
+
+    if is_disallowed(text):
+        return disallowed_reply(), None
+
+    if _is_closing_cue(text):
+        return CLOSING_REPLY, None
+
+    if _is_greeting(text):
+        return f"{GREETING}\n\n{_capability_list()}", None
+
+    if not _entries:
+        return (
+            "I'm still loading my help guide — try again in a moment, "
+            f"or ask the admin directly. {CONTACT_LINE}"
+        ), None
+
+    # A bare "yes"/"how"/"tell me more" isn't a new question — if we know
+    # what topic they were just looking at, re-serve that answer instead
+    # of falling through to the generic off-topic message.
+    if last_topic and _is_followup_cue(text):
+        for entry in _entries:
+            if entry["question"] == last_topic:
+                return entry["answer"], last_topic
+
+    best_entry, best_score = _best_match(text)
+
+    # If scoring alone falls just short, try scoring the message combined
+    # with the previous topic — catches short follow-ups that add a
+    # missing detail (e.g. previous: "how do i set my ad id", next: "the
+    # interval one") without a full standalone match on their own.
+    if (not best_entry or best_score < MATCH_THRESHOLD) and last_topic:
+        combined_entry, combined_score = _best_match(f"{last_topic} {text}")
+        if combined_entry and combined_score >= FOLLOWUP_THRESHOLD and combined_score > best_score:
+            best_entry, best_score = combined_entry, combined_score
+
+    if best_entry and best_score >= MATCH_THRESHOLD:
+        return best_entry["answer"], best_entry["question"]
+
+    return (
+        f"{OFF_TOPIC_MESSAGE}\n\n"
+        f"{CAPABILITIES_INTRO}\n\n"
+        f"{_capability_list()}\n\n"
+        f"{CONTACT_LINE}"
+    ), None
