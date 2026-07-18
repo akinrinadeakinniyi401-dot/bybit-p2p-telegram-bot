@@ -35,6 +35,23 @@ def _default_settings() -> dict:
     }
 
 
+def _default_extra_ad_slot() -> dict:
+    """
+    Shape for ad slots #2 and #3 (the original single-ad fields — settings,
+    refresh_running, refresh_task, current_price, ad_data — remain slot #1
+    and are completely untouched by this; multi-ad support is purely
+    additive so existing single-ad users are unaffected).
+    """
+    return {
+        "settings":             _default_settings(),
+        "ad_data":              {},
+        "running":              False,
+        "task":                 None,
+        "current_price":        Decimal("0"),
+        "consecutive_failures": 0,   # auto-stops this slot after 2 in a row (see bot.py)
+    }
+
+
 class SessionState:
     """
     Holds all volatile P2P state for one user.
@@ -54,6 +71,25 @@ class SessionState:
         self.refresh_running      = False
         self.refresh_task         = None
         self.current_price        = Decimal("0")
+        self.consecutive_failures = 0   # slot #1's own failure counter (see bot.py auto-stop logic)
+
+        # ── Extra ad slots (#2 and #3) — multi-ad price bot ──
+        # Purely additive: slot #1 above is untouched, so single-ad users
+        # (the vast majority) see zero behavior change. Each entry is one
+        # _default_extra_ad_slot() dict. Max length enforced by bot.py
+        # using bybit.MAX_ADS_PER_USER (currently 3, i.e. up to 2 extras).
+        self.extra_ad_slots: list = []
+
+        # Shared NGN/USDT (or other local currency) reference price — ONE
+        # value used by every active ad slot for this user, since BTC and
+        # ETH ads on the same account quote off the same reference price.
+        # settings["local_usdt_ref"] is kept in sync for backward
+        # compatibility with any single-ad code that still reads it there.
+        self.shared_local_usdt_ref: str = ""
+
+        # Which ad slot the AD Price Bot menu is currently editing:
+        # -1 = Ad 1 (the original single-ad fields), 0 = Ad 2, 1 = Ad 3.
+        self.editing_slot: int = -1
 
         # ── Order monitor ──
         self.order_monitor_running = False
@@ -182,11 +218,11 @@ class SessionState:
         return age > max_hours * 3600
 
     def stop_all_tasks(self):
-        """Cancel all background tasks safely."""
+        """Cancel all background tasks safely — including any extra ad slots."""
         for task in [
             self.refresh_task, self.order_monitor_task,
             self.chat_monitor_task, self.paga_worker_task
-        ]:
+        ] + [slot["task"] for slot in self.extra_ad_slots]:
             if task and not task.done():
                 task.cancel()
         self.refresh_running       = False
@@ -196,6 +232,97 @@ class SessionState:
         self.order_monitor_task    = None
         self.chat_monitor_task     = None
         self.paga_worker_task      = None
+        for slot in self.extra_ad_slots:
+            slot["running"] = False
+            slot["task"]    = None
+
+    # ── Multi-ad helpers (slot #1 = the original single-ad fields above;
+    # extra_ad_slots holds #2 and #3) ──
+    def total_ad_slots(self) -> int:
+        """How many ad slots this user has configured, including slot #1."""
+        return 1 + len(self.extra_ad_slots)
+
+    def add_ad_slot(self) -> dict:
+        """Append a new empty extra ad slot (#2 or #3). Caller is
+        responsible for checking total_ad_slots() against
+        bybit.MAX_ADS_PER_USER first."""
+        slot = _default_extra_ad_slot()
+        self.extra_ad_slots.append(slot)
+        return slot
+
+    def remove_ad_slot(self, index: int):
+        """Remove extra slot at index (0 -> ad #2, 1 -> ad #3), stopping
+        its task first if still running. No-op if index is out of range."""
+        if 0 <= index < len(self.extra_ad_slots):
+            slot = self.extra_ad_slots[index]
+            task = slot.get("task")
+            if task and not task.done():
+                task.cancel()
+            self.extra_ad_slots.pop(index)
+
+    def stop_ad_slot(self, index: int):
+        """Stop slot #1 (index -1, by convention) or an extra slot (0-based
+        into extra_ad_slots) without removing its configuration."""
+        if index == -1:
+            if self.refresh_task and not self.refresh_task.done():
+                self.refresh_task.cancel()
+            self.refresh_running = False
+            self.refresh_task    = None
+            return
+        if 0 <= index < len(self.extra_ad_slots):
+            slot = self.extra_ad_slots[index]
+            if slot["task"] and not slot["task"].done():
+                slot["task"].cancel()
+            slot["running"] = False
+            slot["task"]    = None
+
+    def get_active_float_pcts(self, exclude_index: int = None, currency_id: str = None, token_id: str = None) -> list:
+        """
+        Floating % of every OTHER currently-configured ad slot that trades
+        the SAME (currency, coin) pair as the one being edited/started.
+
+        Only ads on the exact same pair (e.g. two BTC/NGN ads) can ever
+        compute to the same price and need a 1% gap between them. Ads on
+        a different pair — even sharing the currency (BTC/NGN vs ETH/NGN)
+        or the coin (BTC/NGN vs BTC/USD) — price off different underlying
+        rates and can safely use the identical %.
+
+        If currency_id/token_id aren't given, falls back to comparing
+        against every active ad regardless of pair (old, more conservative
+        behavior) — kept only as a safety default, callers should always
+        pass the pair being edited.
+
+        Includes stopped ads too — the gap rule applies at configuration
+        time, not just while running, since a stopped ad can restart any
+        time.
+        """
+        def _same_pair(ad_data: dict) -> bool:
+            if not currency_id or not token_id:
+                return True
+            return (
+                ad_data.get("currencyId", "").upper() == currency_id.upper()
+                and ad_data.get("tokenId", "").upper() == token_id.upper()
+            )
+
+        pcts = []
+        if exclude_index != -1 and self.settings.get("mode") == "floating" and _same_pair(self.ad_data):
+            pcts.append(self.settings.get("float_pct"))
+        for i, slot in enumerate(self.extra_ad_slots):
+            if i == exclude_index:
+                continue
+            if slot["settings"].get("mode") == "floating" and _same_pair(slot["ad_data"]):
+                pcts.append(slot["settings"].get("float_pct"))
+        return pcts
+
+    def sync_shared_ref(self, value: str):
+        """Set the shared NGN/USDT reference price for every ad slot at
+        once — BTC and ETH ads on the same account quote off the same
+        reference. Also mirrors it into settings["local_usdt_ref"] on every
+        slot for backward compatibility with code that reads it per-slot."""
+        self.shared_local_usdt_ref = value
+        self.settings["local_usdt_ref"] = value
+        for slot in self.extra_ad_slots:
+            slot["settings"]["local_usdt_ref"] = value
 
     def reset_p2p(self):
         """Reset all P2P session data but keep API keys and settings."""
@@ -221,6 +348,13 @@ class SessionState:
         for k, v in [("ad_id",""),("mode","fixed"),("increment","0.05"),
                      ("float_pct",""),("local_usdt_ref",""),("interval",2)]:
             self.settings[k] = v
+        # Extra ad slots (#2/#3) — same treatment: wipe P2P config, keep
+        # nothing to "keep" per-slot since they have no API keys of their
+        # own (those live at the account level, not per ad).
+        self.extra_ad_slots = []
+        self.shared_local_usdt_ref = ""
+        self.consecutive_failures = 0
+        self.editing_slot = -1
         self.created_at = datetime.now()   # restart the 12h clock
         logger.info(f"[Session] P2P reset for user {self.user_id}")
 
