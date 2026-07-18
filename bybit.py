@@ -110,6 +110,82 @@ def currency_needs_ref(currency_id: str) -> bool:
 
 
 # ─────────────────────────────────────────
+# Multi-ad safety validation (up to 3 ads per user)
+# ─────────────────────────────────────────
+# Two independent guardrails, both enforced at INPUT time (when the user
+# sets a value) rather than at submit time — this avoids any race between
+# multiple ad-update loops trying to submit conflicting prices at once:
+#   1. Bybit's own min/max floating % bounds per currency/coin (already
+#      encoded in MAX_FLOAT_PCT / MIN_FLOAT_PCT above).
+#   2. A minimum 1-percentage-point gap between every active ad's floating
+#      % for the same user — this is what stops two ads from ever landing
+#      on the same (or near-identical) price, which Bybit rejects.
+MIN_AD_INTERVAL_MINUTES = 2
+MIN_FLOAT_PCT_GAP = 1.0
+MAX_ADS_PER_USER = 3
+
+
+def validate_interval(minutes) -> tuple[bool, str]:
+    """Reject any update interval below the safe floor. Keeping this at
+    2 minutes minimum, even for a single ad, keeps every combination of
+    up to 3 concurrent ads well under Bybit's 10-edits-per-5-minutes-per-ad
+    limit and the 5-requests/second account-wide write limit."""
+    try:
+        val = int(minutes)
+    except (TypeError, ValueError):
+        return False, "❌ Interval must be a whole number of minutes."
+    if val < MIN_AD_INTERVAL_MINUTES:
+        return False, (
+            f"❌ Minimum update interval is {MIN_AD_INTERVAL_MINUTES} minutes — "
+            f"this keeps every ad safely within Bybit's rate limits, "
+            f"especially when running more than one ad at once."
+        )
+    return True, ""
+
+
+def validate_float_pct(currency_id: str, token_id: str, new_pct, other_active_pcts: list) -> tuple[bool, str]:
+    """
+    Validate a floating-mode percentage BEFORE it's saved to an ad slot.
+    Checks it against Bybit's allowed min/max for this currency/coin, and
+    that it's at least MIN_FLOAT_PCT_GAP away from every other currently
+    active ad's floating % for this same user (so two ads can never be
+    configured to converge on the same price in the first place).
+
+    other_active_pcts: floating %s of this user's OTHER active ad slots
+    (skip the slot being edited). None/empty entries are ignored.
+
+    Returns (ok, error_message) — error_message is "" when ok is True.
+    """
+    try:
+        pct = float(new_pct)
+    except (TypeError, ValueError):
+        return False, "❌ Floating % must be a number."
+
+    lo = get_min_float_pct(currency_id, token_id)
+    hi = get_max_float_pct(currency_id, token_id)
+    if pct < lo or pct > hi:
+        return False, f"❌ {token_id}/{currency_id} floating % must be between {lo}% and {hi}%."
+
+    for other in other_active_pcts:
+        if other in (None, ""):
+            continue
+        try:
+            other_val = float(other)
+        except (TypeError, ValueError):
+            continue
+        if abs(pct - other_val) < MIN_FLOAT_PCT_GAP:
+            suggestion_lo = other_val - MIN_FLOAT_PCT_GAP
+            suggestion_hi = other_val + MIN_FLOAT_PCT_GAP
+            return False, (
+                f"❌ Another active ad on this account is already using {other_val:g}%. "
+                f"Pick a value at least {MIN_FLOAT_PCT_GAP:g}% away — "
+                f"{suggestion_lo:g}% or lower, or {suggestion_hi:g}% or higher."
+            )
+
+    return True, ""
+
+
+# ─────────────────────────────────────────
 # Payment type map
 # ─────────────────────────────────────────
 PAYMENT_TYPE_MAP = {
