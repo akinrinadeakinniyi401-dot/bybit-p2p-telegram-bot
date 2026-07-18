@@ -24,6 +24,7 @@ from bybit import (
     take_ad_offline, put_ad_online,
     get_user_payment_list,
     review_seller_cancel,
+    validate_interval, validate_float_pct, MAX_ADS_PER_USER,
 )
 from fraud_check import check_buyer_name, load_scammers, get_scammer_count, get_last_updated
 import db
@@ -114,6 +115,80 @@ def _get_user_slot(uid: int) -> int:
 def _get_user_slot_str(uid: int) -> str:
     """Return slot as 1-based string: '1' or '2'."""
     return str(_s(uid).selected_slot + 1)
+
+
+# ─────────────────────────────────────────
+# Multi-ad slot accessors (up to 3 concurrent ads per user)
+# ─────────────────────────────────────────
+# NOTE: this "ad slot" (-1 / 0 / 1, meaning Ad 1 / Ad 2 / Ad 3 — up to 3
+# ads running concurrently) is a completely different axis from the
+# existing "_get_user_slot" (which Bybit ACCOUNT, 1 or 2, is active).
+# Ads 2 and 3 always run against whichever account is currently active —
+# they share that account's API keys and UID, same as Ad 1 does.
+def _valid_slot(sess, slot_idx: int) -> int:
+    """Clamp a possibly-stale slot index back to -1 (Ad 1) if it no longer
+    exists — e.g. the slot was removed from another tab/click in between."""
+    if slot_idx != -1 and slot_idx >= len(sess.extra_ad_slots):
+        return -1
+    return slot_idx
+
+def _ad_settings(sess, slot_idx: int) -> dict:
+    slot_idx = _valid_slot(sess, slot_idx)
+    return sess.settings if slot_idx == -1 else sess.extra_ad_slots[slot_idx]["settings"]
+
+def _ad_data_of(sess, slot_idx: int) -> dict:
+    slot_idx = _valid_slot(sess, slot_idx)
+    return sess.ad_data if slot_idx == -1 else sess.extra_ad_slots[slot_idx]["ad_data"]
+
+def _ad_running(sess, slot_idx: int) -> bool:
+    slot_idx = _valid_slot(sess, slot_idx)
+    if slot_idx == -1:
+        return sess.refresh_running
+    return sess.extra_ad_slots[slot_idx]["running"]
+
+def _set_ad_running(sess, slot_idx: int, val: bool):
+    slot_idx = _valid_slot(sess, slot_idx)
+    if slot_idx == -1:
+        sess.refresh_running = val
+    else:
+        sess.extra_ad_slots[slot_idx]["running"] = val
+
+def _set_ad_task(sess, slot_idx: int, task):
+    slot_idx = _valid_slot(sess, slot_idx)
+    if slot_idx == -1:
+        sess.refresh_task = task
+    else:
+        sess.extra_ad_slots[slot_idx]["task"] = task
+
+def _ad_current_price(sess, slot_idx: int) -> Decimal:
+    slot_idx = _valid_slot(sess, slot_idx)
+    return sess.current_price if slot_idx == -1 else sess.extra_ad_slots[slot_idx]["current_price"]
+
+def _set_ad_current_price(sess, slot_idx: int, price):
+    slot_idx = _valid_slot(sess, slot_idx)
+    if slot_idx == -1:
+        sess.current_price = price
+    else:
+        sess.extra_ad_slots[slot_idx]["current_price"] = price
+
+def _ad_slot_label(slot_idx: int) -> str:
+    return "Ad 1" if slot_idx == -1 else f"Ad {slot_idx + 2}"
+
+def _increment_ad_failures(sess, slot_idx: int) -> int:
+    slot_idx = _valid_slot(sess, slot_idx)
+    if slot_idx == -1:
+        sess.consecutive_failures += 1
+        return sess.consecutive_failures
+    slot = sess.extra_ad_slots[slot_idx]
+    slot["consecutive_failures"] += 1
+    return slot["consecutive_failures"]
+
+def _reset_ad_failures(sess, slot_idx: int):
+    slot_idx = _valid_slot(sess, slot_idx)
+    if slot_idx == -1:
+        sess.consecutive_failures = 0
+    else:
+        sess.extra_ad_slots[slot_idx]["consecutive_failures"] = 0
 
 def _settings(uid: int) -> dict:
     """Shorthand: get the mutable settings dict for uid."""
@@ -393,63 +468,106 @@ def back_prev(prev: str):
 # ─────────────────────────────────────────
 def ads_section_keyboard(uid: int = 0):
     sess       = _s(uid) if uid else None
-    mode       = (sess.settings.get("mode", "fixed") if sess else "fixed")
+    slot_idx   = sess.editing_slot if sess else -1
+    s          = _ad_settings(sess, slot_idx) if sess else {}
+    ad_data    = _ad_data_of(sess, slot_idx) if sess else {}
+    mode       = s.get("mode", "fixed")
     mode_icon  = "💲" if mode == "fixed" else "📈"
     mode_label = f"{mode_icon} Mode: {mode.upper()}"
-    ad_loaded  = bool(sess.ad_data if sess else {})
-    status     = "🟢 Stop Auto-Update" if (sess and sess.refresh_running) else "▶️ Start Auto-Update"
+    ad_loaded  = bool(ad_data)
+    running    = _ad_running(sess, slot_idx) if sess else False
+    status     = "🟢 Stop Auto-Update" if running else "▶️ Start Auto-Update"
+    total_ads  = sess.total_ad_slots() if sess else 1
 
-    rows = [
-        [
+    rows = []
+
+    # ── Ad slot switcher — only shown once the user has more than 1 ad ──
+    if total_ads > 1:
+        switch_row = []
+        for i in range(-1, total_ads - 1):
+            label = _ad_slot_label(i)
+            if i == slot_idx:
+                label = f"• {label} •"
+            switch_row.append(InlineKeyboardButton(label, callback_data=f"edit_ad_{i+2}"))
+        rows.append(switch_row)
+        rows.append([InlineKeyboardButton("🗂 All My Ads (Dashboard)", callback_data="ads_dashboard")])
+
+    if slot_idx == -1:
+        rows.append([
             InlineKeyboardButton("🆔 Set Ad ID",    callback_data="set_ad_id"),
             InlineKeyboardButton("👤 Set UID",      callback_data="set_uid"),
             InlineKeyboardButton("🗑 Del UID",      callback_data="delete_uid"),
-        ],
-        [
-            InlineKeyboardButton("📋 Fetch Ad Details", callback_data="fetch_ad"),
-            InlineKeyboardButton("📃 My Ads List",      callback_data="fetch_my_ads"),
-        ],
-        [
-            InlineKeyboardButton(mode_label,        callback_data="switch_mode"),
-            InlineKeyboardButton("⏱ Set Interval", callback_data="set_interval"),
-        ],
-    ]
+        ])
+    else:
+        # Ads 2/3 share Ad 1's Bybit account + UID — only the Ad ID differs.
+        rows.append([InlineKeyboardButton("🆔 Set Ad ID", callback_data="set_ad_id")])
+
+    rows.append([
+        InlineKeyboardButton("📋 Fetch Ad Details", callback_data="fetch_ad"),
+        InlineKeyboardButton("📃 My Ads List",      callback_data="fetch_my_ads"),
+    ])
+    rows.append([
+        InlineKeyboardButton(mode_label,        callback_data="switch_mode"),
+        InlineKeyboardButton("⏱ Set Interval", callback_data="set_interval"),
+    ])
 
     if mode == "fixed":
         rows.append([InlineKeyboardButton("➕ Set Increment", callback_data="set_increment")])
     else:
         rows.append([InlineKeyboardButton("📊 Set Float %",   callback_data="set_float_pct")])
-        _cur = (sess.ad_data if sess else {}).get("currencyId","").upper()
+        _cur = ad_data.get("currencyId","").upper()
         if currency_needs_ref(_cur) or _cur == "NGN":
             rows.append([InlineKeyboardButton(f"💱 Set {_cur}/USDT Ref", callback_data="set_ngn_ref")])
 
-    if ad_loaded:
+    # Update Once Now only makes sense — and is only offered — when the
+    # user is running a single ad. With multiple ads active, a one-off
+    # manual update on one of them can no longer be validated against the
+    # others' prices at that exact instant, so it's disabled entirely.
+    if ad_loaded and total_ads == 1:
         rows.append([InlineKeyboardButton("🔄 Update Once Now", callback_data="update_now")])
 
-    rows.append([
-        InlineKeyboardButton("📢 Post / Remove Ad",  callback_data="post_ad_prompt"),
-    ])
+    if slot_idx == -1:
+        rows.append([InlineKeyboardButton("📢 Post / Remove Ad", callback_data="post_ad_prompt")])
+
     rows.append([InlineKeyboardButton(status, callback_data="toggle_refresh")])
+
+    if total_ads < MAX_ADS_PER_USER:
+        rows.append([InlineKeyboardButton(f"➕ Add {_ad_slot_label(total_ads - 1)}", callback_data="add_ad_slot")])
+    if slot_idx != -1:
+        rows.append([InlineKeyboardButton(f"🗑 Remove {_ad_slot_label(slot_idx)}", callback_data="remove_ad_slot")])
+
     rows += back_main()
     return InlineKeyboardMarkup(rows)
 
 
 def ads_section_text(uid: int = 0) -> str:
-    uid  = uid or _current_user_id
-    sess = _s(uid)
-    s    = sess.settings
-    slot = _get_user_slot_str(uid)   # per-user slot — NOT global
-    ad_id     = s.get(f"ad_id_{slot}") or s.get("ad_id","") or "❗ Not set"
-    bybit_uid = s.get(f"bybit_uid_{slot}") or s.get("bybit_uid","") or "❗ Not set"
+    uid      = uid or _current_user_id
+    sess     = _s(uid)
+    slot_idx = sess.editing_slot
+    s        = _ad_settings(sess, slot_idx)
+    ad_data  = _ad_data_of(sess, slot_idx)
+    acct_slot = _get_user_slot_str(uid)   # per-user BYBIT ACCOUNT slot — NOT the ad slot
+
+    if slot_idx == -1:
+        ad_id     = s.get(f"ad_id_{acct_slot}") or s.get("ad_id","") or "❗ Not set"
+        bybit_uid = s.get(f"bybit_uid_{acct_slot}") or s.get("bybit_uid","") or "❗ Not set"
+    else:
+        ad_id     = s.get("ad_id","") or "❗ Not set"
+        # Ads 2/3 always use the same UID as the active account (Ad 1's UID).
+        bybit_uid = (
+            sess.settings.get(f"bybit_uid_{acct_slot}")
+            or sess.settings.get("bybit_uid","")
+            or "❗ Not set"
+        )
+
     mode      = s.get("mode",           "fixed")
     interval  = s.get("interval",       2)
     increment = s.get("increment",      "0.05")
     float_pct = s.get("float_pct",     "") or "❗ Not set"
-    local_ref = s.get("local_usdt_ref","") or "❗ Not set"
-    ad_data   = sess.ad_data
+    local_ref = sess.shared_local_usdt_ref or s.get("local_usdt_ref","") or "❗ Not set"
     cur_label = ad_data.get("currencyId","NGN").upper() if ad_data else "NGN"
-    cur       = str(sess.current_price) if sess.current_price else "—"
-    status    = "🟢 Running" if sess.refresh_running else "🔴 Stopped"
+    cur       = str(_ad_current_price(sess, slot_idx)) if _ad_current_price(sess, slot_idx) else "—"
+    status    = "🟢 Running" if _ad_running(sess, slot_idx) else "🔴 Stopped"
 
     if ad_data:
         price    = ad_data.get("price",        "—")
@@ -476,20 +594,61 @@ def ads_section_text(uid: int = 0) -> str:
         if ad_data.get("currencyId","").upper() == "NGN":
             mode_info += f" | 💱 {cur_label}/USDT: `{local_ref}`"
 
-    hint = next_setup_hint(uid)
+    hint = next_setup_hint(uid) if slot_idx == -1 else "Set this ad's Ad ID, fetch its details, then set its mode."
     user_slot_idx = _get_user_slot(uid)
-    acct_label = bybit.BYBIT_ACCOUNTS[user_slot_idx]["label"] if (bybit.BYBIT_ACCOUNTS and user_slot_idx < len(bybit.BYBIT_ACCOUNTS)) else f"Account {slot}"
+    acct_label = bybit.BYBIT_ACCOUNTS[user_slot_idx]["label"] if (bybit.BYBIT_ACCOUNTS and user_slot_idx < len(bybit.BYBIT_ACCOUNTS)) else f"Account {acct_slot}"
+    slot_header = _ad_slot_label(slot_idx)
+    multi_note = f" ({sess.total_ad_slots()} ads active)" if sess.total_ad_slots() > 1 else ""
 
     return (
-        f"📊 <b>AD PRICE BOT — {acct_label}</b>\n\n"
+        f"📊 <b>AD PRICE BOT — {slot_header}{multi_note}</b>\n"
+        f"<i>{acct_label}</i>\n\n"
         f"🆔 Ad ID: <code>{ad_id}</code>\n"
-        f"👤 UID (Acct {slot}): <code>{bybit_uid}</code>\n"
+        f"👤 UID (Acct {acct_slot}): <code>{bybit_uid}</code>\n"
         f"🔀 Mode: <code>{mode.upper()}</code> | ⏱ Every <code>{interval}</code> min\n"
         f"{mode_info}\n"
         f"{ad_info}\n"
         f"📈 Session price: <code>{cur}</code> | {status}\n\n"
         f"<i>{hint}</i>"
     )
+
+
+def ads_dashboard_text(uid: int) -> str:
+    """All-ads-at-a-glance view — coin/pair + status per ad, per user's request."""
+    sess = _s(uid)
+    lines = [f"🗂 <b>All My Ads ({sess.total_ad_slots()} active)</b>\n"]
+    for i in range(-1, len(sess.extra_ad_slots)):
+        ad_data = _ad_data_of(sess, i)
+        running = _ad_running(sess, i)
+        s       = _ad_settings(sess, i)
+        icon    = "🟢" if running else "🔴"
+        if ad_data:
+            pair = f"{ad_data.get('tokenId','?')}/{ad_data.get('currencyId','?')}"
+            price = ad_data.get("price", "—")
+        else:
+            pair, price = "not loaded yet", "—"
+        mode = s.get("mode", "fixed").upper()
+        lines.append(f"{icon} <b>{_ad_slot_label(i)}</b> — {pair} | 💲{price} | {mode} | {'Running' if running else 'Stopped'}")
+    return "\n".join(lines)
+
+
+def ads_dashboard_keyboard(uid: int) -> InlineKeyboardMarkup:
+    sess = _s(uid)
+    rows = []
+    stop_row = []
+    for i in range(-1, len(sess.extra_ad_slots)):
+        if _ad_running(sess, i):
+            stop_row.append(InlineKeyboardButton(f"⏹ Stop {_ad_slot_label(i)}", callback_data=f"stop_ad_{i+2}"))
+    if stop_row:
+        rows.append(stop_row)
+    if sum(1 for i in range(-1, len(sess.extra_ad_slots)) if _ad_running(sess, i)) > 1:
+        rows.append([InlineKeyboardButton("⏹ Stop All Ads", callback_data="stop_all_ads")])
+    edit_row = [InlineKeyboardButton(f"✏️ Edit {_ad_slot_label(i)}", callback_data=f"edit_ad_{i+2}") for i in range(-1, len(sess.extra_ad_slots))]
+    rows.append(edit_row)
+    rows += back_main()
+    return InlineKeyboardMarkup(rows)
+
+
 
 
 # ─────────────────────────────────────────
@@ -3301,14 +3460,29 @@ def calc_floating_price(ad_data, float_pct, local_usdt_ref):
 # ─────────────────────────────────────────
 # 🔄 PRICE UPDATE LOOP
 # ─────────────────────────────────────────
-async def auto_update_loop(bot, chat_id):
+async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
+    """
+    Runs one ad's price-update cycle. slot_idx=-1 is Ad 1 (the original
+    single-ad behavior, completely unchanged); 0/1 are Ad 2/Ad 3.
+
+    Auto-stop-on-failure: when a user has MORE THAN ONE ad active, two
+    consecutive failed updates on this specific ad auto-stops just this
+    slot and notifies the user to fix it on Bybit directly — this is the
+    fallback for "Bybit silently rejects a too-close/duplicate price"
+    since there's no distinct retCode for that case (912120022, handled
+    below, is the *out-of-range* case and is left exactly as before).
+    Single-ad users keep the original behavior: it keeps retrying forever
+    on failure, since there's no other ad's price at risk for them.
+    """
     sess = _s(chat_id)
-    sess.refresh_running = True
-    s         = sess.settings
+    _set_ad_running(sess, slot_idx, True)
+    label     = _ad_slot_label(slot_idx)
+    s         = _ad_settings(sess, slot_idx)
+    ad_data   = _ad_data_of(sess, slot_idx)
     interval  = s.get("interval", 2)
     increment = Decimal(str(s.get("increment","0.05")))
     if s.get("mode") == "fixed":
-        sess.current_price = Decimal(str(sess.ad_data.get("price","0")))
+        _set_ad_current_price(sess, slot_idx, Decimal(str(ad_data.get("price","0"))))
 
     # ── Load this user's credentials ONCE at loop start ──
     # Re-read from DB so any key updates take effect on next loop restart.
@@ -3316,87 +3490,123 @@ async def auto_update_loop(bot, chat_id):
     if not creds or not creds.get("key"):
         await bot.send_message(chat_id=chat_id,
             text=(
-                "❌ <b>Auto-Update stopped</b>\n\n"
+                f"❌ <b>{label} Auto-Update stopped</b>\n\n"
                 "No Bybit API key found for your account.\n"
                 "Go to 🔑 <b>Set APIs</b> → <b>Set Bybit API</b> first."
             ),
             parse_mode="HTML")
-        sess.refresh_running = False
+        _set_ad_running(sess, slot_idx, False)
         return
 
     cycle = 0
-    while sess.refresh_running:
+    while _ad_running(sess, slot_idx):
         cycle += 1
         now  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         mode = s.get("mode","fixed")
+        prefix = f"[{label}] " if sess.total_ad_slots() > 1 else ""
 
         if mode == "fixed":
-            new_p     = sess.current_price + increment
+            new_p     = _ad_current_price(sess, slot_idx) + increment
             new_p_str = str(new_p.quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP))
         else:
             float_pct      = float(s.get("float_pct",0))
-            local_usdt_ref = float(s.get("local_usdt_ref") or 0)
-            new_p_str, err = calc_floating_price(sess.ad_data, float_pct, local_usdt_ref)
+            local_usdt_ref = float(sess.shared_local_usdt_ref or s.get("local_usdt_ref") or 0)
+            new_p_str, err = calc_floating_price(ad_data, float_pct, local_usdt_ref)
             if err:
                 await bot.send_message(chat_id=chat_id,
-                    text=f"⚠️ <b>Cycle {cycle} float error</b>\n<code>{_esc(str(err))}</code>", parse_mode="HTML")
+                    text=f"⚠️ {prefix}<b>Cycle {cycle} float error</b>\n<code>{_esc(str(err))}</code>", parse_mode="HTML")
                 for _ in range(interval * 60):
-                    if not sess.refresh_running: break
+                    if not _ad_running(sess, slot_idx): break
                     await asyncio.sleep(1)
                 continue
 
         result   = await asyncio.get_event_loop().run_in_executor(
-            _ad_executor, modify_ad, s["ad_id"], new_p_str, sess.ad_data, creds
+            _ad_executor, modify_ad, s["ad_id"], new_p_str, ad_data, creds
         )
         ret_code = result.get("retCode", result.get("ret_code",-1))
         ret_msg  = result.get("retMsg",  result.get("ret_msg","Unknown"))
 
         if ret_code == 912120022:
+            # Out-of-range — Bybit tells us its own max/min, so retry with
+            # that value directly. Left exactly as the original single-ad
+            # logic since it's known-good and unrelated to the duplicate-
+            # price case (there's no distinct retCode for that one).
             bybit_max = _extract_bybit_max(ret_msg)
             if bybit_max:
                 retry_result = await asyncio.get_event_loop().run_in_executor(
-                    _ad_executor, modify_ad, s["ad_id"], bybit_max, sess.ad_data, creds
+                    _ad_executor, modify_ad, s["ad_id"], bybit_max, ad_data, creds
                 )
                 retry_code = retry_result.get("retCode", retry_result.get("ret_code",-1))
                 retry_msg  = retry_result.get("retMsg",  retry_result.get("ret_msg","Unknown"))
                 if retry_code == 0:
+                    _reset_ad_failures(sess, slot_idx)
                     if mode == "fixed":
-                        sess.current_price = Decimal(bybit_max)
+                        _set_ad_current_price(sess, slot_idx, Decimal(bybit_max))
                     await bot.send_message(chat_id=chat_id,
                         text=(
-                            f"✅ <b>Cycle {cycle}</b> <code>{now}</code>\n"
+                            f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n"
                             f"⚠️ Original <code>{new_p_str}</code> was out of range\n"
                             f"💲 Posted Bybit max: <code>{bybit_max}</code> ({mode.upper()})"
                         ),
                         parse_mode="HTML")
                 else:
-                    await bot.send_message(chat_id=chat_id,
-                        text=f"❌ <b>Cycle {cycle} retry failed</b>\n<code>{retry_code}</code> — <code>{retry_msg}</code>",
-                        parse_mode="HTML")
+                    if await _handle_ad_cycle_failure(bot, chat_id, sess, slot_idx, label, cycle, retry_code, retry_msg):
+                        return
             else:
-                await bot.send_message(chat_id=chat_id,
-                    text=f"❌ <b>Cycle {cycle} failed</b>\n<code>{ret_code}</code> — <code>{ret_msg}</code>",
-                    parse_mode="HTML")
+                if await _handle_ad_cycle_failure(bot, chat_id, sess, slot_idx, label, cycle, ret_code, ret_msg):
+                    return
 
         elif ret_code == 0:
+            _reset_ad_failures(sess, slot_idx)
             if mode == "fixed":
-                sess.current_price = new_p
+                _set_ad_current_price(sess, slot_idx, new_p)
             await bot.send_message(chat_id=chat_id,
-                text=f"✅ <b>Cycle {cycle}</b> <code>{now}</code>\n💲 <code>{new_p_str}</code> ({mode.upper()})",
+                text=f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n💲 <code>{new_p_str}</code> ({mode.upper()})",
                 parse_mode="HTML")
         else:
-            _ecur = sess.ad_data.get("currencyId","").upper()
-            extra = f"\n💱 Update {_ecur}/USDT ref if rate changed" \
-                    if (currency_needs_ref(_ecur) or _ecur == "NGN") else ""
-            await bot.send_message(chat_id=chat_id,
-                text=f"❌ <b>Cycle {cycle} failed</b>\n<code>{ret_code}</code> — <code>{ret_msg}</code>{extra}",
-                parse_mode="HTML")
+            if await _handle_ad_cycle_failure(bot, chat_id, sess, slot_idx, label, cycle, ret_code, ret_msg, ad_data):
+                return
 
         for _ in range(interval * 60):
-            if not sess.refresh_running: break
+            if not _ad_running(sess, slot_idx): break
             await asyncio.sleep(1)
 
-    logger.info("🛑 PRICE LOOP STOPPED")
+    logger.info(f"🛑 PRICE LOOP STOPPED ({label}) for user {chat_id}")
+
+
+async def _handle_ad_cycle_failure(bot, chat_id, sess, slot_idx, label, cycle, ret_code, ret_msg, ad_data=None) -> bool:
+    """
+    Shared failure handler for auto_update_loop. Returns True if the loop
+    should stop immediately (this slot was auto-stopped), False if it
+    should keep going to its normal inter-cycle sleep.
+    """
+    prefix = f"[{label}] " if sess.total_ad_slots() > 1 else ""
+    extra = ""
+    if ad_data:
+        _ecur = ad_data.get("currencyId","").upper()
+        extra = f"\n💱 Update {_ecur}/USDT ref if rate changed" if (currency_needs_ref(_ecur) or _ecur == "NGN") else ""
+
+    if sess.total_ad_slots() > 1:
+        fail_count = _increment_ad_failures(sess, slot_idx)
+        if fail_count >= 2:
+            _set_ad_running(sess, slot_idx, False)
+            _set_ad_task(sess, slot_idx, None)
+            await bot.send_message(chat_id=chat_id,
+                text=(
+                    f"🛑 <b>{label} auto-stopped</b>\n\n"
+                    f"2 failed updates in a row — likely too close to another ad's price, "
+                    f"or a Bybit-side rejection.\n"
+                    f"Last error: <code>{ret_code}</code> — <code>{_esc(str(ret_msg))}</code>{extra}\n\n"
+                    f"Check/edit this ad directly on Bybit, then restart it from the bot."
+                ),
+                parse_mode="HTML")
+            return True
+
+    await bot.send_message(chat_id=chat_id,
+        text=f"❌ {prefix}<b>Cycle {cycle} failed</b>\n<code>{ret_code}</code> — <code>{_esc(str(ret_msg))}</code>{extra}",
+        parse_mode="HTML")
+    return False
+
 
 
 # ─────────────────────────────────────────
@@ -3882,6 +4092,9 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
     # ── Section navigations ──
     elif data == "section_ads":
+        _sess_ads = _s(tuser.id)
+        if _sess_ads.editing_slot >= len(_sess_ads.extra_ad_slots):
+            _sess_ads.editing_slot = -1   # guard against a stale index if a slot was removed elsewhere
         await edit_menu(query, ads_section_text(tuser.id), ads_section_keyboard(tuser.id))
 
     elif data == "section_orders":
@@ -4325,14 +4538,21 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
     elif data == "set_ad_id":
         _btn_state["action"]       = "ad_id"
         _btn_state["prev_section"] = "section_ads"
-        slot_str = _get_user_slot_str(tuser.id)
-        cur = (
-            _s(tuser.id).settings.get(f"ad_id_{slot_str}", "")
-            or _s(tuser.id).settings.get("ad_id", "")
-            or "Not set"
-        )
+        sess = _s(tuser.id)
+        slot_idx = sess.editing_slot
+        if slot_idx == -1:
+            slot_str = _get_user_slot_str(tuser.id)
+            cur = (
+                sess.settings.get(f"ad_id_{slot_str}", "")
+                or sess.settings.get("ad_id", "")
+                or "Not set"
+            )
+            label = f"Account {slot_str}"
+        else:
+            cur = _ad_settings(sess, slot_idx).get("ad_id", "") or "Not set"
+            label = _ad_slot_label(slot_idx)
         await edit_menu(query,
-            f"🆔 <b>Set Ad ID — Account {slot_str}</b>\n\nCurrent: <code>{_esc(cur)}</code>\n\n"
+            f"🆔 <b>Set Ad ID — {label}</b>\n\nCurrent: <code>{_esc(cur)}</code>\n\n"
             "Send your Bybit Ad ID.\n💡 Use 📃 My Ads List to find it.\n\n"
             "Example: `2040156088201854976`",
             InlineKeyboardMarkup(back_section("section_ads"))
@@ -4438,7 +4658,10 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
     # ── 📋 Fetch Ad Details ──
     elif data == "fetch_ad":
-        if not _s(tuser.id).settings.get("ad_id"):
+        sess = _s(tuser.id)
+        slot_idx = sess.editing_slot
+        s = _ad_settings(sess, slot_idx)
+        if not s.get("ad_id"):
             await edit_menu(query, "❌ Set your Ad ID first.", InlineKeyboardMarkup(back_section("section_ads")))
             return
         _creds = get_user_creds(tuser.id)
@@ -4448,25 +4671,27 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 InlineKeyboardMarkup(back_section("section_ads"))
             )
             return
-            return
         await edit_menu(query, "⏳ Loading ad from Bybit...", ads_section_keyboard(tuser.id))
         result   = await asyncio.get_event_loop().run_in_executor(
-            None, partial(get_ad_details, _s(tuser.id).settings["ad_id"], creds=_creds)
+            None, partial(get_ad_details, s["ad_id"], creds=_creds)
         )
         ret_code = result.get("retCode", result.get("ret_code",-1))
         if ret_code == 0:
-            _s(tuser.id).ad_data.update(result.get("result",{}))
-            token    = _s(tuser.id).ad_data.get("tokenId","—")
-            currency = _s(tuser.id).ad_data.get("currencyId","—")
+            ad_data = _ad_data_of(sess, slot_idx)
+            ad_data.clear()
+            ad_data.update(result.get("result",{}))
+            token    = ad_data.get("tokenId","—")
+            currency = ad_data.get("currencyId","—")
             max_pct  = get_max_float_pct(currency, token)
-            ad_stat  = {10:"🟢 Online",20:"🔴 Offline",30:"✅ Done"}.get(_s(tuser.id).ad_data.get("status"),"?")
+            ad_stat  = {10:"🟢 Online",20:"🔴 Offline",30:"✅ Done"}.get(ad_data.get("status"),"?")
+            next_hint = next_setup_hint(tuser.id) if slot_idx == -1 else "Now set mode + interval for this ad."
             await edit_menu(query,
-                f"✅ <b>Ad Loaded!</b>\n\n"
-                f"🆔 <code>{_s(tuser.id).settings['ad_id']}</code>\n"
-                f"💱 <code>{token}/{currency}</code> | 💲 <code>{_s(tuser.id).ad_data.get('price','')}</code>\n"
-                f"Min: <code>{_s(tuser.id).ad_data.get('minAmount','')}</code> | Max: <code>{_s(tuser.id).ad_data.get('maxAmount','')}</code> | Qty: <code>{_s(tuser.id).ad_data.get('lastQuantity','')}</code>\n"
+                f"✅ <b>Ad Loaded! ({_ad_slot_label(slot_idx)})</b>\n\n"
+                f"🆔 <code>{s['ad_id']}</code>\n"
+                f"💱 <code>{token}/{currency}</code> | 💲 <code>{ad_data.get('price','')}</code>\n"
+                f"Min: <code>{ad_data.get('minAmount','')}</code> | Max: <code>{ad_data.get('maxAmount','')}</code> | Qty: <code>{ad_data.get('lastQuantity','')}</code>\n"
                 f"Status: {ad_stat} | Max float: <code>{max_pct}%</code>\n\n"
-                f"_{next_setup_hint(tuser.id)}_",
+                f"_{next_hint}_",
                 InlineKeyboardMarkup(back_section("section_ads"))
             )
         else:
@@ -4477,14 +4702,20 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
     # ── 🔀 Switch Mode ──
     elif data == "switch_mode":
-        new_mode = "floating" if _s(tuser.id).settings.get("mode") == "fixed" else "fixed"
-        slot_str = _get_user_slot_str(tuser.id)
-        _s(tuser.id).settings["mode"]              = new_mode
-        _s(tuser.id).settings[f"mode_{slot_str}"]  = new_mode
-        _save_settings(tuser.id)
-        note = " (takes effect next cycle)" if _s(tuser.id).refresh_running else ""
+        sess = _s(tuser.id)
+        slot_idx = sess.editing_slot
+        s = _ad_settings(sess, slot_idx)
+        new_mode = "floating" if s.get("mode") == "fixed" else "fixed"
+        s["mode"] = new_mode
+        next_hint = ""
+        if slot_idx == -1:
+            slot_str = _get_user_slot_str(tuser.id)
+            sess.settings[f"mode_{slot_str}"] = new_mode
+            _save_settings(tuser.id)
+            next_hint = f"\n\n_{next_setup_hint(tuser.id)}_"
+        note = " (takes effect next cycle)" if _ad_running(sess, slot_idx) else ""
         await edit_menu(query,
-            f"🔀 <b>Switched to {new_mode.upper()}{note}</b>\n\n_{next_setup_hint(tuser.id)}_",
+            f"🔀 <b>{_ad_slot_label(slot_idx)} switched to {new_mode.upper()}{note}</b>{next_hint}",
             InlineKeyboardMarkup(back_section("section_ads"))
         )
 
@@ -4492,33 +4723,45 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
     elif data == "set_increment":
         _btn_state["action"]       = "increment"
         _btn_state["prev_section"] = "section_ads"
+        sess = _s(tuser.id)
+        s = _ad_settings(sess, sess.editing_slot)
         await edit_menu(query,
-            f"➕ <b>Set Increment</b>\n\nCurrent: <code>+{_s(tuser.id).settings.get('increment','0.05')}</code> per cycle\n\n"
+            f"➕ <b>Set Increment — {_ad_slot_label(sess.editing_slot)}</b>\n\nCurrent: <code>+{s.get('increment','0.05')}</code> per cycle\n\n"
             "Send the amount to add each cycle.\nExamples: `0.05` | `1` | `0.5`",
             InlineKeyboardMarkup(back_section("section_ads"))
         )
 
     # ── 📊 Set Float % ──
     elif data == "set_float_pct":
-        if not _s(tuser.id).ad_data:
+        sess = _s(tuser.id)
+        slot_idx = sess.editing_slot
+        ad_data = _ad_data_of(sess, slot_idx)
+        if not ad_data:
             await edit_menu(query, "❌ Fetch Ad Details first.", InlineKeyboardMarkup(back_section("section_ads")))
             return
-        token    = _s(tuser.id).ad_data.get("tokenId","USDT").upper()
-        currency = _s(tuser.id).ad_data.get("currencyId","NGN").upper()
+        token    = ad_data.get("tokenId","USDT").upper()
+        currency = ad_data.get("currencyId","NGN").upper()
         max_pct  = get_max_float_pct(currency, token)
         min_pct  = get_min_float_pct(currency, token)
         needs_ref = currency_needs_ref(currency) or currency == "NGN"
         _btn_state["action"]       = "float_pct"
         _btn_state["prev_section"] = "section_ads"
-        cur = _s(tuser.id).settings.get("float_pct","") or "Not set"
+        s   = _ad_settings(sess, slot_idx)
+        cur = s.get("float_pct","") or "Not set"
         formula = (
             f"<code>{token}/USDT × {currency}/USDT ref × your% ÷ 100</code>"
             if needs_ref else
             f"<code>{token}/USDT × your% ÷ 100</code>"
         )
+        other_pcts = sess.get_active_float_pcts(exclude_index=slot_idx, currency_id=currency, token_id=token)
+        gap_note = (
+            f"\n\n⚠️ Your other active {token}/{currency} ad(s) are using: {', '.join(f'{p}%' for p in other_pcts)} — "
+            f"yours must be at least 1% away from each of these."
+            if other_pcts else ""
+        )
         await edit_menu(query,
-            f"📊 <b>Set Float %</b>\n\nPair: <code>{token}/{currency}</code> | Range: <code>{min_pct}%–{max_pct}%</code>\nCurrent: <code>{cur}</code>\n\n"
-            f"Formula: {formula}\n\n"
+            f"📊 <b>Set Float % — {_ad_slot_label(slot_idx)}</b>\n\nPair: <code>{token}/{currency}</code> | Range: <code>{min_pct}%–{max_pct}%</code>\nCurrent: <code>{cur}</code>\n\n"
+            f"Formula: {formula}{gap_note}\n\n"
             f"Send a value between <code>{min_pct}</code> and <code>{max_pct}</code>. Example: <code>105</code>",
             InlineKeyboardMarkup(back_section("section_ads"))
         )
@@ -4527,10 +4770,13 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
     elif data == "set_ngn_ref":
         _btn_state["action"]       = "ngn_usdt_ref"
         _btn_state["prev_section"] = "section_ads"
-        _rcur = _s(tuser.id).ad_data.get("currencyId","NGN").upper() if _s(tuser.id).ad_data else "NGN"
-        cur   = _s(tuser.id).settings.get("local_usdt_ref","") or "Not set"
+        sess = _s(tuser.id)
+        ad_data = _ad_data_of(sess, sess.editing_slot)
+        _rcur = ad_data.get("currencyId","NGN").upper() if ad_data else "NGN"
+        cur   = sess.shared_local_usdt_ref or "Not set"
+        shared_note = " (shared by all your ads)" if sess.total_ad_slots() > 1 else ""
         await edit_menu(query,
-            f"💱 <b>{_rcur}/USDT Reference Price</b>\n\nCurrent: <code>{cur}</code>\n\n"
+            f"💱 <b>{_rcur}/USDT Reference Price{shared_note}</b>\n\nCurrent: <code>{cur}</code>\n\n"
             f"Check Bybit P2P market for current {_rcur}/USDT rate.\n"
             f"Example: <code>{'1580' if _rcur == 'NGN' else '1.25' if _rcur == 'EUR' else '100'}</code> ({_rcur} per 1 USDT)",
             InlineKeyboardMarkup(back_section("section_ads"))
@@ -4540,14 +4786,23 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
     elif data == "set_interval":
         _btn_state["action"]       = "interval"
         _btn_state["prev_section"] = "section_ads"
+        sess = _s(tuser.id)
+        s = _ad_settings(sess, sess.editing_slot)
         await edit_menu(query,
-            f"⏱ <b>Set Interval</b>\n\nCurrent: every <code>{_s(tuser.id).settings.get('interval',2)}</code> min\n\n"
-            "Send minutes between each price update.\nExamples: `2` | `5` | `10`",
+            f"⏱ <b>Set Interval — {_ad_slot_label(sess.editing_slot)}</b>\n\nCurrent: every <code>{s.get('interval',2)}</code> min\n\n"
+            f"Send minutes between each price update (minimum {bybit.MIN_AD_INTERVAL_MINUTES}).\nExamples: `2` | `5` | `10`",
             InlineKeyboardMarkup(back_section("section_ads"))
         )
 
     # ── 🔄 Update Once Now ──
     elif data == "update_now":
+        if _s(tuser.id).total_ad_slots() > 1:
+            await edit_menu(query,
+                "❌ <b>Update Once Now</b> is only available with a single active ad.\n\n"
+                "Stop or remove your extra ads first if you need a one-off manual update.",
+                InlineKeyboardMarkup(back_section("section_ads"))
+            )
+            return
         if not _s(tuser.id).ad_data or not _s(tuser.id).settings.get("ad_id"):
             await edit_menu(query, "❌ Load ad details first.", InlineKeyboardMarkup(back_section("section_ads")))
             return
@@ -5189,31 +5444,56 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
     # ── 🟢/🔴 Toggle Price Update ──
     elif data == "toggle_refresh":
-        if _s(tuser.id).refresh_running:
-            _s(tuser.id).refresh_running = False
-            if _s(tuser.id).refresh_task:
-                _s(tuser.id).refresh_task.cancel()
-                _s(tuser.id).refresh_task = None
-            _s(tuser.id).current_price = Decimal("0")
+        sess     = _s(tuser.id)
+        slot_idx = sess.editing_slot
+        s        = _ad_settings(sess, slot_idx)
+        label    = _ad_slot_label(slot_idx)
+        if _ad_running(sess, slot_idx):
+            _set_ad_running(sess, slot_idx, False)
+            _set_ad_task(sess, slot_idx, None)
+            _set_ad_current_price(sess, slot_idx, Decimal("0"))
             await edit_menu(query,
-                "🔴 *Price update stopped.*\n\n" + ads_section_text(tuser.id),
+                f"🔴 <b>{label} price update stopped.</b>\n\n" + ads_section_text(tuser.id),
                 ads_section_keyboard(tuser.id)
             )
         else:
-            if not _s(tuser.id).ad_data or not _s(tuser.id).settings.get("ad_id"):
+            ad_data = _ad_data_of(sess, slot_idx)
+            if not ad_data or not s.get("ad_id"):
+                hint_text = next_setup_hint(tuser.id) if slot_idx == -1 else "Set this ad's Ad ID and fetch its details first."
                 await edit_menu(query,
-                    f"❌ Not ready:\n\n_{next_setup_hint(tuser.id)}_",
+                    f"❌ Not ready:\n\n_{hint_text}_",
                     InlineKeyboardMarkup(back_section("section_ads"))
                 )
                 return
+            # ── Interval floor — defense in depth (already enforced when the
+            # value was entered, but re-checked here in case of stale state) ──
+            ok, err = validate_interval(s.get("interval", 2))
+            if not ok:
+                await edit_menu(query, err, InlineKeyboardMarkup(back_section("section_ads")))
+                return
+            # ── 1% float gap — re-validated here too, since a slot could in
+            # theory have been configured before another ad claimed its %
+            # (e.g. edited out of order) ──
+            if s.get("mode") == "floating":
+                other_pcts = sess.get_active_float_pcts(
+                    exclude_index=slot_idx,
+                    currency_id=ad_data.get("currencyId","NGN"),
+                    token_id=ad_data.get("tokenId","USDT"),
+                )
+                fok, ferr = validate_float_pct(
+                    ad_data.get("currencyId","NGN"), ad_data.get("tokenId","USDT"),
+                    s.get("float_pct", 0), other_pcts
+                )
+                if not fok:
+                    await edit_menu(query, ferr, InlineKeyboardMarkup(back_section("section_ads")))
+                    return
             # ── Conflict guard: block auto-update while order/chat monitor is running ──
             # Running both simultaneously saturates the shared thread pool and event loop,
             # causing Telegram timeouts for ALL users. Users must choose one or the other.
-            _sess_chk = _s(tuser.id)
-            if _sess_chk.order_monitor_running or _sess_chk.chat_monitor_enabled:
+            if sess.order_monitor_running or sess.chat_monitor_enabled:
                 active = []
-                if _sess_chk.order_monitor_running: active.append("Order Monitor")
-                if _sess_chk.chat_monitor_enabled:  active.append("Chat Monitor")
+                if sess.order_monitor_running: active.append("Order Monitor")
+                if sess.chat_monitor_enabled:  active.append("Chat Monitor")
                 await edit_menu(query,
                     "⚠️ <b>Cannot start Auto-Update</b>\n\n"
                     f"<b>{' and '.join(active)}</b> is currently active.\n\n"
@@ -5223,14 +5503,81 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
                     InlineKeyboardMarkup(back_section("section_ads"))
                 )
                 return
-            mode     = _s(tuser.id).settings.get("mode","fixed")
-            interval = _s(tuser.id).settings.get("interval",2)
-            _s(tuser.id).refresh_task = asyncio.create_task(auto_update_loop(context.bot, chat_id))
+            mode     = s.get("mode","fixed")
+            interval = s.get("interval",2)
+            _reset_ad_failures(sess, slot_idx)
+            task = asyncio.create_task(auto_update_loop(context.bot, chat_id, slot_idx))
+            _set_ad_task(sess, slot_idx, task)
             await edit_menu(query,
-                f"🟢 <b>Price update started!</b>\n🔀 <code>{mode.upper()}</code> | ⏱ every <code>{interval}</code> min\n\n"
+                f"🟢 <b>{label} price update started!</b>\n🔀 <code>{mode.upper()}</code> | ⏱ every <code>{interval}</code> min\n\n"
                 + ads_section_text(tuser.id),
                 ads_section_keyboard(tuser.id)
             )
+
+    # ── 🔀 Multi-ad: switch which ad the menu is editing ──
+    elif data in ("edit_ad_1", "edit_ad_2", "edit_ad_3"):
+        sess = _s(tuser.id)
+        target = int(data[-1]) - 2   # "edit_ad_1" -> -1, "edit_ad_2" -> 0, "edit_ad_3" -> 1
+        if target == -1 or target < len(sess.extra_ad_slots):
+            sess.editing_slot = target
+        await edit_menu(query, ads_section_text(tuser.id), ads_section_keyboard(tuser.id))
+
+    # ── ➕ Add another ad slot (up to MAX_ADS_PER_USER) ──
+    elif data == "add_ad_slot":
+        sess = _s(tuser.id)
+        if sess.total_ad_slots() >= MAX_ADS_PER_USER:
+            await edit_menu(query, f"❌ Maximum {MAX_ADS_PER_USER} ads per account.", InlineKeyboardMarkup(back_section("section_ads")))
+            return
+        sess.add_ad_slot()
+        sess.editing_slot = len(sess.extra_ad_slots) - 1   # jump straight to editing the new one
+        await edit_menu(query,
+            f"✅ <b>{_ad_slot_label(sess.editing_slot)} added!</b>\n\n"
+            "Set its Ad ID, fetch its details, then choose a mode — "
+            "it shares this account's Bybit API key and UID with your other ads.\n\n"
+            + ads_section_text(tuser.id),
+            ads_section_keyboard(tuser.id)
+        )
+
+    # ── 🗑 Remove the ad slot currently being edited ──
+    elif data == "remove_ad_slot":
+        sess = _s(tuser.id)
+        slot_idx = sess.editing_slot
+        if slot_idx == -1:
+            await edit_menu(query, "❌ Ad 1 can't be removed — stop it instead.", InlineKeyboardMarkup(back_section("section_ads")))
+            return
+        label = _ad_slot_label(slot_idx)
+        sess.remove_ad_slot(slot_idx)
+        sess.editing_slot = -1   # back to Ad 1
+        await edit_menu(query,
+            f"🗑 <b>{label} removed.</b>\n\n" + ads_section_text(tuser.id),
+            ads_section_keyboard(tuser.id)
+        )
+
+    # ── 🗂 All-ads dashboard ──
+    elif data == "ads_dashboard":
+        await edit_menu(query, ads_dashboard_text(tuser.id), ads_dashboard_keyboard(tuser.id))
+
+    # ── ⏹ Stop one specific ad from the dashboard ──
+    elif data in ("stop_ad_1", "stop_ad_2", "stop_ad_3"):
+        sess = _s(tuser.id)
+        target = int(data[-1]) - 2
+        sess.stop_ad_slot(target)
+        _set_ad_current_price(sess, target, Decimal("0"))
+        await edit_menu(query,
+            f"🔴 <b>{_ad_slot_label(target)} stopped.</b>\n\n" + ads_dashboard_text(tuser.id),
+            ads_dashboard_keyboard(tuser.id)
+        )
+
+    # ── ⏹ Stop all ads in one tap ──
+    elif data == "stop_all_ads":
+        sess = _s(tuser.id)
+        for i in range(-1, len(sess.extra_ad_slots)):
+            sess.stop_ad_slot(i)
+            _set_ad_current_price(sess, i, Decimal("0"))
+        await edit_menu(query,
+            "🔴 <b>All ads stopped.</b>\n\n" + ads_dashboard_text(tuser.id),
+            ads_dashboard_keyboard(tuser.id)
+        )
 
     # ── ✅ Mark as Paid ──
     elif data.startswith("pay_") and not data.startswith("paywarn_"):
@@ -5647,18 +5994,29 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     elif action == "ad_id":
-        # Save under BOTH the slot-keyed key and the generic fallback key
-        slot_str = _get_user_slot_str(uid)
-        _s(uid).settings[f"ad_id_{slot_str}"] = text.strip()
-        _s(uid).settings["ad_id"]              = text.strip()
-        _s(uid).ad_data.clear()
+        sess = _s(uid)
+        slot_idx = sess.editing_slot
+        if slot_idx == -1:
+            # Save under BOTH the slot-keyed key and the generic fallback key
+            slot_str = _get_user_slot_str(uid)
+            sess.settings[f"ad_id_{slot_str}"] = text.strip()
+            sess.settings["ad_id"]              = text.strip()
+            sess.ad_data.clear()
+            _save_settings(uid)   # persisted — Ad 1 lives on disk per account slot
+            logger.info(f"[AdID] Saved ad_id for user={uid} slot={slot_str} ad_id={text.strip()!r}")
+            label = f"Account {slot_str}"
+        else:
+            # Ads 2/3 are ephemeral (in-memory only), like the rest of the
+            # per-user session state — no disk persistence needed here.
+            s = _ad_settings(sess, slot_idx)
+            s["ad_id"] = text.strip()
+            _ad_data_of(sess, slot_idx).clear()
+            logger.info(f"[AdID] Saved ad_id for user={uid} {_ad_slot_label(slot_idx)} ad_id={text.strip()!r}")
+            label = _ad_slot_label(slot_idx)
         _state["action"] = None
-        # Persist to disk immediately so it survives /start and restarts
-        _save_settings(uid)
-        logger.info(f"[AdID] Saved ad_id for user={uid} slot={slot_str} ad_id={text.strip()!r}")
-        hint = next_setup_hint(uid)
+        hint = next_setup_hint(uid) if slot_idx == -1 else "Now use Fetch Ad Details for this ad."
         await update.message.reply_text(
-            f"✅ <b>Ad ID saved for Account {slot_str}!</b>\n\n"
+            f"✅ <b>Ad ID saved for {label}!</b>\n\n"
             f"<code>{_esc(text.strip())}</code>\n\n"
             f"<i>{_esc(hint)}</i>",
             parse_mode="HTML",
@@ -5698,75 +6056,78 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             val = Decimal(text)
             if val <= 0: raise ValueError
-            slot_str = _get_user_slot_str(uid)
-            _s(uid).settings["increment"]               = text
-            _s(uid).settings[f"increment_{slot_str}"]   = text
+            sess = _s(uid)
+            slot_idx = sess.editing_slot
+            s = _ad_settings(sess, slot_idx)
+            s["increment"] = text
+            if slot_idx == -1:
+                slot_str = _get_user_slot_str(uid)
+                sess.settings[f"increment_{slot_str}"] = text
+                _save_settings(uid)
             _state["action"] = None
-            _save_settings(uid)
-            await reply_with_back(f"✅ <b>Increment saved!</b>\n\n<code>+{_esc(text)}</code> per cycle\n\n<i>{_esc(next_setup_hint(uid))}</i>")
+            hint = next_setup_hint(uid) if slot_idx == -1 else ""
+            await reply_with_back(f"✅ <b>{_ad_slot_label(slot_idx)} increment saved!</b>\n\n<code>+{_esc(text)}</code> per cycle\n\n<i>{_esc(hint)}</i>")
         except Exception:
             await update.message.reply_text("❌ Send a positive number like `0.05`", parse_mode="HTML")
 
     elif action == "float_pct":
-        try:
-            val      = float(text)
-            if val <= 0: raise ValueError
-            token    = _s(uid).ad_data.get("tokenId","USDT").upper()
-            currency = _s(uid).ad_data.get("currencyId","NGN").upper()
-            max_pct  = get_max_float_pct(currency, token)
-            min_pct  = get_min_float_pct(currency, token)
-            if val > max_pct:
-                await update.message.reply_text(
-                    f"❌ <code>{val}%</code> exceeds max for {token}/{currency}\n"
-                    f"Range: <code>{min_pct}%</code> – <code>{max_pct}%</code>",
-                    parse_mode="HTML"
-                )
-                return
-            if min_pct > 0 and val < min_pct:
-                await update.message.reply_text(
-                    f"❌ <code>{val}%</code> is below min for {token}/{currency}\n"
-                    f"Range: <code>{min_pct}%</code> – <code>{max_pct}%</code>",
-                    parse_mode="HTML"
-                )
-                return
+        sess = _s(uid)
+        slot_idx = sess.editing_slot
+        ad_data = _ad_data_of(sess, slot_idx)
+        token    = ad_data.get("tokenId","USDT").upper()
+        currency = ad_data.get("currencyId","NGN").upper()
+        other_pcts = sess.get_active_float_pcts(exclude_index=slot_idx, currency_id=currency, token_id=token)
+        ok, err = validate_float_pct(currency, token, text, other_pcts)
+        if not ok:
+            await update.message.reply_text(err, parse_mode="HTML")
+            return
+        s = _ad_settings(sess, slot_idx)
+        s["float_pct"] = text
+        if slot_idx == -1:
             slot_str = _get_user_slot_str(uid)
-            _s(uid).settings["float_pct"]              = text
-            _s(uid).settings[f"float_pct_{slot_str}"]  = text
-            _state["action"] = None
+            sess.settings[f"float_pct_{slot_str}"] = text
             _save_settings(uid)
-            await reply_with_back(
-                f"✅ <b>Float % saved!</b>\n\n<code>{text}%</code> for <code>{token}/{currency}</code>\n\n"
-                f"_{next_setup_hint(uid)}_"
-            )
-        except Exception:
-            await update.message.reply_text("❌ Send a number like `105`", parse_mode="HTML")
+        _state["action"] = None
+        hint = next_setup_hint(uid) if slot_idx == -1 else ""
+        await reply_with_back(
+            f"✅ <b>{_ad_slot_label(slot_idx)} float % saved!</b>\n\n<code>{text}%</code> for <code>{token}/{currency}</code>\n\n"
+            f"_{hint}_"
+        )
 
     elif action == "ngn_usdt_ref":
         try:
             val = float(text)
             if val <= 0: raise ValueError
-            slot_str = _get_user_slot_str(uid)
-            _s(uid).settings["local_usdt_ref"]                 = text
-            _s(uid).settings[f"local_usdt_ref_{slot_str}"]     = text
-            _scur = _s(uid).ad_data.get("currencyId","NGN").upper() if _s(uid).ad_data else "NGN"
+            sess = _s(uid)
+            sess.sync_shared_ref(text)   # applies to every ad slot at once
+            if sess.editing_slot == -1:
+                slot_str = _get_user_slot_str(uid)
+                sess.settings[f"local_usdt_ref_{slot_str}"] = text
+                _save_settings(uid)
+            _scur = _ad_data_of(sess, sess.editing_slot).get("currencyId","NGN").upper()
             _state["action"] = None
-            _save_settings(uid)
-            await reply_with_back(f"✅ <b>{_esc(_scur)}/USDT ref saved!</b>\n\n<code>{_esc(text)}</code>\n\n<i>{_esc(next_setup_hint(uid))}</i>")
+            shared_note = " (applies to all your ads)" if sess.total_ad_slots() > 1 else ""
+            await reply_with_back(f"✅ <b>{_esc(_scur)}/USDT ref saved!{shared_note}</b>\n\n<code>{_esc(text)}</code>\n\n<i>{_esc(next_setup_hint(uid) if sess.editing_slot == -1 else '')}</i>")
         except Exception:
             await update.message.reply_text("❌ Send a number like `1580`", parse_mode="HTML")
 
     elif action == "interval":
-        try:
-            val = int(text)
-            if val < 1: raise ValueError
+        ok, err = validate_interval(text)
+        if not ok:
+            await update.message.reply_text(err, parse_mode="HTML")
+            return
+        val = int(text)
+        sess = _s(uid)
+        slot_idx = sess.editing_slot
+        s = _ad_settings(sess, slot_idx)
+        s["interval"] = val
+        if slot_idx == -1:
             slot_str = _get_user_slot_str(uid)
-            _s(uid).settings["interval"]               = val
-            _s(uid).settings[f"interval_{slot_str}"]   = val
-            _state["action"] = None
+            sess.settings[f"interval_{slot_str}"] = val
             _save_settings(uid)
-            await reply_with_back(f"✅ <b>Interval saved!</b>\n\nEvery <code>{_esc(str(val))}</code> min\n\n<i>{_esc(next_setup_hint(uid))}</i>")
-        except Exception:
-            await update.message.reply_text("❌ Send a whole number like `2`", parse_mode="HTML")
+        _state["action"] = None
+        hint = next_setup_hint(uid) if slot_idx == -1 else ""
+        await reply_with_back(f"✅ <b>{_ad_slot_label(slot_idx)} interval saved!</b>\n\nEvery <code>{_esc(str(val))}</code> min\n\n<i>{_esc(hint)}</i>")
 
     elif action == "sender_name":
         _s(uid).settings["sender_name"] = text.strip()
