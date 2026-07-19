@@ -25,6 +25,7 @@ from bybit import (
     get_user_payment_list,
     review_seller_cancel,
     validate_interval, validate_float_pct, MAX_ADS_PER_USER,
+    get_min_price_gap,
 )
 from fraud_check import check_buyer_name, load_scammers, get_scammer_count, get_last_updated
 import db
@@ -189,6 +190,51 @@ def _reset_ad_failures(sess, slot_idx: int):
         sess.consecutive_failures = 0
     else:
         sess.extra_ad_slots[slot_idx]["consecutive_failures"] = 0
+
+
+def _resolve_price_collision(sess, slot_idx: int, currency_id: str, token_id: str, natural_price: Decimal) -> Decimal:
+    """
+    Multiple ads on the SAME (currency, coin) pair are allowed to use the
+    same floating % (or fixed base) — Bybit doesn't reject on the % or the
+    starting price, it rejects when the actual POSTED prices land too
+    close together. So: if this ad's naturally-computed price is within
+    get_min_price_gap() of another active ad's currently-known price on
+    the same pair, step this one down below the lowest conflicting price
+    by that gap — e.g. Ad 1 posts ₦84,908,465.23, Ad 2 (same pair, same
+    float) would naturally compute the same number, so it gets pushed to
+    ₦84,903,465.23 or lower instead.
+
+    This only ever looks at OTHER slots — never changes which ad "wins"
+    the natural price, it just moves the others out of the way. Resolves
+    iteratively so a 3-way collision clears every conflict, not just the
+    nearest one.
+    """
+    gap = get_min_price_gap(currency_id)
+    conflicting_prices = []
+    for i in range(-1, len(sess.extra_ad_slots)):
+        if i == slot_idx:
+            continue
+        other_ad_data = _ad_data_of(sess, i)
+        if not other_ad_data:
+            continue
+        if (other_ad_data.get("currencyId","").upper() != currency_id.upper()
+                or other_ad_data.get("tokenId","").upper() != token_id.upper()):
+            continue
+        other_price = _ad_current_price(sess, i)
+        if other_price and other_price > 0:
+            conflicting_prices.append(other_price)
+
+    price = natural_price
+    for _ in range(10):   # safety cap — converges in 1-2 passes in practice
+        adjusted = False
+        for cp in conflicting_prices:
+            if abs(price - cp) < gap:
+                price = cp - gap
+                adjusted = True
+        if not adjusted:
+            break
+    return price
+
 
 def _settings(uid: int) -> dict:
     """Shorthand: get the mutable settings dict for uid."""
@@ -3506,10 +3552,22 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
         prefix = f"[{label}] " if sess.total_ad_slots() > 1 else ""
 
         if mode == "fixed":
-            new_p     = _ad_current_price(sess, slot_idx) + increment
-            new_p_str = str(new_p.quantize(Decimal("0.00000001"), rounding=ROUND_HALF_UP))
+            new_p    = _ad_current_price(sess, slot_idx) + increment
+            _quant   = Decimal("0.00000001")   # unchanged — fixed mode's original precision
         else:
-            float_pct      = float(s.get("float_pct",0))
+            try:
+                float_pct = float(s.get("float_pct") or 0)
+            except (TypeError, ValueError):
+                float_pct = 0
+            if float_pct <= 0:
+                await bot.send_message(chat_id=chat_id,
+                    text=(
+                        f"⚠️ {prefix}<b>Cycle {cycle}</b> — Float % isn't set yet.\n"
+                        f"Set it from the AD Price Bot menu, then restart {label}."
+                    ), parse_mode="HTML")
+                _set_ad_running(sess, slot_idx, False)
+                _set_ad_task(sess, slot_idx, None)
+                return
             local_usdt_ref = float(sess.shared_local_usdt_ref or s.get("local_usdt_ref") or 0)
             new_p_str, err = calc_floating_price(ad_data, float_pct, local_usdt_ref)
             if err:
@@ -3519,6 +3577,20 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                     if not _ad_running(sess, slot_idx): break
                     await asyncio.sleep(1)
                 continue
+            new_p  = Decimal(new_p_str)   # calc_floating_price's own 0.01 precision
+            _quant = Decimal("0.01")
+
+        # ── Same-float multi-ad support: same % is allowed across ads on
+        # the same pair now — this nudges the actual PRICE apart instead,
+        # only when another active ad on the identical pair would
+        # otherwise land within the minimum gap. ──
+        if sess.total_ad_slots() > 1:
+            new_p = _resolve_price_collision(
+                sess, slot_idx,
+                ad_data.get("currencyId",""), ad_data.get("tokenId",""),
+                new_p
+            )
+        new_p_str = str(new_p.quantize(_quant, rounding=ROUND_HALF_UP))
 
         result   = await asyncio.get_event_loop().run_in_executor(
             _ad_executor, modify_ad, s["ad_id"], new_p_str, ad_data, creds
@@ -3540,8 +3612,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                 retry_msg  = retry_result.get("retMsg",  retry_result.get("ret_msg","Unknown"))
                 if retry_code == 0:
                     _reset_ad_failures(sess, slot_idx)
-                    if mode == "fixed":
-                        _set_ad_current_price(sess, slot_idx, Decimal(bybit_max))
+                    _set_ad_current_price(sess, slot_idx, Decimal(bybit_max))
                     await bot.send_message(chat_id=chat_id,
                         text=(
                             f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n"
@@ -3558,8 +3629,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
 
         elif ret_code == 0:
             _reset_ad_failures(sess, slot_idx)
-            if mode == "fixed":
-                _set_ad_current_price(sess, slot_idx, new_p)
+            _set_ad_current_price(sess, slot_idx, new_p)
             await bot.send_message(chat_id=chat_id,
                 text=f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n💲 <code>{new_p_str}</code> ({mode.upper()})",
                 parse_mode="HTML")
@@ -4839,7 +4909,15 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         else:
             # ── FIX: call calc_floating_price directly (it is sync) — do NOT wrap in
             # run_in_executor which causes tuple-unpacking to silently fail.
-            float_pct      = float(_s(tuser.id).settings.get("float_pct", 0))
+            try:
+                float_pct = float(_s(tuser.id).settings.get("float_pct") or 0)
+            except (TypeError, ValueError):
+                float_pct = 0
+            if float_pct <= 0:
+                await edit_menu(query,
+                    "❌ Float % isn't set yet. Tap 📊 Set Float % first, then Update Once Now.",
+                    InlineKeyboardMarkup(back_section("section_ads")))
+                return
             local_usdt_ref = float(_s(tuser.id).settings.get("local_usdt_ref") or 0)
             price, err     = calc_floating_price(_s(tuser.id).ad_data, float_pct, local_usdt_ref)
             if err:
