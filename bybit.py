@@ -75,8 +75,8 @@ def _resolve_creds(creds: dict | None) -> tuple[str, str]:
 # Max/Min float pct per currency and coin
 # ─────────────────────────────────────────
 MAX_FLOAT_PCT = {
-    "NGN": {"BTC": 110, "ETH": 110, "USDT": 110, "USDC": 110},
-    "USD": {"BTC": 130, "ETH": 130, "USDT": 120, "USDC": 120},
+    "NGN": {"BTC": 111, "ETH": 111, "USDT": 110, "USDC": 110},
+    "USD": {"BTC": 131, "ETH": 131, "USDT": 120, "USDC": 120},
     "GHS": {"BTC": 130, "ETH": 130},
     "GBP": {"BTC": 130, "ETH": 130},
     "EUR": {"BTC": 125, "ETH": 125},
