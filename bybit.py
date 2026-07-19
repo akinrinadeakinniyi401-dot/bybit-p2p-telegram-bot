@@ -22,6 +22,7 @@ import requests
 import json
 import logging
 import uuid
+from decimal import Decimal
 from config import BYBIT_ACCOUNTS
 
 logger = logging.getLogger(__name__)
@@ -107,6 +108,33 @@ def get_min_float_pct(currency_id: str, token_id: str) -> int:
 
 def currency_needs_ref(currency_id: str) -> bool:
     return currency_id.upper() in NEEDS_LOCAL_REF
+
+
+# ─────────────────────────────────────────
+# Minimum PRICE gap for same-float multi-ad setups
+# ─────────────────────────────────────────
+# Multiple ads on the exact same (currency, coin) pair are now allowed to
+# use the SAME floating % (or fixed base) — Bybit doesn't reject on % or
+# starting price alone, it rejects when the *final posted prices* land too
+# close together. So instead of forcing distinct floats, the bot keeps
+# each ad's actual price at least this far apart, in the currency's own
+# units, adjusting automatically (see _resolve_price_collision in bot.py).
+# ₦5,000 default for NGN is a safety margin above the ₦4,465.23 gap a user
+# confirmed Bybit already accepts — tune per currency here if needed.
+MIN_PRICE_GAP = {
+    "NGN": Decimal("5000"),
+    "USD": Decimal("100"),
+    "GHS": Decimal("50"),
+    "GBP": Decimal("50"),
+    "EUR": Decimal("50"),
+    "RUB": Decimal("500"),
+    "KES": Decimal("500"),
+}
+DEFAULT_MIN_PRICE_GAP = Decimal("100")
+
+
+def get_min_price_gap(currency_id: str) -> Decimal:
+    return MIN_PRICE_GAP.get(currency_id.upper(), DEFAULT_MIN_PRICE_GAP)
 
 
 # ─────────────────────────────────────────
