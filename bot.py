@@ -204,12 +204,17 @@ def _resolve_price_collision(sess, slot_idx: int, currency_id: str, token_id: st
     float) would naturally compute the same number, so it gets pushed to
     ₦84,903,465.23 or lower instead.
 
+    Fixed-amount gap for BTC/ETH pairs (₦5,000 / $100 etc — see
+    MIN_PRICE_GAP in bybit.py). For USDT/USDC specifically, the gap is 1%
+    of the actual price instead, since a flat amount would be the wrong
+    scale for a stablecoin price (see get_min_price_gap in bybit.py).
+
     This only ever looks at OTHER slots — never changes which ad "wins"
     the natural price, it just moves the others out of the way. Resolves
     iteratively so a 3-way collision clears every conflict, not just the
     nearest one.
     """
-    gap = get_min_price_gap(currency_id)
+    gap = get_min_price_gap(currency_id, token_id, natural_price)
     conflicting_prices = []
     for i in range(-1, len(sess.extra_ad_slots)):
         if i == slot_idx:
@@ -4825,8 +4830,9 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         )
         other_pcts = sess.get_active_float_pcts(exclude_index=slot_idx, currency_id=currency, token_id=token)
         gap_note = (
-            f"\n\n⚠️ Your other active {token}/{currency} ad(s) are using: {', '.join(f'{p}%' for p in other_pcts)} — "
-            f"yours must be at least 1% away from each of these."
+            f"\n\nℹ️ Your other active {token}/{currency} ad(s) are also using: "
+            f"{', '.join(f'{p}%' for p in other_pcts)} — that's fine, using the same % is allowed. "
+            f"The bot automatically keeps the posted PRICES far enough apart."
             if other_pcts else ""
         )
         await edit_menu(query,
@@ -5549,18 +5555,15 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             if not ok:
                 await edit_menu(query, err, InlineKeyboardMarkup(back_section("section_ads")))
                 return
-            # ── 1% float gap — re-validated here too, since a slot could in
-            # theory have been configured before another ad claimed its %
-            # (e.g. edited out of order) ──
+            # ── Float % range check — defense in depth (already enforced
+            # when the value was entered, re-checked here in case of stale
+            # state). Matching another active ad's % is allowed — the bot
+            # keeps the actual posted PRICES apart live, in the loop
+            # itself, not by restricting the % at this stage. ──
             if s.get("mode") == "floating":
-                other_pcts = sess.get_active_float_pcts(
-                    exclude_index=slot_idx,
-                    currency_id=ad_data.get("currencyId","NGN"),
-                    token_id=ad_data.get("tokenId","USDT"),
-                )
                 fok, ferr = validate_float_pct(
                     ad_data.get("currencyId","NGN"), ad_data.get("tokenId","USDT"),
-                    s.get("float_pct", 0), other_pcts
+                    s.get("float_pct", 0)
                 )
                 if not fok:
                     await edit_menu(query, ferr, InlineKeyboardMarkup(back_section("section_ads")))
@@ -6154,8 +6157,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ad_data = _ad_data_of(sess, slot_idx)
         token    = ad_data.get("tokenId","USDT").upper()
         currency = ad_data.get("currencyId","NGN").upper()
-        other_pcts = sess.get_active_float_pcts(exclude_index=slot_idx, currency_id=currency, token_id=token)
-        ok, err = validate_float_pct(currency, token, text, other_pcts)
+        ok, err = validate_float_pct(currency, token, text)
         if not ok:
             await update.message.reply_text(err, parse_mode="HTML")
             return
