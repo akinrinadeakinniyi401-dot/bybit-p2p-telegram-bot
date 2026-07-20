@@ -3518,12 +3518,14 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
 
     Auto-stop-on-failure: when a user has MORE THAN ONE ad active, two
     consecutive failed updates on this specific ad auto-stops just this
-    slot and notifies the user to fix it on Bybit directly — this is the
-    fallback for "Bybit silently rejects a too-close/duplicate price"
-    since there's no distinct retCode for that case (912120022, handled
-    below, is the *out-of-range* case and is left exactly as before).
-    Single-ad users keep the original behavior: it keeps retrying forever
-    on failure, since there's no other ad's price at risk for them.
+    slot and notifies the user to fix it on Bybit directly. This is now
+    only a fallback for genuinely unexpected errors — the two known,
+    recoverable cases are handled directly instead of counting as
+    failures: 912120022 (out-of-range — retried with Bybit's own stated
+    max) and 90043 (new price rounds to the same value the ad already has
+    live — retried with a small nudge). Single-ad users keep the original
+    behavior on any other error: it keeps retrying forever, since there's
+    no other ad's price at risk for them.
     """
     sess = _s(chat_id)
     _set_ad_running(sess, slot_idx, True)
@@ -3606,8 +3608,8 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
         if ret_code == 912120022:
             # Out-of-range — Bybit tells us its own max/min, so retry with
             # that value directly. Left exactly as the original single-ad
-            # logic since it's known-good and unrelated to the duplicate-
-            # price case (there's no distinct retCode for that one).
+            # logic since it's known-good. (The duplicate/unchanged-price
+            # case has its own retCode — 90043 — handled separately below.)
             bybit_max = _extract_bybit_max(ret_msg)
             if bybit_max:
                 retry_result = await asyncio.get_event_loop().run_in_executor(
@@ -3630,6 +3632,37 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                         return
             else:
                 if await _handle_ad_cycle_failure(bot, chat_id, sess, slot_idx, label, cycle, ret_code, ret_msg):
+                    return
+
+        elif ret_code == 90043:
+            # "The price of this P2P ad differs from your existing ad by
+            # less than 0%." — this fires when the computed price rounds
+            # to the SAME value the ad already has live on Bybit (happens
+            # when the underlying market barely moves between cycles, or
+            # when this ad hasn't changed since its last successful post).
+            # This is fully recoverable — nudge the price by this pair's
+            # minimum gap and retry immediately, same pattern as the
+            # out-of-range case above, instead of counting it as a failure.
+            nudge_gap  = get_min_price_gap(ad_data.get("currencyId",""), ad_data.get("tokenId",""), new_p)
+            nudged_p   = new_p - nudge_gap
+            nudged_str = str(nudged_p.quantize(_quant, rounding=ROUND_HALF_UP))
+            retry_result = await asyncio.get_event_loop().run_in_executor(
+                _ad_executor, modify_ad, s["ad_id"], nudged_str, ad_data, creds
+            )
+            retry_code = retry_result.get("retCode", retry_result.get("ret_code",-1))
+            retry_msg  = retry_result.get("retMsg",  retry_result.get("ret_msg","Unknown"))
+            if retry_code == 0:
+                _reset_ad_failures(sess, slot_idx)
+                _set_ad_current_price(sess, slot_idx, nudged_p)
+                await bot.send_message(chat_id=chat_id,
+                    text=(
+                        f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n"
+                        f"⚠️ Price unchanged from last post — nudged\n"
+                        f"💲 <code>{nudged_str}</code> ({mode.upper()})"
+                    ),
+                    parse_mode="HTML")
+            else:
+                if await _handle_ad_cycle_failure(bot, chat_id, sess, slot_idx, label, cycle, retry_code, retry_msg, ad_data):
                     return
 
         elif ret_code == 0:
@@ -4943,10 +4976,22 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 rc    = result.get("retCode", result.get("ret_code",-1))
                 rm    = result.get("retMsg",  result.get("ret_msg",""))
                 price = bybit_max
+        elif rc == 90043:
+            # Price rounds to the same value the ad already has live —
+            # nudge by this pair's minimum gap and retry once (same
+            # recoverable case as in auto_update_loop, see there for why).
+            _ad_data_now = _s(tuser.id).ad_data
+            _nudge = get_min_price_gap(_ad_data_now.get("currencyId",""), _ad_data_now.get("tokenId",""), Decimal(str(price)))
+            _nudged_price = str((Decimal(str(price)) - _nudge).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+            result = await asyncio.get_event_loop().run_in_executor(
+                _ad_executor, modify_ad, _s(tuser.id).settings["ad_id"], _nudged_price, _ad_data_now, _update_creds
+            )
+            rc    = result.get("retCode", result.get("ret_code",-1))
+            rm    = result.get("retMsg",  result.get("ret_msg",""))
+            price = _nudged_price
         if rc == 0:
             # ── Advance current_price so the next cycle (auto or manual) continues from here
-            if mode == "fixed":
-                _s(tuser.id).current_price = Decimal(price)
+            _s(tuser.id).current_price = Decimal(str(price))
             await edit_menu(query,
                 f"✅ <b>Updated!</b> Price: <code>{price}</code> ({mode.upper()})\n\n_{next_setup_hint(tuser.id)}_",
                 InlineKeyboardMarkup(back_section("section_ads"))
