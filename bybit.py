@@ -133,7 +133,26 @@ MIN_PRICE_GAP = {
 DEFAULT_MIN_PRICE_GAP = Decimal("100")
 
 
-def get_min_price_gap(currency_id: str) -> Decimal:
+# Stablecoins trade close to 1:1 with the local fx rate — a flat currency
+# amount would be the wrong scale entirely (₦5,000 is enormous next to a
+# ~₦1,600 USDT price, but tiny next to an ₦84,000,000 BTC price). So for
+# USDT/USDC specifically, the gap is 1% of the actual price instead — this
+# is the one place the original "1% rule" still applies, matching how
+# these pairs are actually used (Fixed Mode, per the docs). BTC/ETH keep
+# the flat currency-amount gap above, calibrated for their much larger
+# price scale.
+STABLECOIN_TOKENS  = {"USDT", "USDC"}
+STABLECOIN_GAP_PCT = Decimal("0.01")   # 1% of price
+
+
+def get_min_price_gap(currency_id: str, token_id: str = "", reference_price=None) -> Decimal:
+    if token_id.upper() in STABLECOIN_TOKENS and reference_price:
+        try:
+            pct_gap = Decimal(str(reference_price)) * STABLECOIN_GAP_PCT
+            if pct_gap > 0:
+                return pct_gap.quantize(Decimal("0.01"))
+        except Exception:
+            pass
     return MIN_PRICE_GAP.get(currency_id.upper(), DEFAULT_MIN_PRICE_GAP)
 
 
@@ -142,14 +161,22 @@ def get_min_price_gap(currency_id: str) -> Decimal:
 # ─────────────────────────────────────────
 # Two independent guardrails, both enforced at INPUT time (when the user
 # sets a value) rather than at submit time — this avoids any race between
-# multiple ad-update loops trying to submit conflicting prices at once:
+# ─────────────────────────────────────────
+# Multi-ad safety validation (up to 3 ads per user)
+# ─────────────────────────────────────────
+# Two independent guardrails, both enforced at INPUT time (when the user
+# sets a value) rather than at submit time:
 #   1. Bybit's own min/max floating % bounds per currency/coin (already
 #      encoded in MAX_FLOAT_PCT / MIN_FLOAT_PCT above).
-#   2. A minimum 1-percentage-point gap between every active ad's floating
-#      % for the same user — this is what stops two ads from ever landing
-#      on the same (or near-identical) price, which Bybit rejects.
+#   2. Update interval floor — see validate_interval below.
+#
+# NOTE: ads on the same pair are now allowed to use the SAME floating %
+# (this used to be blocked by a 1-percentage-point gap requirement here —
+# that's been removed). Bybit doesn't actually reject on matching %, it
+# rejects when the final POSTED PRICES land too close together, so that's
+# handled at the price level instead, live, right before each submission —
+# see _resolve_price_collision() in bot.py.
 MIN_AD_INTERVAL_MINUTES = 2
-MIN_FLOAT_PCT_GAP = 1.0
 MAX_ADS_PER_USER = 3
 
 
@@ -171,16 +198,13 @@ def validate_interval(minutes) -> tuple[bool, str]:
     return True, ""
 
 
-def validate_float_pct(currency_id: str, token_id: str, new_pct, other_active_pcts: list) -> tuple[bool, str]:
+def validate_float_pct(currency_id: str, token_id: str, new_pct, other_active_pcts: list = None) -> tuple[bool, str]:
     """
     Validate a floating-mode percentage BEFORE it's saved to an ad slot.
-    Checks it against Bybit's allowed min/max for this currency/coin, and
-    that it's at least MIN_FLOAT_PCT_GAP away from every other currently
-    active ad's floating % for this same user (so two ads can never be
-    configured to converge on the same price in the first place).
-
-    other_active_pcts: floating %s of this user's OTHER active ad slots
-    (skip the slot being edited). None/empty entries are ignored.
+    Only checks it against Bybit's allowed min/max for this currency/coin
+    — matching another active ad's % is explicitly ALLOWED now (see note
+    above). other_active_pcts is accepted-but-unused so existing call
+    sites don't need to change; kept for signature compatibility.
 
     Returns (ok, error_message) — error_message is "" when ok is True.
     """
@@ -193,22 +217,6 @@ def validate_float_pct(currency_id: str, token_id: str, new_pct, other_active_pc
     hi = get_max_float_pct(currency_id, token_id)
     if pct < lo or pct > hi:
         return False, f"❌ {token_id}/{currency_id} floating % must be between {lo}% and {hi}%."
-
-    for other in other_active_pcts:
-        if other in (None, ""):
-            continue
-        try:
-            other_val = float(other)
-        except (TypeError, ValueError):
-            continue
-        if abs(pct - other_val) < MIN_FLOAT_PCT_GAP:
-            suggestion_lo = other_val - MIN_FLOAT_PCT_GAP
-            suggestion_hi = other_val + MIN_FLOAT_PCT_GAP
-            return False, (
-                f"❌ Another active ad on this account is already using {other_val:g}%. "
-                f"Pick a value at least {MIN_FLOAT_PCT_GAP:g}% away — "
-                f"{suggestion_lo:g}% or lower, or {suggestion_hi:g}% or higher."
-            )
 
     return True, ""
 
