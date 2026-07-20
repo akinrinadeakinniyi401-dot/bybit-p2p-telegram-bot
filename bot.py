@@ -6496,7 +6496,8 @@ def _reset_user_session(sess) -> bool:
         sess.chat_monitor_enabled  or sess.auto_pay_enabled or
         sess.flw_pay_enabled       or sess.paga_pay_enabled or
         sess.buyer_protection_on   or sess.name_match_enabled or
-        sess.sell_msg_enabled
+        sess.sell_msg_enabled      or
+        any(slot["running"] for slot in sess.extra_ad_slots)   # Ad 2 / Ad 3
     )
     if not was_active:
         return False
@@ -6514,6 +6515,19 @@ def _reset_user_session(sess) -> bool:
     if sess.chat_monitor_task and not sess.chat_monitor_task.done():
         sess.chat_monitor_task.cancel()
     sess.chat_monitor_task = None
+
+    # Stop and clear Ad 2 / Ad 3 too — these were previously left running
+    # indefinitely since this function predates multi-ad support.
+    for _slot in sess.extra_ad_slots:
+        _task = _slot.get("task")
+        if _task and not _task.done():
+            _task.cancel()
+        _slot["running"] = False
+        _slot["task"]    = None
+    sess.extra_ad_slots        = []
+    sess.shared_local_usdt_ref = ""
+    sess.consecutive_failures  = 0
+    sess.editing_slot          = -1
 
     # Deactivate all feature flags
     sess.auto_pay_enabled    = False
@@ -6597,6 +6611,7 @@ async def _session_auto_reset_loop(bot=None):
                                 "The bot performs an automatic reset every hour to maintain "
                                 "optimal performance and prevent API rate-limit issues.\n\n"
                                 "Your active session has been cleared. This includes:\n"
+                                "• AD Price Bot (all active ads)\n"
                                 "• Order Monitor\n"
                                 "• Chat Monitor\n"
                                 "• Auto-Pay (Bybit / Flutterwave / Paga)\n"
