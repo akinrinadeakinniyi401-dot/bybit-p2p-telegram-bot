@@ -3635,15 +3635,16 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
         ret_msg  = result.get("retMsg",  result.get("ret_msg","Unknown"))
 
         if ret_code == 912120022:
-            # Out-of-range — Bybit tells us its own max/min, so retry with
-            # that value. Retries up to 3 times total, each time reading a
-            # FRESH boundary from the latest response and backing off by a
-            # small safety margin — posting the exact boundary sometimes
-            # gets rejected again if Bybit's live min/max shifted a hair
-            # between attempts (normal market movement over the round
-            # trip). A single one-shot retry at the exact number was not
-            # enough in practice. (The duplicate/unchanged-price case has
-            # its own retCode — 90043 — handled separately below.)
+            # Out-of-range — Bybit tells us its own max/min. The FIRST
+            # retry posts that exact number — it's what Bybit itself just
+            # told us is valid, and with live BTC/ETH prices constantly
+            # moving there's essentially no risk of it colliding with
+            # anything. Only if that exact-boundary attempt ALSO fails
+            # (rare — the live boundary shifted a hair in the round trip)
+            # do later attempts back off with a small safety margin, each
+            # time reading a FRESH boundary from the latest response.
+            # (The duplicate/unchanged-price case has its own retCode —
+            # 90043 — handled separately below.)
             last_code, last_msg = ret_code, ret_msg
             posted_price = None
             for _attempt in range(3):
@@ -3653,8 +3654,11 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                 if not bound_str:
                     break   # couldn't parse a boundary at all — nothing more we can do
                 bound_dec = Decimal(bound_str)
-                margin    = _safety_margin(bound_dec)
-                candidate = (bound_dec - margin) if was_too_high else (bound_dec + margin)
+                if _attempt == 0:
+                    candidate = bound_dec   # exact boundary Bybit just gave us
+                else:
+                    margin    = _safety_margin(bound_dec)
+                    candidate = (bound_dec - margin) if was_too_high else (bound_dec + margin)
                 candidate_str = str(candidate.quantize(_quant, rounding=ROUND_HALF_UP))
 
                 retry_result = await asyncio.get_event_loop().run_in_executor(
@@ -5025,8 +5029,11 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 if not bound_str:
                     break
                 bound_dec = Decimal(bound_str)
-                margin    = _safety_margin(bound_dec)
-                candidate = (bound_dec - margin) if was_too_high else (bound_dec + margin)
+                if _attempt == 0:
+                    candidate = bound_dec   # exact boundary Bybit just gave us
+                else:
+                    margin    = _safety_margin(bound_dec)
+                    candidate = (bound_dec - margin) if was_too_high else (bound_dec + margin)
                 candidate_str = str(candidate.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
                 result = await asyncio.get_event_loop().run_in_executor(
                     _ad_executor, modify_ad, _s(tuser.id).settings["ad_id"], candidate_str, _s(tuser.id).ad_data, _update_creds
