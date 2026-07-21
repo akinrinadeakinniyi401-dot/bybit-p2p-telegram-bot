@@ -3473,6 +3473,35 @@ def _extract_bybit_max(error_msg: str) -> str | None:
     return None
 
 
+def _extract_bybit_bounds(error_msg: str):
+    """
+    Parse BOTH bounds from Bybit's out-of-range message, e.g.
+    'The fixed price set is lower than X or higher than Y.'
+    Returns (min_str, max_str) — either may be None if not present in
+    this particular message.
+    """
+    import re
+    min_match = re.search(r'lower than ([\d.]+)',  error_msg or "")
+    max_match = re.search(r'higher than ([\d.]+)', error_msg or "")
+    min_val = min_match.group(1).rstrip(".") if min_match else None
+    max_val = max_match.group(1).rstrip(".") if max_match else None
+    return min_val, max_val
+
+
+def _safety_margin(price: Decimal) -> Decimal:
+    """
+    Small buffer used when retrying at a Bybit-stated boundary, so we land
+    safely INSIDE the valid range instead of riding exactly on the edge.
+    Posting the exact boundary value sometimes gets rejected again if
+    Bybit's live min/max shifted a hair between it telling us the number
+    and us submitting it (normal market movement over the round-trip).
+    0.02% of price, with a small currency-agnostic floor so it's never
+    effectively zero on cheap-priced pairs.
+    """
+    margin = price * Decimal("0.0002")
+    return margin if margin > Decimal("0.01") else Decimal("0.01")
+
+
 def calc_floating_price(ad_data, float_pct, local_usdt_ref):
     """
     Calculate floating price for any supported currency/token pair.
@@ -3607,31 +3636,50 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
 
         if ret_code == 912120022:
             # Out-of-range — Bybit tells us its own max/min, so retry with
-            # that value directly. Left exactly as the original single-ad
-            # logic since it's known-good. (The duplicate/unchanged-price
-            # case has its own retCode — 90043 — handled separately below.)
-            bybit_max = _extract_bybit_max(ret_msg)
-            if bybit_max:
+            # that value. Retries up to 3 times total, each time reading a
+            # FRESH boundary from the latest response and backing off by a
+            # small safety margin — posting the exact boundary sometimes
+            # gets rejected again if Bybit's live min/max shifted a hair
+            # between attempts (normal market movement over the round
+            # trip). A single one-shot retry at the exact number was not
+            # enough in practice. (The duplicate/unchanged-price case has
+            # its own retCode — 90043 — handled separately below.)
+            last_code, last_msg = ret_code, ret_msg
+            posted_price = None
+            for _attempt in range(3):
+                min_str, max_str = _extract_bybit_bounds(last_msg)
+                was_too_high = max_str is not None
+                bound_str = max_str if was_too_high else min_str
+                if not bound_str:
+                    break   # couldn't parse a boundary at all — nothing more we can do
+                bound_dec = Decimal(bound_str)
+                margin    = _safety_margin(bound_dec)
+                candidate = (bound_dec - margin) if was_too_high else (bound_dec + margin)
+                candidate_str = str(candidate.quantize(_quant, rounding=ROUND_HALF_UP))
+
                 retry_result = await asyncio.get_event_loop().run_in_executor(
-                    _ad_executor, modify_ad, s["ad_id"], bybit_max, ad_data, creds
+                    _ad_executor, modify_ad, s["ad_id"], candidate_str, ad_data, creds
                 )
-                retry_code = retry_result.get("retCode", retry_result.get("ret_code",-1))
-                retry_msg  = retry_result.get("retMsg",  retry_result.get("ret_msg","Unknown"))
-                if retry_code == 0:
-                    _reset_ad_failures(sess, slot_idx)
-                    _set_ad_current_price(sess, slot_idx, Decimal(bybit_max))
-                    await bot.send_message(chat_id=chat_id,
-                        text=(
-                            f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n"
-                            f"⚠️ Original <code>{new_p_str}</code> was out of range\n"
-                            f"💲 Posted Bybit max: <code>{bybit_max}</code> ({mode.upper()})"
-                        ),
-                        parse_mode="HTML")
-                else:
-                    if await _handle_ad_cycle_failure(bot, chat_id, sess, slot_idx, label, cycle, retry_code, retry_msg):
-                        return
+                last_code = retry_result.get("retCode", retry_result.get("ret_code",-1))
+                last_msg  = retry_result.get("retMsg",  retry_result.get("ret_msg","Unknown"))
+                if last_code == 0:
+                    posted_price = candidate
+                    break
+                if last_code != 912120022:
+                    break   # a different error now — stop retrying, fall through to failure handling
+
+            if posted_price is not None:
+                _reset_ad_failures(sess, slot_idx)
+                _set_ad_current_price(sess, slot_idx, posted_price)
+                await bot.send_message(chat_id=chat_id,
+                    text=(
+                        f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n"
+                        f"⚠️ Original <code>{new_p_str}</code> was out of range\n"
+                        f"💲 Posted within Bybit's limit: <code>{posted_price}</code> ({mode.upper()})"
+                    ),
+                    parse_mode="HTML")
             else:
-                if await _handle_ad_cycle_failure(bot, chat_id, sess, slot_idx, label, cycle, ret_code, ret_msg):
+                if await _handle_ad_cycle_failure(bot, chat_id, sess, slot_idx, label, cycle, last_code, last_msg, ad_data):
                     return
 
         elif ret_code == 90043:
@@ -4968,14 +5016,26 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         rc = result.get("retCode", result.get("ret_code",-1))
         rm = result.get("retMsg",  result.get("ret_msg",""))
         if rc == 912120022:
-            bybit_max = _extract_bybit_max(rm)
-            if bybit_max:
+            # Same bounded retry as auto_update_loop — see there for why a
+            # single exact-boundary attempt wasn't reliable enough.
+            for _attempt in range(3):
+                min_str, max_str = _extract_bybit_bounds(rm)
+                was_too_high = max_str is not None
+                bound_str = max_str if was_too_high else min_str
+                if not bound_str:
+                    break
+                bound_dec = Decimal(bound_str)
+                margin    = _safety_margin(bound_dec)
+                candidate = (bound_dec - margin) if was_too_high else (bound_dec + margin)
+                candidate_str = str(candidate.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
                 result = await asyncio.get_event_loop().run_in_executor(
-                    _ad_executor, modify_ad, _s(tuser.id).settings["ad_id"], bybit_max, _s(tuser.id).ad_data, _update_creds
+                    _ad_executor, modify_ad, _s(tuser.id).settings["ad_id"], candidate_str, _s(tuser.id).ad_data, _update_creds
                 )
                 rc    = result.get("retCode", result.get("ret_code",-1))
                 rm    = result.get("retMsg",  result.get("ret_msg",""))
-                price = bybit_max
+                price = candidate_str
+                if rc == 0 or rc != 912120022:
+                    break
         elif rc == 90043:
             # Price rounds to the same value the ad already has live —
             # nudge by this pair's minimum gap and retry once (same
