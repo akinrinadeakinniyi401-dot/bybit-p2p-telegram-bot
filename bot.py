@@ -3,7 +3,7 @@ import random
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 import logging
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_HALF_UP, ROUND_FLOOR, ROUND_CEILING
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.ext import (
@@ -3654,12 +3654,24 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                 if not bound_str:
                     break   # couldn't parse a boundary at all — nothing more we can do
                 bound_dec = Decimal(bound_str)
-                if _attempt == 0:
-                    candidate = bound_dec   # exact boundary Bybit just gave us
+                if _attempt < 2:
+                    # Use Bybit's own string EXACTLY — no re-quantizing. Bybit
+                    # doesn't always use the same decimal precision we do
+                    # (e.g. 3 decimals on some USD pairs vs 2 on NGN), so
+                    # rounding this to our own precision can round IT UP
+                    # past Bybit's actual limit and fail again for a reason
+                    # that has nothing to do with the price being wrong.
+                    candidate_str = bound_str
+                    candidate     = bound_dec
                 else:
+                    # Last resort: nudge off the boundary. Round in the SAFE
+                    # direction (down if we were too high, up if too low) so
+                    # quantizing can never push us back out of range.
                     margin    = _safety_margin(bound_dec)
                     candidate = (bound_dec - margin) if was_too_high else (bound_dec + margin)
-                candidate_str = str(candidate.quantize(_quant, rounding=ROUND_HALF_UP))
+                    safe_rounding = ROUND_FLOOR if was_too_high else ROUND_CEILING
+                    candidate     = candidate.quantize(_quant, rounding=safe_rounding)
+                    candidate_str = str(candidate)
 
                 retry_result = await asyncio.get_event_loop().run_in_executor(
                     _ad_executor, modify_ad, s["ad_id"], candidate_str, ad_data, creds
@@ -5029,12 +5041,13 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 if not bound_str:
                     break
                 bound_dec = Decimal(bound_str)
-                if _attempt == 0:
-                    candidate = bound_dec   # exact boundary Bybit just gave us
+                if _attempt < 2:
+                    candidate_str = bound_str   # Bybit's own string, exactly — see auto_update_loop for why
                 else:
-                    margin    = _safety_margin(bound_dec)
-                    candidate = (bound_dec - margin) if was_too_high else (bound_dec + margin)
-                candidate_str = str(candidate.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+                    margin        = _safety_margin(bound_dec)
+                    candidate     = (bound_dec - margin) if was_too_high else (bound_dec + margin)
+                    safe_rounding = ROUND_FLOOR if was_too_high else ROUND_CEILING
+                    candidate_str = str(candidate.quantize(Decimal("0.01"), rounding=safe_rounding))
                 result = await asyncio.get_event_loop().run_in_executor(
                     _ad_executor, modify_ad, _s(tuser.id).settings["ad_id"], candidate_str, _s(tuser.id).ad_data, _update_creds
                 )
