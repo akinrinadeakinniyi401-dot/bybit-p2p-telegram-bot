@@ -5,3 +5,5 @@ flask
 python-dotenv
 paga-business-client
 openpyxl
+yt-dlp
+imageio-ffmpeg
