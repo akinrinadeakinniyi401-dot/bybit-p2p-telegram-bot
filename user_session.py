@@ -161,6 +161,14 @@ class SessionState:
         self.buy_volume_order_ids: set  = set() # prevents double-counting the same order
         self.buy_volume_started_at      = datetime.now()
 
+        # ── Social media video downloader (Pro) ──
+        # {download_id: {"file_path": str, "dir": str, "cleanup_task": Task}}
+        # Purely in-memory and per-user (this whole object is per-user
+        # already), so one user's downloads can never be looked up or
+        # served to another user — see media_downloader.py for the actual
+        # download/convert logic and the ~60s auto-delete behavior.
+        self.video_downloads: dict = {}
+
     def _maybe_reset_buy_volume(self):
         """Roll the 24h window over if it has elapsed. Called lazily before
         every read/write so no background task is needed for this."""
