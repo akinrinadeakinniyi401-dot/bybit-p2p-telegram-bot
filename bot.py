@@ -36,6 +36,7 @@ from admin_commands import (
     cmd_withdrawals, cmd_approvewithdraw, cmd_rejectwithdraw,
 )
 import help_agent
+import media_downloader as mediadl
 from config import REFERRAL_REWARD_NGN, BOT_OWNER_USERNAME, MIN_WITHDRAWAL_NGN
 
 logger = logging.getLogger(__name__)
@@ -442,6 +443,7 @@ def main_menu_keyboard(uid: int = 0):
         [InlineKeyboardButton("🔑 Set APIs",             callback_data="section_apis")],
         [InlineKeyboardButton("⬆️ Upgrade Plan",         callback_data="upgrade_plan")],
         [InlineKeyboardButton("🎁 Referrals",            callback_data="referrals")],
+        [InlineKeyboardButton("🎬 Video Downloader",     callback_data="video_downloader")],
         [InlineKeyboardButton("📡 Bot Status",           callback_data="bot_status")],
         [InlineKeyboardButton("🌍 Get My IP",            callback_data="get_my_ip")],
         [InlineKeyboardButton("🔁 Reset Session",        callback_data="reset_confirm")],
@@ -5559,6 +5561,46 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 logger.error(f"[Upgrade] Could not notify admin {_admin_id}: {_notify_err}")
                 # The background _upgrade_notifier_loop will retry in 30 s
 
+    # ── 🎵 Convert a downloaded video to audio ──
+    elif data.startswith("conv_audio_"):
+        uid         = query.from_user.id
+        sess        = _s(uid)
+        download_id = data[len("conv_audio_"):]
+        entry       = sess.video_downloads.get(download_id)   # per-user dict — another user's ID can never match here
+        if not entry:
+            await edit_menu(query,
+                f"⌛ This video has expired (files are auto-deleted after {mediadl.FILE_TTL_SECONDS} seconds "
+                "to save space).\n\nSend the link again to get a fresh copy.",
+                InlineKeyboardMarkup(back_main())
+            )
+            return
+        await edit_menu(query, "🎵 Converting to audio...", InlineKeyboardMarkup(back_main()))
+        result = await asyncio.get_event_loop().run_in_executor(None, mediadl.convert_to_audio, entry["file_path"])
+        if not result["ok"]:
+            msg = (f"⌛ This video has expired (files are auto-deleted after {mediadl.FILE_TTL_SECONDS} seconds).\n\n"
+                   "Send the link again to get a fresh copy.") if result["reason"] == "expired" else f"❌ {result['reason']}"
+            await edit_menu(query, msg, InlineKeyboardMarkup(back_main()))
+            return
+        try:
+            with open(result["audio_path"], "rb") as f:
+                await context.bot.send_audio(chat_id=uid, audio=f, caption="🎵 Converted from your video")
+            await edit_menu(query, "✅ Sent as audio above.", InlineKeyboardMarkup(back_main()))
+        except Exception as e:
+            logger.error(f"[MediaDL] send_audio failed: {type(e).__name__}")
+            await edit_menu(query, "❌ Could not send the audio file.", InlineKeyboardMarkup(back_main()))
+
+    # ── 🎬 Video Downloader — prompt for a link ──
+    elif data == "video_downloader":
+        _btn_state["action"] = "video_link"
+        await edit_menu(query,
+            "🎬 <b>Social Media Video Downloader</b>\n\n"
+            "Send me a video link (YouTube, TikTok, Instagram, Twitter/X, Facebook, etc.) "
+            "and I'll download it for you.\n\n"
+            f"⏱ Videos are kept for {mediadl.FILE_TTL_SECONDS} seconds after download — "
+            "if you want the audio version, tap 🎵 Convert to Audio right away.",
+            InlineKeyboardMarkup(back_main())
+        )
+
     # ── 🎁 Referrals ──
     elif data == "referrals":
         uid  = query.from_user.id
@@ -6494,6 +6536,59 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         )
                     except Exception as _notify_err:
                         logger.error(f"[Withdraw] Could not notify admin {admin_chat_id}: {_notify_err}")
+
+    # ── 🎬 Video Downloader — link received ──
+    elif action == "video_link":
+        if not mediadl.looks_like_url(text):
+            await update.message.reply_text(
+                "❌ That doesn't look like a link. Send a direct video link starting with http:// or https://"
+            )
+            return
+        _state["action"] = None
+
+        status_msg = await update.message.reply_text("🔎 Checking link...")
+        probe = await asyncio.get_event_loop().run_in_executor(None, mediadl.probe_video, text)
+        if not probe["ok"]:
+            await status_msg.edit_text(f"❌ {probe['reason']}")
+            return
+
+        await status_msg.edit_text(f"⬇️ Downloading \"{_esc(probe['title'])}\"...")
+        result = await asyncio.get_event_loop().run_in_executor(None, mediadl.download_video, text, uid)
+        if not result["ok"]:
+            await status_msg.edit_text(f"❌ {result['reason']}")
+            return
+
+        download_id = result["download_id"]
+        # Per-user dict on this user's own session — user A's download_id
+        # can never resolve against user B's session, since each user has
+        # their own separate SessionState and their own separate dict.
+        _s(uid).video_downloads[download_id] = {"file_path": result["file_path"], "dir": result["dir"]}
+
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🎵 Convert to Audio", callback_data=f"conv_audio_{download_id}")]])
+        try:
+            with open(result["file_path"], "rb") as f:
+                await update.message.reply_video(
+                    video=f,
+                    caption=f"🎬 {_esc(result['title'])}\n\n⏱ Available for {mediadl.FILE_TTL_SECONDS}s — convert to audio now if you want it.",
+                    reply_markup=keyboard
+                )
+        except Exception as e:
+            logger.error(f"[MediaDL] send_video failed: {type(e).__name__}")
+            await update.message.reply_text("❌ Downloaded, but couldn't send the video (it may be too large for Telegram).")
+            mediadl.cleanup_dir(result["dir"])
+            _s(uid).video_downloads.pop(download_id, None)
+            await status_msg.delete()
+            return
+
+        await status_msg.delete()
+
+        # Auto-delete this download's files ~60s from now no matter what —
+        # runs regardless of whether the user converts to audio in time.
+        async def _cleanup_video_later(_uid=uid, _download_id=download_id, _dir_path=result["dir"]):
+            await asyncio.sleep(mediadl.FILE_TTL_SECONDS)
+            mediadl.cleanup_dir(_dir_path)
+            _s(_uid).video_downloads.pop(_download_id, None)
+        asyncio.create_task(_cleanup_video_later())
 
     else:
         # ── No active input flow — this is free-text chat, not a bot setting.
