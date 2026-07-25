@@ -26,6 +26,7 @@ PRO_FEATURES = {
     "post_ad_prompt",
     "repost_ad_do",
     "remove_ad_do",
+    "video_downloader",
 }
 
 FREE_FEATURES = {
@@ -55,7 +56,7 @@ def is_pro(user_id: int) -> bool:
 
 def requires_pro(callback_data: str) -> bool:
     """Return True if this action requires Pro plan."""
-    for prefix in ["bp_set_", "switch_account_"]:
+    for prefix in ["bp_set_", "switch_account_", "conv_audio_"]:
         if callback_data.startswith(prefix):
             return True
     return callback_data in PRO_FEATURES
