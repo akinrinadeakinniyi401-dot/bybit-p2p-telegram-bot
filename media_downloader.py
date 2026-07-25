@@ -122,6 +122,24 @@ def probe_video(url: str) -> dict:
     return {"ok": True, "reason": "", "title": info.get("title") or "video", "duration": duration}
 
 
+def _has_audio_stream(file_path: str) -> bool:
+    """
+    Quick check that the downloaded file actually has an audio track —
+    using ffmpeg's own stream listing, since imageio-ffmpeg only bundles
+    ffmpeg, not a separate ffprobe binary. Fails open (assumes audio is
+    present) if the check itself errors out, so a probe hiccup never
+    blocks a perfectly good video from being sent.
+    """
+    try:
+        result = subprocess.run(
+            [_ffmpeg_path(), "-i", file_path],
+            capture_output=True, timeout=20
+        )
+        return "Audio:" in result.stderr.decode(errors="ignore")
+    except Exception:
+        return True
+
+
 def download_video(url: str, user_id: int) -> dict:
     """
     Downloads into its own uuid-named folder under this user's own
@@ -136,8 +154,20 @@ def download_video(url: str, user_id: int) -> dict:
 
     opts = _common_opts()
     opts.update({
-        "outtmpl":      out_template,
-        "format":       f"best[filesize<{MAX_FILESIZE_BYTES}]/best",
+        "outtmpl": out_template,
+        # "best" alone can silently pick a VIDEO-ONLY stream once a filesize
+        # filter rules out the properly-muxed option — that's what was
+        # producing videos with no sound. This instead explicitly prefers
+        # separate best-video + best-audio (merged into one mp4 via the
+        # bundled ffmpeg binary), and only falls back to a plain "best" — or
+        # finally *any* best regardless of size — if that combo isn't
+        # available for this particular link.
+        "format": (
+            f"bestvideo[filesize<{MAX_FILESIZE_BYTES}]+bestaudio[filesize<{MAX_FILESIZE_BYTES}]"
+            f"/best[filesize<{MAX_FILESIZE_BYTES}]"
+            f"/best"
+        ),
+        "merge_output_format": "mp4",
         "max_filesize": MAX_FILESIZE_BYTES,
     })
 
@@ -145,6 +175,14 @@ def download_video(url: str, user_id: int) -> dict:
         with yt_dlp.YoutubeDL(opts) as ydl:
             info      = ydl.extract_info(url, download=True)
             file_path = ydl.prepare_filename(info)
+            # When yt-dlp merges separate video+audio streams, the actual
+            # output file's extension becomes merge_output_format (mp4),
+            # which prepare_filename() doesn't always reflect — resolve the
+            # real file on disk if the "expected" path doesn't exist.
+            if not os.path.exists(file_path):
+                mp4_candidate = str(Path(file_path).with_suffix(".mp4"))
+                if os.path.exists(mp4_candidate):
+                    file_path = mp4_candidate
     except Exception as e:
         shutil.rmtree(user_dir, ignore_errors=True)
         logger.error(f"[MediaDL] download failed for user {user_id}: {type(e).__name__}")
@@ -154,10 +192,18 @@ def download_video(url: str, user_id: int) -> dict:
         shutil.rmtree(user_dir, ignore_errors=True)
         return {"ok": False, "reason": "Download failed — no file was produced.", "file_path": "", "dir": "", "download_id": "", "title": ""}
 
+    # The per-stream filesize filters above are a good heuristic but don't
+    # strictly bound the final MERGED file — double check the real result
+    # before trying to hand Telegram something too big to upload.
+    if os.path.getsize(file_path) > MAX_FILESIZE_BYTES:
+        shutil.rmtree(user_dir, ignore_errors=True)
+        return {"ok": False, "reason": "That video is too large to send via Telegram (over ~49MB).", "file_path": "", "dir": "", "download_id": "", "title": ""}
+
     return {
         "ok": True, "reason": "",
         "file_path": file_path, "dir": str(user_dir),
         "download_id": download_id, "title": (info.get("title") or "video") if info else "video",
+        "has_audio": _has_audio_stream(file_path),
     }
 
 
