@@ -5563,31 +5563,42 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
     # ── 🎵 Convert a downloaded video to audio ──
     elif data.startswith("conv_audio_"):
+        # IMPORTANT: this callback's message IS the video itself. edit_menu()
+        # tries edit_message_caption() first, which succeeds on a video
+        # message too — so calling it here would silently rewrite the
+        # video's own caption (and any Main Menu button attached that way
+        # would then try to turn this same video message into the full
+        # dashboard). Everything below sends separate NEW messages instead,
+        # and only ever touches the video's reply_markup (never its caption
+        # or the video itself) to clear the button once it's been used.
         uid         = query.from_user.id
         sess        = _s(uid)
         download_id = data[len("conv_audio_"):]
         entry       = sess.video_downloads.get(download_id)   # per-user dict — another user's ID can never match here
         if not entry:
-            await edit_menu(query,
-                f"⌛ This video has expired (files are auto-deleted after {mediadl.FILE_TTL_SECONDS} seconds "
-                "to save space).\n\nSend the link again to get a fresh copy.",
-                InlineKeyboardMarkup(back_main())
+            await query.answer(
+                f"⌛ This video has expired (files are auto-deleted after {mediadl.FILE_TTL_SECONDS}s). Send the link again.",
+                show_alert=True
             )
             return
-        await edit_menu(query, "🎵 Converting to audio...", InlineKeyboardMarkup(back_main()))
+
+        await query.answer("🎵 Converting to audio...")
         result = await asyncio.get_event_loop().run_in_executor(None, mediadl.convert_to_audio, entry["file_path"])
         if not result["ok"]:
             msg = (f"⌛ This video has expired (files are auto-deleted after {mediadl.FILE_TTL_SECONDS} seconds).\n\n"
                    "Send the link again to get a fresh copy.") if result["reason"] == "expired" else f"❌ {result['reason']}"
-            await edit_menu(query, msg, InlineKeyboardMarkup(back_main()))
+            await context.bot.send_message(chat_id=uid, text=msg)
             return
         try:
             with open(result["audio_path"], "rb") as f:
                 await context.bot.send_audio(chat_id=uid, audio=f, caption="🎵 Converted from your video")
-            await edit_menu(query, "✅ Sent as audio above.", InlineKeyboardMarkup(back_main()))
+            try:
+                await query.edit_message_reply_markup(reply_markup=None)   # clear the button only — video/caption untouched
+            except Exception:
+                pass
         except Exception as e:
             logger.error(f"[MediaDL] send_audio failed: {type(e).__name__}")
-            await edit_menu(query, "❌ Could not send the audio file.", InlineKeyboardMarkup(back_main()))
+            await context.bot.send_message(chat_id=uid, text="❌ Could not send the audio file.")
 
     # ── 🎬 Video Downloader — prompt for a link ──
     elif data == "video_downloader":
@@ -6564,12 +6575,17 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # their own separate SessionState and their own separate dict.
         _s(uid).video_downloads[download_id] = {"file_path": result["file_path"], "dir": result["dir"]}
 
-        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🎵 Convert to Audio", callback_data=f"conv_audio_{download_id}")]])
+        if result.get("has_audio", True):
+            keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🎵 Convert to Audio", callback_data=f"conv_audio_{download_id}")]])
+            caption  = f"🎬 {_esc(result['title'])}\n\n⏱ Available for {mediadl.FILE_TTL_SECONDS}s — convert to audio now if you want it."
+        else:
+            keyboard = None
+            caption  = f"🎬 {_esc(result['title'])}\n\n⚠️ This video has no audio track (Convert to Audio isn't available for it)."
         try:
             with open(result["file_path"], "rb") as f:
                 await update.message.reply_video(
                     video=f,
-                    caption=f"🎬 {_esc(result['title'])}\n\n⏱ Available for {mediadl.FILE_TTL_SECONDS}s — convert to audio now if you want it.",
+                    caption=caption,
                     reply_markup=keyboard
                 )
         except Exception as e:
