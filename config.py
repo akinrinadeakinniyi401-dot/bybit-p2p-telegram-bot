@@ -114,3 +114,9 @@ KNOWLEDGE_FILE_URL = os.getenv(
     "KNOWLEDGE_FILE_URL",
     "https://raw.githubusercontent.com/akinrinadeakinniyi401-dot/bybit-p2p-telegram-bot/main/knowledge.txt"
 )
+
+# ── Public base URL of this deployment ──
+# Same value app.py already uses to register the Telegram webhook — reused
+# here to build the browser-download links for oversized videos (see
+# media_downloader.py / the /download route in app.py).
+PUBLIC_BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
