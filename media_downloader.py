@@ -47,10 +47,13 @@ DOWNLOAD_ROOT = Path(os.getenv("MEDIA_DOWNLOAD_ROOT", "/tmp/media_downloads"))
 DOWNLOAD_ROOT.mkdir(parents=True, exist_ok=True)
 
 MAX_DURATION_SECONDS = 15 * 60           # 15 min cap — keeps downloads quick and bounded
-MAX_FILESIZE_BYTES   = 49 * 1024 * 1024  # stay under Telegram bot API's ~50MB upload limit
-FILE_TTL_SECONDS     = 60                # auto-delete window
+MAX_FILESIZE_BYTES   = 49 * 1024 * 1024  # Telegram bot API's own upload cap — videos under this get sent directly
+FILE_TTL_SECONDS     = 60                # auto-delete window for videos sent directly in-chat
+WEB_DOWNLOAD_TTL_SECONDS = 5 * 60        # longer window for the browser-download-link flow (oversized videos) —
+                                          # needs more time since the user has to tap the link and download manually
 
 _URL_RE = re.compile(r'^https?://\S+$', re.IGNORECASE)
+_ID_RE  = re.compile(r'^[a-f0-9]{6,32}$')
 
 
 class _SilentLogger:
@@ -140,12 +143,26 @@ def _has_audio_stream(file_path: str) -> bool:
         return True
 
 
+HARD_MAX_FILESIZE_BYTES = 500 * 1024 * 1024   # absolute ceiling — beyond this we refuse outright (abuse/disk-space guard)
+
+
 def download_video(url: str, user_id: int) -> dict:
     """
     Downloads into its own uuid-named folder under this user's own
     subfolder — never shared with any other user or any other download.
+
+    Always fetches the best available quality — NOT capped to Telegram's
+    50MB at download time, since that was silently dropping audio on
+    larger videos (best-under-50MB is sometimes video-only). The actual
+    Telegram-vs-browser-link decision happens after download, based on
+    the real file size:
+        oversized=False -> caller sends it directly in-chat (fits Telegram's limit)
+        oversized=True  -> caller should offer a browser download link instead
+                            (file is kept longer for this — see WEB_DOWNLOAD_TTL_SECONDS)
+
     Returns:
-        {"ok": bool, "reason": str, "file_path": str, "dir": str, "download_id": str, "title": str}
+        {"ok": bool, "reason": str, "file_path": str, "dir": str,
+         "download_id": str, "title": str, "has_audio": bool, "oversized": bool}
     """
     download_id = uuid.uuid4().hex[:12]
     user_dir    = DOWNLOAD_ROOT / str(user_id) / download_id
@@ -155,20 +172,15 @@ def download_video(url: str, user_id: int) -> dict:
     opts = _common_opts()
     opts.update({
         "outtmpl": out_template,
-        # "best" alone can silently pick a VIDEO-ONLY stream once a filesize
+        # "best" alone can silently pick a VIDEO-ONLY stream when a size
         # filter rules out the properly-muxed option — that's what was
-        # producing videos with no sound. This instead explicitly prefers
-        # separate best-video + best-audio (merged into one mp4 via the
-        # bundled ffmpeg binary), and only falls back to a plain "best" — or
-        # finally *any* best regardless of size — if that combo isn't
-        # available for this particular link.
-        "format": (
-            f"bestvideo[filesize<{MAX_FILESIZE_BYTES}]+bestaudio[filesize<{MAX_FILESIZE_BYTES}]"
-            f"/best[filesize<{MAX_FILESIZE_BYTES}]"
-            f"/best"
-        ),
+        # producing videos with no sound. This prefers separate best-video
+        # + best-audio, merged into one mp4 via the bundled ffmpeg binary.
+        # No size filter here anymore — see HARD_MAX_FILESIZE_BYTES below
+        # for the actual (much larger) ceiling.
+        "format": "bestvideo+bestaudio/best",
         "merge_output_format": "mp4",
-        "max_filesize": MAX_FILESIZE_BYTES,
+        "max_filesize": HARD_MAX_FILESIZE_BYTES,
     })
 
     try:
@@ -186,24 +198,27 @@ def download_video(url: str, user_id: int) -> dict:
     except Exception as e:
         shutil.rmtree(user_dir, ignore_errors=True)
         logger.error(f"[MediaDL] download failed for user {user_id}: {type(e).__name__}")
-        return {"ok": False, "reason": "Download failed — the link may be private, region-locked, or too large.", "file_path": "", "dir": "", "download_id": "", "title": ""}
+        return {"ok": False, "reason": "Download failed — the link may be private, region-locked, or too large.", "file_path": "", "dir": "", "download_id": "", "title": "", "has_audio": False, "oversized": False}
 
     if not os.path.exists(file_path):
         shutil.rmtree(user_dir, ignore_errors=True)
-        return {"ok": False, "reason": "Download failed — no file was produced.", "file_path": "", "dir": "", "download_id": "", "title": ""}
+        return {"ok": False, "reason": "Download failed — no file was produced.", "file_path": "", "dir": "", "download_id": "", "title": "", "has_audio": False, "oversized": False}
 
-    # The per-stream filesize filters above are a good heuristic but don't
-    # strictly bound the final MERGED file — double check the real result
-    # before trying to hand Telegram something too big to upload.
-    if os.path.getsize(file_path) > MAX_FILESIZE_BYTES:
+    file_size = os.path.getsize(file_path)
+    if file_size > HARD_MAX_FILESIZE_BYTES:
         shutil.rmtree(user_dir, ignore_errors=True)
-        return {"ok": False, "reason": "That video is too large to send via Telegram (over ~49MB).", "file_path": "", "dir": "", "download_id": "", "title": ""}
+        return {
+            "ok": False,
+            "reason": f"That video is too large ({file_size // (1024*1024)}MB) — max supported is {HARD_MAX_FILESIZE_BYTES // (1024*1024)}MB.",
+            "file_path": "", "dir": "", "download_id": "", "title": "", "has_audio": False, "oversized": False,
+        }
 
     return {
         "ok": True, "reason": "",
         "file_path": file_path, "dir": str(user_dir),
         "download_id": download_id, "title": (info.get("title") or "video") if info else "video",
         "has_audio": _has_audio_stream(file_path),
+        "oversized": file_size > MAX_FILESIZE_BYTES,   # True -> caller should offer a browser download link instead of sending in-chat
     }
 
 
@@ -232,8 +247,39 @@ def convert_to_audio(file_path: str) -> dict:
 
 def cleanup_dir(dir_path: str):
     """Deletes one download's entire folder. Safe to call more than once
-    or on an already-missing path — used by the ~60s auto-delete timer."""
+    or on an already-missing path — used by the auto-delete timers."""
     try:
         shutil.rmtree(dir_path, ignore_errors=True)
     except Exception:
         pass
+
+
+def resolve_download_path(user_id, download_id: str):
+    """
+    Safely resolves the on-disk video file for a given user_id/download_id
+    pair, for use by the /download Flask route in app.py. Strictly
+    validates both inputs and confirms the resolved path is genuinely
+    inside DOWNLOAD_ROOT before returning anything — defends against path
+    traversal via a malformed/malicious URL. Returns a Path, or None if
+    invalid, missing, or already expired/cleaned up.
+    """
+    try:
+        user_id = int(user_id)
+    except (TypeError, ValueError):
+        return None
+    if not download_id or not _ID_RE.match(download_id):
+        return None
+
+    candidate_dir = (DOWNLOAD_ROOT / str(user_id) / download_id).resolve()
+    try:
+        candidate_dir.relative_to(DOWNLOAD_ROOT.resolve())
+    except ValueError:
+        return None   # somehow escaped DOWNLOAD_ROOT — reject outright
+
+    if not candidate_dir.is_dir():
+        return None
+
+    for f in candidate_dir.iterdir():
+        if f.name.startswith("video.") and f.suffix != ".mp3":
+            return f
+    return None
