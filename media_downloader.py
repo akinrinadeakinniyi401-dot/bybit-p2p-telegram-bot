@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 DOWNLOAD_ROOT = Path(os.getenv("MEDIA_DOWNLOAD_ROOT", "/tmp/media_downloads"))
 DOWNLOAD_ROOT.mkdir(parents=True, exist_ok=True)
 
-MAX_DURATION_SECONDS = 15 * 60           # 15 min cap — keeps downloads quick and bounded
+MAX_DURATION_SECONDS = None               # no duration cap — file size is the real constraint (see oversized/web-link path)
 MAX_FILESIZE_BYTES   = 49 * 1024 * 1024  # Telegram bot API's own upload cap — videos under this get sent directly
 FILE_TTL_SECONDS     = 60                # auto-delete window for videos sent directly in-chat
 WEB_DOWNLOAD_TTL_SECONDS = 5 * 60        # longer window for the browser-download-link flow (oversized videos) —
@@ -112,12 +112,6 @@ def probe_video(url: str) -> dict:
         return {"ok": False, "reason": "That's a playlist/album link — send a single video link instead.", "title": "", "duration": 0}
 
     duration = info.get("duration") or 0
-    if duration and duration > MAX_DURATION_SECONDS:
-        return {
-            "ok": False,
-            "reason": f"That video is too long ({duration // 60} min) — max supported is {MAX_DURATION_SECONDS // 60} minutes.",
-            "title": "", "duration": duration,
-        }
 
     if info.get("vcodec") == "none":
         return {"ok": False, "reason": "That link doesn't point to a video (looks like audio or an image post).", "title": "", "duration": 0}
