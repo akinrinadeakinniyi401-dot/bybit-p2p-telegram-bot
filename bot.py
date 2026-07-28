@@ -37,7 +37,7 @@ from admin_commands import (
 )
 import help_agent
 import media_downloader as mediadl
-from config import REFERRAL_REWARD_NGN, BOT_OWNER_USERNAME, MIN_WITHDRAWAL_NGN
+from config import REFERRAL_REWARD_NGN, BOT_OWNER_USERNAME, MIN_WITHDRAWAL_NGN, PUBLIC_BASE_URL
 
 logger = logging.getLogger(__name__)
 
@@ -6574,6 +6574,37 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # can never resolve against user B's session, since each user has
         # their own separate SessionState and their own separate dict.
         _s(uid).video_downloads[download_id] = {"file_path": result["file_path"], "dir": result["dir"]}
+
+        if result.get("oversized"):
+            # Too big for Telegram's ~50MB bot-upload cap — offer a plain
+            # browser download link instead (served by the /download route
+            # in app.py, reusing this exact same per-user file). No
+            # Convert-to-Audio here since it's not sent through Telegram at all.
+            if not PUBLIC_BASE_URL:
+                await status_msg.edit_text(
+                    "❌ This video is too large for Telegram, and no download link could be generated "
+                    "(server URL not configured). Contact the admin."
+                )
+                mediadl.cleanup_dir(result["dir"])
+                _s(uid).video_downloads.pop(download_id, None)
+                return
+
+            link = f"{PUBLIC_BASE_URL}/download/{uid}/{download_id}"
+            ttl_min = mediadl.WEB_DOWNLOAD_TTL_SECONDS // 60
+            await status_msg.edit_text(
+                f"🎬 <b>{_esc(result['title'])}</b>\n\n"
+                f"This video is too large to send directly in Telegram, so here's a direct download link instead:\n"
+                f"{link}\n\n"
+                f"⏱ Link works for {ttl_min} minutes — tap it to download the video to your device.",
+                parse_mode="HTML"
+            )
+
+            async def _cleanup_web_download_later(_uid=uid, _download_id=download_id, _dir_path=result["dir"]):
+                await asyncio.sleep(mediadl.WEB_DOWNLOAD_TTL_SECONDS)
+                mediadl.cleanup_dir(_dir_path)
+                _s(_uid).video_downloads.pop(_download_id, None)
+            asyncio.create_task(_cleanup_web_download_later())
+            return
 
         if result.get("has_audio", True):
             keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("🎵 Convert to Audio", callback_data=f"conv_audio_{download_id}")]])
