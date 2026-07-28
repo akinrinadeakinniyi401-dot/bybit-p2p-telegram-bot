@@ -44,6 +44,26 @@ def home():
     return "✅ Bot is running"
 
 
+# 🎬 Browser download link for videos too large to send via Telegram (~50MB cap).
+# Reuses the exact same per-user isolated storage and IDs as the in-chat
+# Convert-to-Audio flow — see media_downloader.py for the actual file
+# resolution/validation logic (path-traversal-safe, per-user, per-download).
+@app.route("/download/<user_id>/<download_id>")
+def download_video_file(user_id, download_id):
+    import media_downloader as mediadl
+    file_path = mediadl.resolve_download_path(user_id, download_id)
+    if not file_path:
+        return (
+            "<html><body style='font-family:sans-serif;text-align:center;padding:40px'>"
+            "<h2>⌛ Link expired</h2>"
+            "<p>This download link is no longer valid. Go back to Telegram and send the video link again.</p>"
+            "</body></html>",
+            404,
+        )
+    from flask import send_file
+    return send_file(file_path, as_attachment=True, download_name=file_path.name)
+
+
 # 📨 Telegram webhook
 @app.route("/webhook", methods=["POST"])
 def webhook():
