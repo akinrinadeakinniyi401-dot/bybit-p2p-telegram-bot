@@ -137,7 +137,7 @@ def _has_audio_stream(file_path: str) -> bool:
         return True
 
 
-HARD_MAX_FILESIZE_BYTES = 500 * 1024 * 1024   # absolute ceiling — beyond this we refuse outright (abuse/disk-space guard)
+HARD_MAX_FILESIZE_BYTES = 2 * 1024 * 1024 * 1024   # 2GB absolute ceiling — comfortably covers a 1080p-capped 2hr+ video
 
 
 def download_video(url: str, user_id: int) -> dict:
@@ -170,9 +170,12 @@ def download_video(url: str, user_id: int) -> dict:
         # filter rules out the properly-muxed option — that's what was
         # producing videos with no sound. This prefers separate best-video
         # + best-audio, merged into one mp4 via the bundled ffmpeg binary.
-        # No size filter here anymore — see HARD_MAX_FILESIZE_BYTES below
-        # for the actual (much larger) ceiling.
-        "format": "bestvideo+bestaudio/best",
+        # Capped at 1080p — uncapped "best" on a 1-2+ hour video can mean a
+        # multi-GB 4K file, which then silently produces no output at all
+        # once it exceeds max_filesize below (yt-dlp doesn't always raise
+        # an exception for that — it just skips writing the file). 1080p
+        # keeps even long videos to a sane, actually-downloadable size.
+        "format": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
         "merge_output_format": "mp4",
         "max_filesize": HARD_MAX_FILESIZE_BYTES,
     })
@@ -191,16 +194,24 @@ def download_video(url: str, user_id: int) -> dict:
                     file_path = mp4_candidate
     except Exception as e:
         shutil.rmtree(user_dir, ignore_errors=True)
-        logger.error(f"[MediaDL] download failed for user {user_id}: {type(e).__name__}")
+        logger.error(f"[MediaDL] download failed for user {user_id}: {e}")
         return {"ok": False, "reason": "Download failed — the link may be private, region-locked, or too large.", "file_path": "", "dir": "", "download_id": "", "title": "", "has_audio": False, "oversized": False}
 
     if not os.path.exists(file_path):
         shutil.rmtree(user_dir, ignore_errors=True)
-        return {"ok": False, "reason": "Download failed — no file was produced.", "file_path": "", "dir": "", "download_id": "", "title": "", "has_audio": False, "oversized": False}
+        # yt-dlp can skip writing a file with NO exception at all when the
+        # selected format exceeds max_filesize — this used to fail silently
+        # with zero logging, which is exactly why the real cause never
+        # showed up before. Logging the duration/limit here directly points
+        # at whether size was actually the reason.
+        approx_size_note = f" (title: {info.get('title','?')!r}, duration: {info.get('duration','?')}s)" if info else ""
+        logger.error(f"[MediaDL] no file produced for user {user_id}, url={url!r}{approx_size_note} — likely exceeded max_filesize ({HARD_MAX_FILESIZE_BYTES // (1024*1024)}MB)")
+        return {"ok": False, "reason": "Download failed — the video may exceed our size limit, or no downloadable format was found.", "file_path": "", "dir": "", "download_id": "", "title": "", "has_audio": False, "oversized": False}
 
     file_size = os.path.getsize(file_path)
     if file_size > HARD_MAX_FILESIZE_BYTES:
         shutil.rmtree(user_dir, ignore_errors=True)
+        logger.error(f"[MediaDL] downloaded file exceeded hard cap for user {user_id}: {file_size // (1024*1024)}MB")
         return {
             "ok": False,
             "reason": f"That video is too large ({file_size // (1024*1024)}MB) — max supported is {HARD_MAX_FILESIZE_BYTES // (1024*1024)}MB.",
