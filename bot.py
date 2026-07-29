@@ -6,6 +6,7 @@ import logging
 from decimal import Decimal, ROUND_HALF_UP, ROUND_FLOOR, ROUND_CEILING
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+from telegram.error import RetryAfter, Forbidden
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
     MessageHandler, ContextTypes, filters
@@ -5600,6 +5601,32 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             logger.error(f"[MediaDL] send_audio failed: {type(e).__name__}")
             await context.bot.send_message(chat_id=uid, text="❌ Could not send the audio file.")
 
+    # ── 📢 Broadcast — confirm/cancel ──
+    elif data == "broadcast_confirm":
+        if not is_admin(tuser.id):
+            return
+        draft = user_state.get("broadcast_draft")
+        if not draft:
+            await query.answer("❌ No broadcast draft found — start again with /broadcast.", show_alert=True)
+            return
+        user_state["broadcast_draft"] = None
+        await query.answer("📢 Broadcasting — this runs in the background, you'll get a summary when it's done.", show_alert=True)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)   # clear buttons only — preview content untouched
+        except Exception:
+            pass
+        asyncio.create_task(_run_broadcast(context.bot, query.message.chat_id, draft))
+
+    elif data == "broadcast_cancel":
+        if not is_admin(tuser.id):
+            return
+        user_state["broadcast_draft"] = None
+        await query.answer("❌ Broadcast cancelled.")
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+
     # ── 🎬 Video Downloader — prompt for a link ──
     elif data == "video_downloader":
         _btn_state["action"] = "video_link"
@@ -6548,6 +6575,16 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     except Exception as _notify_err:
                         logger.error(f"[Withdraw] Could not notify admin {admin_chat_id}: {_notify_err}")
 
+    # ── 📢 Broadcast — text content received ──
+    elif action == "broadcast_awaiting_content":
+        if text.strip().lower() == "cancel":
+            _state["action"] = None
+            await update.message.reply_text("❌ Broadcast cancelled.")
+            return
+        _state["broadcast_draft"] = {"type": "text", "file_id": None, "text": text}
+        _state["action"] = None
+        await _show_broadcast_preview(update, context)
+
     # ── 🎬 Video Downloader — link received ──
     elif action == "video_link":
         if not mediadl.looks_like_url(text):
@@ -6884,6 +6921,123 @@ async def _db_session_cleanup_loop():
             logger.error(f"[DBCleanup] Error: {e}")
 
 
+# ─────────────────────────────────────────
+# 📢 BROADCAST — admin sends a promo to every user (text, photo, or video)
+# ─────────────────────────────────────────
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/broadcast — admin-only. Two-step flow: send the content you want
+    broadcast (plain text, or a photo/video with caption), review a
+    preview, then confirm before it actually goes out to every user."""
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        return
+    user_state["broadcast_draft"] = None
+    user_state["action"] = "broadcast_awaiting_content"
+    await update.message.reply_text(
+        "📢 <b>Broadcast — Step 1/2</b>\n\n"
+        "Send the message you want to broadcast to ALL users. You can send:\n"
+        "• Plain text\n"
+        "• A photo with caption\n"
+        "• A video with caption\n\n"
+        "Type <code>cancel</code> to cancel.",
+        parse_mode="HTML"
+    )
+
+
+async def broadcast_media_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Handles photo/video messages ONLY for the admin broadcast flow.
+    Deliberately narrow — every other feature in this bot that reads
+    messages (API keys, ad settings, etc.) is plain text, so this quietly
+    ignores anything that isn't an admin actively mid-broadcast, with zero
+    effect on any other part of the bot.
+    """
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        return
+    if user_state.get("action") != "broadcast_awaiting_content":
+        return
+
+    if update.message.photo:
+        file_id, media_type = update.message.photo[-1].file_id, "photo"
+    elif update.message.video:
+        file_id, media_type = update.message.video.file_id, "video"
+    else:
+        return
+
+    user_state["broadcast_draft"] = {"type": media_type, "file_id": file_id, "text": update.message.caption or ""}
+    user_state["action"] = None
+    await _show_broadcast_preview(update, context)
+
+
+async def _show_broadcast_preview(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    draft = user_state.get("broadcast_draft")
+    if not draft:
+        return
+    total_users = len(db.get_all_users())
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"✅ Send to {total_users} users", callback_data="broadcast_confirm")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="broadcast_cancel")],
+    ])
+    note = f"\n\n📊 <b>Step 2/2</b> — this will be sent to {total_users} users. Confirm?"
+
+    if draft["type"] == "text":
+        await update.message.reply_text(f"📢 <b>Preview:</b>\n\n{draft['text']}{note}", parse_mode="HTML", reply_markup=keyboard)
+    elif draft["type"] == "photo":
+        await update.message.reply_photo(photo=draft["file_id"], caption=f"{_esc(draft['text'])}{note}", parse_mode="HTML", reply_markup=keyboard)
+    elif draft["type"] == "video":
+        await update.message.reply_video(video=draft["file_id"], caption=f"{_esc(draft['text'])}{note}", parse_mode="HTML", reply_markup=keyboard)
+
+
+async def _run_broadcast(bot, admin_chat_id: int, draft: dict):
+    """
+    Sends the confirmed broadcast to every user on file, one at a time
+    with a small delay to stay comfortably under Telegram's rate limits.
+    Blocked/deactivated users and any other per-user send failure are
+    counted and skipped — one bad chat_id never stops the rest. On a real
+    flood-control response, waits exactly as long as Telegram asks, then
+    retries that one user once before moving on.
+    """
+    users = db.get_all_users()
+    sent = failed = 0
+
+    for user in users:
+        target_id = user.get("user_id")
+        if not target_id:
+            continue
+        try:
+            await _send_broadcast_item(bot, target_id, draft)
+            sent += 1
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after)
+            try:
+                await _send_broadcast_item(bot, target_id, draft)
+                sent += 1
+            except Exception:
+                failed += 1
+        except Forbidden:
+            failed += 1   # user blocked the bot / deactivated — skip, not fatal
+        except Exception as e:
+            failed += 1
+            logger.debug(f"[Broadcast] failed for {target_id}: {e}")
+        await asyncio.sleep(0.05)   # ~20 msg/sec — safely under Telegram's flood limits
+
+    await bot.send_message(
+        chat_id=admin_chat_id,
+        text=f"📢 <b>Broadcast complete!</b>\n\n✅ Sent: {sent}\n❌ Failed/blocked: {failed}\n👥 Total users: {len(users)}",
+        parse_mode="HTML"
+    )
+
+
+async def _send_broadcast_item(bot, chat_id: int, draft: dict):
+    if draft["type"] == "text":
+        await bot.send_message(chat_id=chat_id, text=draft["text"], parse_mode="HTML")
+    elif draft["type"] == "photo":
+        await bot.send_photo(chat_id=chat_id, photo=draft["file_id"], caption=draft["text"], parse_mode="HTML")
+    elif draft["type"] == "video":
+        await bot.send_video(chat_id=chat_id, video=draft["file_id"], caption=draft["text"], parse_mode="HTML")
+
+
 async def refresh_scammers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _get_or_register_user(update.effective_user)
     uid = update.effective_user.id
@@ -7108,8 +7262,10 @@ def start_bot():
     application.add_handler(CommandHandler("withdrawals",      cmd_withdrawals))
     application.add_handler(CommandHandler("approvewithdraw",  cmd_approvewithdraw))
     application.add_handler(CommandHandler("rejectwithdraw",   cmd_rejectwithdraw))
+    application.add_handler(CommandHandler("broadcast",        broadcast_command))
 
     application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO, broadcast_media_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
     # ── Global error handler — logs ALL unhandled exceptions with full traceback ──
