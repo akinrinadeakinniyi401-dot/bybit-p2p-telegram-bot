@@ -202,10 +202,12 @@ async def cmd_requests(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uname = esc(req.get("username", "?"))
         dname = esc(req.get("display_name", "?"))
         reqat = esc(req.get("requested_at", "?"))
+        contact = esc(req.get("contact", "")) or "— not provided —"
         ref_line = _referrer_line(uid) if isinstance(uid, int) else ""
         lines.append(
             f"👤 <code>{uid}</code> — @{uname} ({dname})\n"
             f"   📅 Requested: {reqat}\n"
+            f"   📞 Contact: {contact}\n"
             f"{ref_line}"
             f"   ✅ Approve: <code>/upgrade {uid} 30</code>\n"
         )
