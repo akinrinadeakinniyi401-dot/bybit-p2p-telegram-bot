@@ -1,5 +1,6 @@
 import asyncio
 import random
+import re
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 import logging
@@ -438,15 +439,16 @@ def main_menu_keyboard(uid: int = 0):
     kb = [_slot_row]
 
     kb += [
-        [InlineKeyboardButton(f"{r_icon} AD PRICE BOT",  callback_data="section_ads")],
-        [InlineKeyboardButton(f"{o_icon} ORDER MONITOR", callback_data="section_orders")],
-        [InlineKeyboardButton(f"{p_icon} AUTO-PAY",      callback_data="section_autopay")],
-        [InlineKeyboardButton("🔑 Set APIs",             callback_data="section_apis")],
-        [InlineKeyboardButton("⬆️ Upgrade Plan",         callback_data="upgrade_plan")],
-        [InlineKeyboardButton("🎁 Referrals",            callback_data="referrals")],
-        [InlineKeyboardButton("🎬 Video Downloader",     callback_data="video_downloader")],
-        [InlineKeyboardButton("📡 Bot Status",           callback_data="bot_status")],
-        [InlineKeyboardButton("🌍 Get My IP",            callback_data="get_my_ip")],
+        [InlineKeyboardButton(f"{r_icon} AD PRICE BOT",  callback_data="section_ads"),
+         InlineKeyboardButton(f"{o_icon} ORDER MONITOR", callback_data="section_orders")],
+        [InlineKeyboardButton(f"{p_icon} AUTO-PAY",      callback_data="section_autopay"),
+         InlineKeyboardButton("🔑 Set APIs",             callback_data="section_apis")],
+        [InlineKeyboardButton("⬆️ Upgrade Plan",         callback_data="upgrade_plan"),
+         InlineKeyboardButton("🎁 Referrals",            callback_data="referrals")],
+        [InlineKeyboardButton("🎬 Video Downloader",     callback_data="video_downloader"),
+         InlineKeyboardButton("💬 Contact Support",      callback_data="contact_support")],
+        [InlineKeyboardButton("📡 Bot Status",           callback_data="bot_status"),
+         InlineKeyboardButton("🌍 Get My IP",            callback_data="get_my_ip")],
         [InlineKeyboardButton("🔁 Reset Session",        callback_data="reset_confirm")],
     ]
     return InlineKeyboardMarkup(kb)
@@ -3856,6 +3858,80 @@ async def _typing(context: ContextTypes.DEFAULT_TYPE, chat_id: int, min_delay: f
         pass
 
 
+_TG_USERNAME_RE = re.compile(r'^@[A-Za-z][A-Za-z0-9_]{4,31}$')
+_PHONE_RE       = re.compile(r'^\+[1-9]\d{6,14}$')
+
+
+def validate_contact(text: str):
+    """
+    Validates a contact string as either a Telegram username (@name) or a
+    WhatsApp/phone number in international format (+countrycode...).
+    Returns (ok, normalized_contact, error_message) — error_message is ""
+    when ok is True.
+    """
+    t = (text or "").strip()
+    if not t:
+        return False, "", "❌ Please send your Telegram username or WhatsApp number."
+    if t.startswith("@"):
+        if _TG_USERNAME_RE.match(t):
+            return True, t, ""
+        return False, "", (
+            "❌ That doesn't look like a valid Telegram username.\n"
+            "It should start with @ and be 5-32 characters (letters, numbers, underscores).\n"
+            "Example: <code>@johnsmith</code>"
+        )
+    if t.startswith("+"):
+        if _PHONE_RE.match(t):
+            return True, t, ""
+        return False, "", (
+            "❌ That doesn't look like a valid WhatsApp number.\n"
+            "Include your country code starting with +, digits only, no spaces or dashes.\n"
+            "Example: <code>+2348012345678</code>"
+        )
+    return False, "", (
+        "❌ Please start with <code>@</code> for a Telegram username (e.g. <code>@johnsmith</code>) "
+        "or <code>+</code> for a WhatsApp number with country code (e.g. <code>+2348012345678</code>)."
+    )
+
+
+async def _submit_upgrade_request(bot, uid: int, uname: str, dname: str, contact: str):
+    """
+    Shared upgrade-request submission — saves to DB and notifies every
+    admin, now including the contact detail the user provided. Used from
+    the free-text message handler (after contact info passes validation);
+    confirming to the user is handled separately by the caller since that
+    differs by call site.
+    """
+    logger.info(f"[Upgrade] Request from uid={uid} uname=@{uname} — saving to DB")
+    try:
+        db.request_upgrade(uid, uname, dname, contact)
+        logger.info(f"[Upgrade] DB write OK for uid={uid}")
+    except Exception as _db_err:
+        logger.error(f"[Upgrade] DB write FAILED for uid={uid}: {_db_err}")
+
+    _ref_line = ""
+    _referrer_id = db.get_referrer(uid)
+    if _referrer_id:
+        _referrer = db.get_user(_referrer_id)
+        _rname = _esc(_referrer.get("username") or _referrer.get("display_name") or str(_referrer_id)) if _referrer else str(_referrer_id)
+        _ref_line = f"🎁 Referred by: @{_rname} (<code>{_referrer_id}</code>)\n\n"
+    _admin_msg = (
+        f"🔔 <b>New Upgrade Request!</b>\n\n"
+        f"👤 User ID: <code>{uid}</code>\n"
+        f"Username: @{uname if uname else 'None'}\n"
+        f"Name: {_esc(dname)}\n"
+        f"📞 Contact: {_esc(contact)}\n\n"
+        f"{_ref_line}"
+        f"Approve: <code>/upgrade {uid} 30</code>"
+    )
+    for _admin_id in list(_admin_chat_ids):
+        try:
+            await bot.send_message(chat_id=_admin_id, text=_admin_msg, parse_mode="HTML")
+            logger.info(f"[Upgrade] Admin {_admin_id} notified for uid={uid}")
+        except Exception as _notify_err:
+            logger.error(f"[Upgrade] Could not notify admin {_admin_id}: {_notify_err}")
+
+
 async def edit_menu_html(query, text: str, keyboard: InlineKeyboardMarkup):
     """Like edit_menu but uses HTML parse mode — safe for raw API keys / UUIDs."""
     try:
@@ -4151,7 +4227,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
     # get_my_ip, section_apis, set_api_*, delete_apis, delete_apis_confirm, reset_*
     _FREE_ALLOWED = {
         "main_menu", "upgrade_plan", "upgrade_request_yes",
-        "referrals",
+        "referrals", "contact_support",
         "bot_status", "reset_confirm", "reset_do",
         "section_apis", "set_api_bybit", "set_api_flw", "set_api_paga",
         "set_api_bybit_1", "set_api_bybit_2",
@@ -5513,53 +5589,14 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         )
 
     elif data == "upgrade_request_yes":
-        uid   = query.from_user.id
-        uname = query.from_user.username or ""
-        dname = query.from_user.full_name or ""
-
-        # ── Step 1: Save to DB (fast, no network — cannot fail) ──
-        logger.info(f"[Upgrade] Request from uid={uid} uname=@{uname} — saving to DB")
-        try:
-            db.request_upgrade(uid, uname, dname)
-            logger.info(f"[Upgrade] DB write OK for uid={uid}")
-        except Exception as _db_err:
-            logger.error(f"[Upgrade] DB write FAILED for uid={uid}: {_db_err}")
-
-        # ── Step 2: Update user screen immediately (before any network call) ──
+        _btn_state["action"] = "upgrade_contact"
         await edit_menu(query,
-            "⏳ *Upgrade Request Sent!*\n\n"
-            "The admin has been notified and will review shortly.\n"
-            "You will receive a message once approved.",
+            "📞 <b>One more step before we submit your request</b>\n\n"
+            "Send your Telegram username or WhatsApp number (with country code) so the admin can reach you before approving:\n\n"
+            "• Telegram: <code>@johnsmith</code>\n"
+            "• WhatsApp: <code>+2348012345678</code>",
             InlineKeyboardMarkup(back_main())
         )
-        logger.info(f"[Upgrade] Menu updated for uid={uid}")
-
-        # ── Step 3: Notify admin(s) directly — in try/except so any Telegram
-        # API error is logged but CANNOT propagate and crash the bot. ──
-        _ref_line = ""
-        _referrer_id = db.get_referrer(uid)
-        if _referrer_id:
-            _referrer = db.get_user(_referrer_id)
-            _rname = _esc(_referrer.get("username") or _referrer.get("display_name") or str(_referrer_id)) if _referrer else str(_referrer_id)
-            _ref_line = f"🎁 Referred by: @{_rname} (<code>{_referrer_id}</code>)\n\n"
-        _admin_msg = (
-            f"🔔 <b>New Upgrade Request!</b>\n\n"
-            f"👤 User ID: <code>{uid}</code>\n"
-            f"Username: @{uname if uname else 'None'}\n"
-            f"Name: {dname}\n\n"
-            f"{_ref_line}"
-            f"Approve: <code>/upgrade {uid} 30</code>"
-        )
-        for _admin_id in list(_admin_chat_ids):
-            try:
-                await context.bot.send_message(
-                    chat_id=_admin_id,
-                    text=_admin_msg,
-                    parse_mode="HTML"
-                )
-                logger.info(f"[Upgrade] Admin {_admin_id} notified for uid={uid}")
-            except Exception as _notify_err:
-                logger.error(f"[Upgrade] Could not notify admin {_admin_id}: {_notify_err}")
                 # The background _upgrade_notifier_loop will retry in 30 s
 
     # ── 🎵 Convert a downloaded video to audio ──
@@ -5626,6 +5663,36 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             await query.edit_message_reply_markup(reply_markup=None)
         except Exception:
             pass
+
+    # ── 💬 Contact Support — prompt for a message ──
+    elif data == "contact_support":
+        _btn_state["action"] = "support_message"
+        await edit_menu(query,
+            "💬 <b>Contact Support</b>\n\n"
+            "Send your message and the admin will get back to you directly.",
+            InlineKeyboardMarkup(back_main())
+        )
+
+    # ── 💬 Admin taps Reply on a forwarded support message ──
+    elif data.startswith("support_reply_"):
+        if not is_admin(tuser.id):
+            return
+        target_uid = data[len("support_reply_"):]
+        try:
+            target_uid = int(target_uid)
+        except ValueError:
+            await query.answer("❌ Invalid user ID.", show_alert=True)
+            return
+        user_state["support_reply_target"] = target_uid
+        user_state["action"] = "support_reply_awaiting"
+        await query.answer()
+        target_user = db.get_user(target_uid)
+        target_label = target_user.get("username") or target_user.get("display_name") or str(target_uid) if target_user else str(target_uid)
+        await context.bot.send_message(
+            chat_id=query.message.chat_id,
+            text=f"↩️ Type your reply to @{_esc(target_label)} (<code>{target_uid}</code>):",
+            parse_mode="HTML"
+        )
 
     # ── 🎬 Video Downloader — prompt for a link ──
     elif data == "video_downloader":
@@ -6575,6 +6642,63 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     except Exception as _notify_err:
                         logger.error(f"[Withdraw] Could not notify admin {admin_chat_id}: {_notify_err}")
 
+    # ── 💬 Contact Support — user's message received ──
+    elif action == "support_message":
+        _state["action"] = None
+        uname_label = tuser.username or tuser.full_name or str(uid)
+        keyboard = InlineKeyboardMarkup([[InlineKeyboardButton("↩️ Reply to this user", callback_data=f"support_reply_{uid}")]])
+        admin_msg = (
+            f"📩 <b>New Support Message</b>\n\n"
+            f"👤 User: @{_esc(uname_label)}\n"
+            f"ID: <code>{uid}</code>\n\n"
+            f"💬 Message:\n{_esc(text)}"
+        )
+        sent_to_any = False
+        for admin_id in list(_admin_chat_ids):
+            try:
+                await context.bot.send_message(chat_id=admin_id, text=admin_msg, parse_mode="HTML", reply_markup=keyboard)
+                sent_to_any = True
+            except Exception as e:
+                logger.error(f"[Support] Could not reach admin {admin_id}: {e}")
+        if sent_to_any:
+            await update.message.reply_text("✅ Your message has been sent to support. They'll get back to you here soon.")
+        else:
+            await update.message.reply_text("❌ Could not reach support right now — please try again shortly.")
+
+    # ── 💬 Admin's typed reply to a support message ──
+    elif action == "support_reply_awaiting":
+        target_uid = _state.get("support_reply_target")
+        _state["action"] = None
+        _state["support_reply_target"] = None
+        if not target_uid:
+            await update.message.reply_text("❌ No pending reply target — tap Reply on a support message first.")
+            return
+        try:
+            await context.bot.send_message(
+                chat_id=target_uid,
+                text=f"💬 <b>Reply from Support:</b>\n\n{_esc(text)}",
+                parse_mode="HTML"
+            )
+            await update.message.reply_text(f"✅ Reply sent to user <code>{target_uid}</code>.", parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"[Support] Could not deliver reply to {target_uid}: {e}")
+            await update.message.reply_text(f"❌ Could not deliver reply — the user may have blocked the bot.")
+
+    # ── ⬆️ Upgrade request — contact details ──
+    elif action == "upgrade_contact":
+        ok, contact, err = validate_contact(text)
+        if not ok:
+            await update.message.reply_text(err, parse_mode="HTML")
+            return
+        _state["action"] = None
+        await update.message.reply_text(
+            "⏳ <b>Upgrade Request Sent!</b>\n\n"
+            "The admin has been notified and will review shortly.\n"
+            "You will receive a message once approved.",
+            parse_mode="HTML"
+        )
+        await _submit_upgrade_request(context.bot, uid, tuser.username or "", tuser.full_name or "", contact)
+
     # ── 📢 Broadcast — text content received ──
     elif action == "broadcast_awaiting_content":
         if text.strip().lower() == "cancel":
@@ -6718,11 +6842,13 @@ async def _upgrade_notifier_loop(bot):
                     continue   # already notified
                 uname_r = req.get("username", "")
                 dname_r = req.get("display_name", "")
+                contact_r = req.get("contact", "") or "— not provided —"
                 msg = (
                     f"🔔 <b>New Upgrade Request!</b>\n\n"
                     f"👤 User ID: <code>{uid_r}</code>\n"
                     f"Username: @{uname_r}\n"
-                    f"Name: {dname_r}\n\n"
+                    f"Name: {dname_r}\n"
+                    f"📞 Contact: {contact_r}\n\n"
                     f"Approve: <code>/upgrade {uid_r} 30</code>"
                 )
                 notified = False
