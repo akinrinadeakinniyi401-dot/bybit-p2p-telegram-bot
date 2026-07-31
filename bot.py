@@ -3701,38 +3701,59 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
             # told us is valid, and with live BTC/ETH prices constantly
             # moving there's essentially no risk of it colliding with
             # anything. Only if that exact-boundary attempt ALSO fails
-            # (rare — the live boundary shifted a hair in the round trip)
             # do later attempts back off with a small safety margin, each
             # time reading a FRESH boundary from the latest response.
-            # (The duplicate/unchanged-price case has its own retCode —
-            # 90043 — handled separately below.)
+            #
+            # One specific failure mode handled here: if this ad already
+            # sits EXACTLY at Bybit's stated boundary (e.g. a previous
+            # cycle already parked it at the live max), resubmitting that
+            # same exact number gets rejected with 90043 ("price differs
+            # by less than 0%") instead of 912120022 — Bybit is telling us
+            # the number is valid, just unchanged. That used to bubble up
+            # as a totally different, unhandled error and get counted as
+            # a cycle failure after only 2 occurrences, auto-stopping the
+            # ad. Now it's treated the same way the top-level 90043 branch
+            # handles it: nudge off it by this pair's minimum price gap,
+            # in whichever direction we were already heading, and keep
+            # trying — rather than stopping the ad over a price that's
+            # perfectly fine, just identical to what's already live.
             last_code, last_msg = ret_code, ret_msg
-            posted_price = None
-            for _attempt in range(3):
-                min_str, max_str = _extract_bybit_bounds(last_msg)
-                was_too_high = max_str is not None
-                bound_str = max_str if was_too_high else min_str
-                if not bound_str:
-                    break   # couldn't parse a boundary at all — nothing more we can do
-                bound_dec = Decimal(bound_str)
-                if _attempt < 2:
-                    # Use Bybit's own string EXACTLY — no re-quantizing. Bybit
-                    # doesn't always use the same decimal precision we do
-                    # (e.g. 3 decimals on some USD pairs vs 2 on NGN), so
-                    # rounding this to our own precision can round IT UP
-                    # past Bybit's actual limit and fail again for a reason
-                    # that has nothing to do with the price being wrong.
-                    candidate_str = bound_str
-                    candidate     = bound_dec
-                else:
-                    # Last resort: nudge off the boundary. Round in the SAFE
-                    # direction (down if we were too high, up if too low) so
-                    # quantizing can never push us back out of range.
-                    margin    = _safety_margin(bound_dec)
-                    candidate = (bound_dec - margin) if was_too_high else (bound_dec + margin)
-                    safe_rounding = ROUND_FLOOR if was_too_high else ROUND_CEILING
-                    candidate     = candidate.quantize(_quant, rounding=safe_rounding)
+            posted_price   = None
+            was_too_high   = None
+            candidate      = None
+            for _attempt in range(4):
+                if last_code == 912120022:
+                    min_str, max_str = _extract_bybit_bounds(last_msg)
+                    was_too_high = max_str is not None
+                    bound_str = max_str if was_too_high else min_str
+                    if not bound_str:
+                        break   # couldn't parse a boundary at all — nothing more we can do
+                    bound_dec = Decimal(bound_str)
+                    if _attempt < 2:
+                        # Use Bybit's own string EXACTLY — no re-quantizing. Bybit
+                        # doesn't always use the same decimal precision we do
+                        # (e.g. 3 decimals on some USD pairs vs 2 on NGN), so
+                        # rounding this to our own precision can round IT UP
+                        # past Bybit's actual limit and fail again for a reason
+                        # that has nothing to do with the price being wrong.
+                        candidate_str = bound_str
+                        candidate     = bound_dec
+                    else:
+                        # Last resort: nudge off the boundary. Round in the SAFE
+                        # direction (down if we were too high, up if too low) so
+                        # quantizing can never push us back out of range.
+                        margin    = _safety_margin(bound_dec)
+                        candidate = (bound_dec - margin) if was_too_high else (bound_dec + margin)
+                        safe_rounding = ROUND_FLOOR if was_too_high else ROUND_CEILING
+                        candidate     = candidate.quantize(_quant, rounding=safe_rounding)
+                        candidate_str = str(candidate)
+                elif last_code == 90043 and candidate is not None:
+                    gap = get_min_price_gap(ad_data.get("currencyId",""), ad_data.get("tokenId",""), candidate)
+                    candidate = (candidate - gap) if was_too_high else (candidate + gap)
+                    candidate = candidate.quantize(_quant, rounding=ROUND_HALF_UP)
                     candidate_str = str(candidate)
+                else:
+                    break   # a genuinely different error — stop retrying, fall through to failure handling
 
                 retry_result = await asyncio.get_event_loop().run_in_executor(
                     _ad_executor, modify_ad, s["ad_id"], candidate_str, ad_data, creds
@@ -3742,7 +3763,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                 if last_code == 0:
                     posted_price = candidate
                     break
-                if last_code != 912120022:
+                if last_code not in (912120022, 90043):
                     break   # a different error now — stop retrying, fall through to failure handling
 
             if posted_price is not None:
@@ -3768,6 +3789,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                 if await _handle_ad_cycle_failure(bot, chat_id, sess, slot_idx, label, cycle, last_code, last_msg, ad_data):
                     return
 
+
         elif ret_code == 90043:
             # "The price of this P2P ad differs from your existing ad by
             # less than 0%." — this fires when the computed price rounds
@@ -3775,28 +3797,53 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
             # when the underlying market barely moves between cycles, or
             # when this ad hasn't changed since its last successful post).
             # This is fully recoverable — nudge the price by this pair's
-            # minimum gap and retry immediately, same pattern as the
-            # out-of-range case above, instead of counting it as a failure.
-            nudge_gap  = get_min_price_gap(ad_data.get("currencyId",""), ad_data.get("tokenId",""), new_p)
-            nudged_p   = new_p - nudge_gap
-            nudged_str = str(nudged_p.quantize(_quant, rounding=ROUND_HALF_UP))
-            retry_result = await asyncio.get_event_loop().run_in_executor(
-                _ad_executor, modify_ad, s["ad_id"], nudged_str, ad_data, creds
-            )
-            retry_code = retry_result.get("retCode", retry_result.get("ret_code",-1))
-            retry_msg  = retry_result.get("retMsg",  retry_result.get("ret_msg","Unknown"))
-            if retry_code == 0:
+            # minimum gap and retry, same pattern as the out-of-range case
+            # above, instead of counting it as a failure. If one nudge
+            # isn't enough (e.g. the pair's flat gap is tiny relative to
+            # its price scale), each further attempt doubles the nudge; if
+            # Bybit instead reports we've now gone out of range, switch to
+            # posting its stated boundary directly.
+            last_code, last_msg = ret_code, ret_msg
+            candidate = new_p
+            posted_price = None
+            for _attempt in range(3):
+                if last_code == 90043:
+                    gap = get_min_price_gap(ad_data.get("currencyId",""), ad_data.get("tokenId",""), candidate) * (2 ** _attempt)
+                    candidate = candidate - gap
+                    candidate = candidate.quantize(_quant, rounding=ROUND_HALF_UP)
+                elif last_code == 912120022:
+                    min_str, max_str = _extract_bybit_bounds(last_msg)
+                    bound_str = max_str if max_str else min_str
+                    if not bound_str:
+                        break
+                    candidate = Decimal(bound_str)
+                else:
+                    break   # a genuinely different error — stop retrying, fall through to failure handling
+
+                candidate_str = str(candidate)
+                retry_result = await asyncio.get_event_loop().run_in_executor(
+                    _ad_executor, modify_ad, s["ad_id"], candidate_str, ad_data, creds
+                )
+                last_code = retry_result.get("retCode", retry_result.get("ret_code",-1))
+                last_msg  = retry_result.get("retMsg",  retry_result.get("ret_msg","Unknown"))
+                if last_code == 0:
+                    posted_price = candidate
+                    break
+                if last_code not in (90043, 912120022):
+                    break
+
+            if posted_price is not None:
                 _reset_ad_failures(sess, slot_idx)
-                _set_ad_current_price(sess, slot_idx, nudged_p)
+                _set_ad_current_price(sess, slot_idx, posted_price)
                 await bot.send_message(chat_id=chat_id,
                     text=(
                         f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n"
                         f"⚠️ Price unchanged from last post — nudged\n"
-                        f"💲 <code>{nudged_str}</code> ({mode.upper()})"
+                        f"💲 <code>{posted_price}</code> ({mode.upper()})"
                     ),
                     parse_mode="HTML")
             else:
-                if await _handle_ad_cycle_failure(bot, chat_id, sess, slot_idx, label, cycle, retry_code, retry_msg, ad_data):
+                if await _handle_ad_cycle_failure(bot, chat_id, sess, slot_idx, label, cycle, last_code, last_msg, ad_data):
                     return
 
         elif ret_code == 0:
