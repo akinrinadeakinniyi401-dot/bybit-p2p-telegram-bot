@@ -232,6 +232,20 @@ def _resolve_price_collision(sess, slot_idx: int, currency_id: str, token_id: st
         if other_price and other_price > 0:
             conflicting_prices.append(other_price)
 
+    # Also guard against landing back on THIS ad's own currently-live price.
+    # Bybit rejects a submission with retCode 90043 ("price differs from
+    # your existing ad by less than 0%") whenever the new price rounds to
+    # what this SAME ad already has posted — that's a per-ad comparison
+    # Bybit makes internally, nothing to do with any other ad. Previously
+    # this function only ever checked OTHER ads, so when the underlying
+    # market hadn't moved between cycles, a collision nudge could push this
+    # ad's price right back onto its own last-posted value and get
+    # rejected — which is exactly what showed up as repeated 90043 failures
+    # once a user had 2+ ads on the same pair/float %.
+    own_price = _ad_current_price(sess, slot_idx)
+    if own_price and own_price > 0:
+        conflicting_prices.append(own_price)
+
     price = natural_price
     for _ in range(10):   # safety cap — converges in 1-2 passes in practice
         adjusted = False
@@ -3507,6 +3521,30 @@ def _safety_margin(price: Decimal) -> Decimal:
     return margin if margin > Decimal("0.01") else Decimal("0.01")
 
 
+def _wants_live_ceiling(currency_id: str, token_id: str, float_pct) -> bool:
+    """
+    True when the floating % is set to the very top of what this bot
+    allows for this pair, or one point below it (e.g. 110% or 111% for
+    NGN/BTC, 130% or 131% for USD/BTC — get_max_float_pct(NGN,BTC) is 111,
+    get_max_float_pct(USD,BTC) is 131).
+
+    At that setting, the user's real intent is "give me the highest price
+    Bybit will currently let me list at" — not literally "market price
+    times this exact multiplier". A fixed multiplier can drift from what
+    Bybit will actually accept as the live order book moves, so instead of
+    trusting the formula number, the caller (auto_update_loop) deliberately
+    forces an out-of-range rejection every cycle so Bybit hands back its
+    OWN live ceiling in the error message, then posts that instead. See
+    the 912120022 handling in auto_update_loop for where that gets used.
+    """
+    try:
+        pct = float(float_pct)
+    except (TypeError, ValueError):
+        return False
+    hi = get_max_float_pct(currency_id, token_id)
+    return hi - 1 <= pct <= hi
+
+
 def calc_floating_price(ad_data, float_pct, local_usdt_ref):
     """
     Calculate floating price for any supported currency/token pair.
@@ -3595,6 +3633,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
         if mode == "fixed":
             new_p    = _ad_current_price(sess, slot_idx) + increment
             _quant   = Decimal("0.00000001")   # unchanged — fixed mode's original precision
+            chase_ceiling = False   # live-ceiling chase only applies to floating mode
         else:
             try:
                 float_pct = float(s.get("float_pct") or 0)
@@ -3620,6 +3659,9 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                 continue
             new_p  = Decimal(new_p_str)   # calc_floating_price's own 0.01 precision
             _quant = Decimal("0.01")
+            chase_ceiling = _wants_live_ceiling(
+                ad_data.get("currencyId",""), ad_data.get("tokenId",""), float_pct
+            )
 
         # ── Same-float multi-ad support: same % is allowed across ads on
         # the same pair now — this nudges the actual PRICE apart instead,
@@ -3633,8 +3675,22 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
             )
         new_p_str = str(new_p.quantize(_quant, rounding=ROUND_HALF_UP))
 
+        # ── Live-ceiling chase (max floating %) ──
+        # At the top float % for this pair, submit a price deliberately
+        # far beyond anything Bybit would ever accept, guaranteeing an
+        # out-of-range (912120022) rejection. Bybit's error message always
+        # includes its OWN current real max — the 912120022 handler below
+        # then posts exactly that. This makes the ad always track Bybit's
+        # true live ceiling every cycle instead of a fixed formula number
+        # that can drift from it as the order book moves.
+        if chase_ceiling:
+            probe_price = (new_p * Decimal("5")).quantize(_quant, rounding=ROUND_HALF_UP)
+            submit_price, submit_str = probe_price, str(probe_price)
+        else:
+            submit_price, submit_str = new_p, new_p_str
+
         result   = await asyncio.get_event_loop().run_in_executor(
-            _ad_executor, modify_ad, s["ad_id"], new_p_str, ad_data, creds
+            _ad_executor, modify_ad, s["ad_id"], submit_str, ad_data, creds
         )
         ret_code = result.get("retCode", result.get("ret_code",-1))
         ret_msg  = result.get("retMsg",  result.get("ret_msg","Unknown"))
@@ -3692,13 +3748,22 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
             if posted_price is not None:
                 _reset_ad_failures(sess, slot_idx)
                 _set_ad_current_price(sess, slot_idx, posted_price)
-                await bot.send_message(chat_id=chat_id,
-                    text=(
-                        f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n"
-                        f"⚠️ Original <code>{new_p_str}</code> was out of range\n"
-                        f"💲 Posted within Bybit's limit: <code>{posted_price}</code> ({mode.upper()})"
-                    ),
-                    parse_mode="HTML")
+                if chase_ceiling:
+                    await bot.send_message(chat_id=chat_id,
+                        text=(
+                            f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n"
+                            f"🏔 Chasing Bybit's live ceiling (max float {float_pct}%)\n"
+                            f"💲 Posted at Bybit's real-time max: <code>{posted_price}</code> ({mode.upper()})"
+                        ),
+                        parse_mode="HTML")
+                else:
+                    await bot.send_message(chat_id=chat_id,
+                        text=(
+                            f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n"
+                            f"⚠️ Original <code>{new_p_str}</code> was out of range\n"
+                            f"💲 Posted within Bybit's limit: <code>{posted_price}</code> ({mode.upper()})"
+                        ),
+                        parse_mode="HTML")
             else:
                 if await _handle_ad_cycle_failure(bot, chat_id, sess, slot_idx, label, cycle, last_code, last_msg, ad_data):
                     return
@@ -3736,10 +3801,25 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
 
         elif ret_code == 0:
             _reset_ad_failures(sess, slot_idx)
-            _set_ad_current_price(sess, slot_idx, new_p)
-            await bot.send_message(chat_id=chat_id,
-                text=f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n💲 <code>{new_p_str}</code> ({mode.upper()})",
-                parse_mode="HTML")
+            _set_ad_current_price(sess, slot_idx, submit_price)
+            if chase_ceiling:
+                # Extremely unlikely — the probe price (5x the formula
+                # number) was accepted outright instead of triggering an
+                # out-of-range rejection. Flag it clearly rather than
+                # silently leaving the ad listed at that price, since this
+                # means Bybit's real ceiling for this ad is currently even
+                # higher than expected.
+                await bot.send_message(chat_id=chat_id,
+                    text=(
+                        f"⚠️ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n"
+                        f"🏔 Live-ceiling probe was accepted directly at <code>{submit_str}</code> — "
+                        f"Bybit's real max right now is at or above this. Double-check this ad on Bybit."
+                    ),
+                    parse_mode="HTML")
+            else:
+                await bot.send_message(chat_id=chat_id,
+                    text=f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n💲 <code>{submit_str}</code> ({mode.upper()})",
+                    parse_mode="HTML")
         else:
             if await _handle_ad_cycle_failure(bot, chat_id, sess, slot_idx, label, cycle, ret_code, ret_msg, ad_data):
                 return
@@ -6901,18 +6981,21 @@ def _reset_user_session(sess) -> bool:
         sess.chat_monitor_task.cancel()
     sess.chat_monitor_task = None
 
-    # Stop and clear Ad 2 / Ad 3 too — these were previously left running
-    # indefinitely since this function predates multi-ad support.
+    # Stop Ad 2 / Ad 3's background tasks ONLY — their configuration (ad_id,
+    # mode, float_pct/increment, fetched ad_data) and the slots themselves
+    # are intentionally KEPT. This used to wipe sess.extra_ad_slots to []
+    # entirely, which deleted Ad 2/Ad 3 outright: the user would find them
+    # gone after the hourly reset and have to re-add each slot, re-fetch
+    # its ad details, and re-enter its settings from scratch before it
+    # could be started again. The hourly reset's job is to stop anything
+    # running in the background, not to erase what the user configured.
     for _slot in sess.extra_ad_slots:
         _task = _slot.get("task")
         if _task and not _task.done():
             _task.cancel()
         _slot["running"] = False
         _slot["task"]    = None
-    sess.extra_ad_slots        = []
-    sess.shared_local_usdt_ref = ""
-    sess.consecutive_failures  = 0
-    sess.editing_slot          = -1
+        _slot["consecutive_failures"] = 0
 
     # Deactivate all feature flags
     sess.auto_pay_enabled    = False
@@ -6923,14 +7006,12 @@ def _reset_user_session(sess) -> bool:
     sess.sell_msg_enabled    = False
     sess.sell_msg_count      = 1
 
-    # Clear volatile order / chat state
+    # Clear volatile order / chat runtime state (dedupe caches, not settings)
     sess.seen_chat_msgs.clear()
     sess.reply_state.clear()
     sess.order_msg_ids.clear()
     sess.my_account_id = ""
     sess.my_nick       = ""
-    sess.current_price = Decimal("0")
-    sess.ad_data.clear()
     sess.seen_order_ids = set()
     sess.paid_order_ids = set()
     sess.seen_sell_ids  = set()
@@ -6939,15 +7020,17 @@ def _reset_user_session(sess) -> bool:
     sess.pending_cancel_reviews = {}   # clear pending seller cancel requests
     sess.expecting_cancel_ids  = set()  # clear orders no longer being tracked for cancel review
 
-    # Reset volatile P2P settings (API keys + sender_name etc. are kept)
-    for k, v in [("ad_id",""),("mode","fixed"),("increment","0.05"),
-                 ("float_pct",""),("local_usdt_ref",""),("interval",2)]:
-        sess.settings[k] = v
-    sess.settings.pop("manage_ad_id",   None)
-    sess.settings.pop("manage_ad_data", None)
-    sess.settings.pop("post_ad_qty",    None)
+    # NOTE: sess.ad_data (Ad 1's fetched details), sess.settings (ad_id,
+    # mode, increment, float_pct, local_usdt_ref, interval, manage_ad_id,
+    # etc.), sess.shared_local_usdt_ref, sess.consecutive_failures, and
+    # sess.editing_slot are intentionally left untouched now — this reset
+    # only stops what's actively running, it doesn't erase configuration.
+    # current_price is left alone too: it's reinitialized from ad_data on
+    # the next auto-loop start anyway (see auto_update_loop), so clearing
+    # it here bought nothing and only made the "was this cached?" story
+    # more confusing.
 
-    logger.info(f"[AutoReset] Session fully reset for user {sess.user_id}")
+    logger.info(f"[AutoReset] Background tasks stopped for user {sess.user_id} (settings/ads preserved)")
     return True
 
 
@@ -6995,7 +7078,7 @@ async def _session_auto_reset_loop(bot=None):
                                 "🔄 Scheduled System Reset\n\n"
                                 "The bot performs an automatic reset every hour to maintain "
                                 "optimal performance and prevent API rate-limit issues.\n\n"
-                                "Your active session has been cleared. This includes:\n"
+                                "Your running features have been stopped. This includes:\n"
                                 "• AD Price Bot (all active ads)\n"
                                 "• Order Monitor\n"
                                 "• Chat Monitor\n"
@@ -7004,7 +7087,10 @@ async def _session_auto_reset_loop(bot=None):
                                 "• Buyer Protection & Name Match\n\n"
                                 "If you are currently trading, please tap /menu and "
                                 "re-enable the features you need.\n\n"
-                                "✅ Your API keys and account settings are not affected."
+                                "✅ Your ad settings — including Ad 2/Ad 3 and fetched ad "
+                                "details — API keys, and account settings are all kept "
+                                "exactly as you left them. You won't need to set anything "
+                                "up again, just restart the features above."
                             )
                         )
                         notified += 1
