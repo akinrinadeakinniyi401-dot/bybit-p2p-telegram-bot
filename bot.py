@@ -3498,12 +3498,18 @@ def _extract_bybit_bounds(error_msg: str):
     'The fixed price set is lower than X or higher than Y.'
     Returns (min_str, max_str) — either may be None if not present in
     this particular message.
+
+    Matches optional thousands-separator commas too (e.g. "79,126,068.63")
+    and strips them before returning — NGN bounds are large enough that if
+    Bybit ever formats them with commas, a comma-blind regex would match
+    only the digits up to the first comma (e.g. "79" instead of
+    "79126068.63") and silently post a price a thousand times too small.
     """
     import re
-    min_match = re.search(r'lower than ([\d.]+)',  error_msg or "")
-    max_match = re.search(r'higher than ([\d.]+)', error_msg or "")
-    min_val = min_match.group(1).rstrip(".") if min_match else None
-    max_val = max_match.group(1).rstrip(".") if max_match else None
+    min_match = re.search(r'lower than ([\d,]*\d(?:\.\d+)?)',  error_msg or "")
+    max_match = re.search(r'higher than ([\d,]*\d(?:\.\d+)?)', error_msg or "")
+    min_val = min_match.group(1).replace(",", "").rstrip(".") if min_match else None
+    max_val = max_match.group(1).replace(",", "").rstrip(".") if max_match else None
     return min_val, max_val
 
 
@@ -4602,7 +4608,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         )
 
     elif data == "bp_set_custom":
-        user_state["action"]       = "bp_custom_threshold"
+        _btn_state["action"]       = "bp_custom_threshold"
         _btn_state["prev_section"] = "buyer_protection_menu"
         await edit_menu(query,
             f"✏️ <b>Custom Buyer Protection Threshold</b>\n\n"
