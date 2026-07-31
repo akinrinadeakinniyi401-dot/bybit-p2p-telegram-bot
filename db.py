@@ -338,13 +338,14 @@ def check_and_auto_downgrade(user_id: int) -> bool:
 # ─────────────────────────────────────────
 # Upgrade requests
 # ─────────────────────────────────────────
-def request_upgrade(user_id: int, username: str, display_name: str):
+def request_upgrade(user_id: int, username: str, display_name: str, contact: str = ""):
     with _lock:
         reqs = _read_json(UPGRADE_REQ, {})
         reqs[str(user_id)] = {
             "user_id":      user_id,
             "username":     username,
             "display_name": display_name,
+            "contact":      contact,   # Telegram username or WhatsApp number the admin can reach them on
             "requested_at": _now(),
         }
         _write_json(UPGRADE_REQ, reqs)
