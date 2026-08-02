@@ -227,8 +227,8 @@ def _record_modify_ad1(sess):
 _FAST_CHASE_GAP_OVERRIDE = {
     ("NGN", "BTC"): Decimal("5000"),
     ("NGN", "ETH"): Decimal("5000"),
-    ("USD", "BTC"): Decimal("10"),
-    ("USD", "ETH"): Decimal("10"),
+    ("USD", "BTC"): Decimal("5"),
+    ("USD", "ETH"): Decimal("5"),
 }
 
 def _fast_chase_gap(currency_id: str, token_id: str, reference_price=None) -> Decimal:
@@ -3802,7 +3802,6 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
         now  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         mode = s.get("mode","fixed")
         prefix = f"[{label}] " if sess.total_ad_slots() > 1 else ""
-        cur_p_before_cycle = _ad_current_price(sess, slot_idx)   # price already live, before this cycle touches anything
 
         if mode == "fixed":
             new_p    = _ad_current_price(sess, slot_idx) + increment
@@ -3897,7 +3896,6 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
             posted_price   = None
             was_too_high   = None
             candidate      = None
-            no_downgrade   = False
             for _attempt in range(4):
                 if last_code == 912120022:
                     min_str, max_str = _extract_bybit_bounds(last_msg)
@@ -3932,20 +3930,6 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                 else:
                     break   # a genuinely different error — stop retrying, fall through to failure handling
 
-                # Chase-ceiling guard: Bybit's stated boundary can drift DOWN
-                # as the order book shifts, not just up. Blindly reposting
-                # whatever it currently says — without checking it's actually
-                # an improvement over what's already live — is exactly what
-                # caused an ad to get reposted at the same price twice, then
-                # at a LOWER price, every ~10-40 seconds. If the candidate
-                # isn't at least one gap above what's already live, stop here
-                # and leave the ad exactly where it is instead of touching it.
-                if chase_ceiling and was_too_high and candidate is not None:
-                    _chase_gap = _fast_chase_gap(ad_data.get("currencyId",""), ad_data.get("tokenId",""), candidate)
-                    if candidate - cur_p_before_cycle < _chase_gap:
-                        no_downgrade = True
-                        break
-
                 if slot_idx == -1:
                     _record_modify_ad1(sess)
                 retry_result = await asyncio.get_event_loop().run_in_executor(
@@ -3979,14 +3963,8 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                         ),
                         parse_mode="HTML")
             else:
-                if no_downgrade:
-                    # Not the ad's fault — Bybit's live ceiling just hasn't
-                    # risen above what's already posted. Leave it exactly
-                    # where it is; don't count this as a failure.
-                    _reset_ad_failures(sess, slot_idx)
-                else:
-                    if await _handle_ad_cycle_failure(bot, chat_id, sess, slot_idx, label, cycle, last_code, last_msg, ad_data):
-                        return
+                if await _handle_ad_cycle_failure(bot, chat_id, sess, slot_idx, label, cycle, last_code, last_msg, ad_data):
+                    return
 
 
         elif ret_code == 90043:
