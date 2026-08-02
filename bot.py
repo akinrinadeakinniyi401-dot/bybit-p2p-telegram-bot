@@ -216,6 +216,28 @@ def _record_modify_ad1(sess):
     sess.modify_call_times.append(datetime.now().timestamp())
 
 
+# Fast-chase-only gap thresholds. This is separate from get_min_price_gap
+# (used everywhere else — collision avoidance between ads, retry nudges)
+# because that gap is sized to keep ads safely apart, not to decide
+# "was this worth an early post". BTC/ETH move in much smaller increments
+# than a $100/₦5,000 swing most 10-second windows, so using the same gap
+# here meant fast-chase rarely found a move big enough to act on. Only
+# applies inside _try_fast_chase — the scheduled cycle and multi-ad
+# collision logic are untouched.
+_FAST_CHASE_GAP_OVERRIDE = {
+    ("NGN", "BTC"): Decimal("5000"),
+    ("NGN", "ETH"): Decimal("5000"),
+    ("USD", "BTC"): Decimal("10"),
+    ("USD", "ETH"): Decimal("10"),
+}
+
+def _fast_chase_gap(currency_id: str, token_id: str, reference_price=None) -> Decimal:
+    override = _FAST_CHASE_GAP_OVERRIDE.get((currency_id.upper(), token_id.upper()))
+    if override is not None:
+        return override
+    return get_min_price_gap(currency_id, token_id, reference_price)
+
+
 def _resolve_price_collision(sess, slot_idx: int, currency_id: str, token_id: str, natural_price: Decimal) -> Decimal:
     """
     Multiple ads on the SAME (currency, coin) pair are allowed to use the
@@ -3652,7 +3674,7 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
         return
     currency = ad_data.get("currencyId","")
     token    = ad_data.get("tokenId","")
-    gap      = get_min_price_gap(currency, token, new_p)
+    gap      = _fast_chase_gap(currency, token, new_p)
     if new_p - cur_p < gap:
         return   # hasn't risen enough to be worth a fresh post yet
 
@@ -4019,11 +4041,11 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
             if await _handle_ad_cycle_failure(bot, chat_id, sess, slot_idx, label, cycle, ret_code, ret_msg, ad_data):
                 return
 
-        _fast_chase = (slot_idx == -1 and mode == "floating"
-                       and sess.total_ad_slots() == 1)
         for _tick in range(interval * 60):
             if not _ad_running(sess, slot_idx): break
-            if _fast_chase and _tick > 0 and _tick % 10 == 0:
+            if (_tick > 0 and _tick % 10 == 0
+                    and slot_idx == -1 and mode == "floating"
+                    and sess.total_ad_slots() == 1):
                 await _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, creds, _quant)
             await asyncio.sleep(1)
 
