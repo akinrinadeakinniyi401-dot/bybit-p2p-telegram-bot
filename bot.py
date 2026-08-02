@@ -207,10 +207,10 @@ def _reset_ad_failures(sess, slot_idx: int):
 _FAST_CHASE_BUDGET       = 8
 _FAST_CHASE_WINDOW_SECS  = 300
 
-def _can_modify_ad1(sess) -> bool:
+def _can_modify_ad1(sess, need: int = 1) -> bool:
     now = datetime.now().timestamp()
     sess.modify_call_times = [t for t in sess.modify_call_times if now - t < _FAST_CHASE_WINDOW_SECS]
-    return len(sess.modify_call_times) < _FAST_CHASE_BUDGET
+    return len(sess.modify_call_times) <= _FAST_CHASE_BUDGET - need
 
 def _record_modify_ad1(sess):
     sess.modify_call_times.append(datetime.now().timestamp())
@@ -227,8 +227,8 @@ def _record_modify_ad1(sess):
 _FAST_CHASE_GAP_OVERRIDE = {
     ("NGN", "BTC"): Decimal("5000"),
     ("NGN", "ETH"): Decimal("5000"),
-    ("USD", "BTC"): Decimal("5"),
-    ("USD", "ETH"): Decimal("5"),
+    ("USD", "BTC"): Decimal("3"),
+    ("USD", "ETH"): Decimal("3"),
 }
 
 def _fast_chase_gap(currency_id: str, token_id: str, reference_price=None) -> Decimal:
@@ -3697,6 +3697,19 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
             posted_price = submit_price
 
     else:
+        # Chase-ceiling needs TWO calls to ever actually change anything:
+        # the probe (guaranteed to be rejected, purely to learn Bybit's
+        # current boundary) and the follow-up post of that boundary. If
+        # only one slot is left in the shared budget, spending it on the
+        # probe burns the last slot on a call that can NEVER succeed by
+        # itself — the follow-up that would have actually raised the
+        # price then gets silently skipped for lack of budget. That's
+        # exactly what was happening: a single "MODIFY... 912120022"
+        # logged, then nothing — the discovered boundary was a real $21+
+        # improvement, but there was no budget left to post it. Wait for
+        # 2 free slots instead of spending on a probe we can't follow up.
+        if not _can_modify_ad1(sess, need=2):
+            return
         # Chase-ceiling: probe first (always — the natural formula number
         # tells us nothing about where Bybit's real boundary currently
         # sits), then decide whether the DISCOVERED boundary is worth
