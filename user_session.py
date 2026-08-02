@@ -73,6 +73,14 @@ class SessionState:
         self.current_price        = Decimal("0")
         self.consecutive_failures = 0   # slot #1's own failure counter (see bot.py auto-stop logic)
 
+        # Rolling list of modify_ad call timestamps for Ad 1, used to stay
+        # under Bybit's "10 modifies per single ad within 5 minutes" limit.
+        # Shared between the normal scheduled cycle AND the 10-second
+        # fast-chase price check (single-ad floating mode only) — both
+        # draw from the same budget so together they can never exceed it.
+        # See _can_modify_ad1() / _record_modify_ad1() in bot.py.
+        self.modify_call_times: list = []
+
         # ── Extra ad slots (#2 and #3) — multi-ad price bot ──
         # Purely additive: slot #1 above is untouched, so single-ad users
         # (the vast majority) see zero behavior change. Each entry is one
