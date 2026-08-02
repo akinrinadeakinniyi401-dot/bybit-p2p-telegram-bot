@@ -215,12 +215,6 @@ _FAST_CHASE_WINDOW_SECS  = 300
 # scheduled cycle, so the 8-edits-per-5-minutes ceiling is unchanged).
 _FAST_CHASE_POLL_SECS    = 8
 
-# How often the chase-ceiling PROBE specifically is allowed to fire (separate
-# from the general 8s poll above). Probing every poll burns the whole shared
-# budget on discovery calls alone and starves the real follow-up post — see
-# the comment at the chase-ceiling branch in _try_fast_chase for the detail.
-_FAST_CHASE_CEILING_PROBE_SECS = 24
-
 def _can_modify_ad1(sess, need: int = 1) -> bool:
     now = datetime.now().timestamp()
     sess.modify_call_times = [t for t in sess.modify_call_times if now - t < _FAST_CHASE_WINDOW_SECS]
@@ -3764,28 +3758,38 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
             # improvement, but there was no budget left to post it. Wait for
             # 2 free slots instead of spending on a probe we can't follow up.
             #
-            # SEPARATELY: unlike plain-floating mode (which only spends
-            # budget once diff >= gap), chase-ceiling has no such upfront
-            # check — it MUST probe to find out where the ceiling currently
-            # is. Probing on every 8s poll burns the entire shared budget on
-            # discovery calls alone within about a minute, then leaves the
-            # ad starved (budget exhausted) for most of the rest of the
-            # 5-minute window — often with no budget left for the one
-            # follow-up call that would actually move the price. So the
-            # probe itself runs on its own, slower cadence, independent of
-            # the general fast-chase poll — Bybit's real ceiling for a pair
-            # doesn't move meaningfully every 8 seconds, so this trades a
-            # small amount of discovery latency for the budget headroom
-            # needed to actually act once a real move is found.
-            now_mono = asyncio.get_event_loop().time()
-            since_last_probe = now_mono - getattr(sess, "last_ceiling_probe_ts", 0.0)
-            if since_last_probe < _FAST_CHASE_CEILING_PROBE_SECS:
+            # THE ACTUAL FIX: unlike plain-floating mode (which only spends
+            # budget once diff >= gap against the ad's own current price),
+            # chase-ceiling had NO local gate at all — it asked Bybit
+            # (spending 1-2 of the 8 shared slots) on every single poll,
+            # whether or not the market had moved at all. That's what burns
+            # the budget down to nothing within the first minute, timer-
+            # throttled or not.
+            #
+            # get_token_usdt_price()/calc_floating_price() hit Bybit's PUBLIC
+            # market endpoint (no API key, no signature) — it does not touch
+            # the account's rate limit at all, only modify_ad() does. So we
+            # can fetch that price as often as we like for free, and use it
+            # exactly like plain-floating mode does: cache the formula price
+            # from the last time we actually asked Bybit for its live
+            # ceiling, and only ask again once the freshly-fetched price has
+            # moved by at least this pair's own threshold since then. This
+            # is the "does the bot know the price it's holding vs. the new
+            # one, without posting every check" logic — it's now local and
+            # free, and a Bybit call only happens on genuine movement.
+            last_probe_ref = getattr(sess, "last_ceiling_probe_price", None)
+            if last_probe_ref is not None:
+                formula_diff = new_p - last_probe_ref
                 logger.info(
-                    f"{tag} skipped — chase-ceiling probe throttled "
-                    f"({since_last_probe:.1f}s since last probe, need "
-                    f"{_FAST_CHASE_CEILING_PROBE_SECS}s) to conserve modify budget"
+                    f"{tag} chase-ceiling | fetched price={new_p} vs last-probed reference={last_probe_ref} "
+                    f"diff={formula_diff} threshold={gap}"
                 )
-                return
+                if formula_diff < gap:
+                    logger.info(
+                        f"{tag} skipped — underlying price hasn't moved enough since the last "
+                        f"Bybit check to be worth spending a call on (no API request made)"
+                    )
+                    return
             if not _can_modify_ad1(sess, need=2):
                 logger.info(f"{tag} skipped — chase-ceiling needs 2 free budget slots, don't have them")
                 return
@@ -3795,7 +3799,7 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
             # posting — never the probe itself.
             probe_price = (new_p * Decimal("5")).quantize(_quant, rounding=ROUND_HALF_UP)
             _record_modify_ad1(sess)
-            sess.last_ceiling_probe_ts = now_mono
+            sess.last_ceiling_probe_price = new_p
             logger.info(f"{tag} chase-ceiling probe — submitting {probe_price}")
             result = await asyncio.get_event_loop().run_in_executor(
                 _ad_executor, modify_ad, s["ad_id"], str(probe_price), ad_data, creds
