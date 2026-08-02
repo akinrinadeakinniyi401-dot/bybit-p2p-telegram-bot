@@ -195,6 +195,27 @@ def _reset_ad_failures(sess, slot_idx: int):
         sess.extra_ad_slots[slot_idx]["consecutive_failures"] = 0
 
 
+# ─────────────────────────────────────────
+# Fast-chase modify budget (Ad 1, single-ad, floating mode only)
+# ─────────────────────────────────────────
+# Bybit's own limit: "a single advertisement can be modified no more than
+# 10 times within 5 minutes." The scheduled cycle already spends part of
+# that budget; the fast-chase 10-second price check spends from the SAME
+# rolling window rather than its own separate count, so the two together
+# can never add up to more than Bybit allows. Capped at 8, not 10, to
+# leave headroom for a manual edit on Bybit's own site in the same window.
+_FAST_CHASE_BUDGET       = 8
+_FAST_CHASE_WINDOW_SECS  = 300
+
+def _can_modify_ad1(sess) -> bool:
+    now = datetime.now().timestamp()
+    sess.modify_call_times = [t for t in sess.modify_call_times if now - t < _FAST_CHASE_WINDOW_SECS]
+    return len(sess.modify_call_times) < _FAST_CHASE_BUDGET
+
+def _record_modify_ad1(sess):
+    sess.modify_call_times.append(datetime.now().timestamp())
+
+
 def _resolve_price_collision(sess, slot_idx: int, currency_id: str, token_id: str, natural_price: Decimal) -> Decimal:
     """
     Multiple ads on the SAME (currency, coin) pair are allowed to use the
@@ -3586,6 +3607,59 @@ def calc_floating_price(ad_data, float_pct, local_usdt_ref):
     return str(Decimal(str(raw)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)), None
 
 
+async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, creds, _quant):
+    """
+    Runs every 10 seconds while Ad 1 waits out the rest of its scheduled
+    interval (floating mode, single-ad users only — see auto_update_loop,
+    which gates this to slot_idx == -1 and sess.total_ad_slots() == 1
+    before ever calling it, so a user with 2+ ads never triggers this and
+    can't out-update everyone else on the same pair).
+
+    If the live reference price has risen by at least this pair's minimum
+    gap since the last post, post it right away instead of waiting for the
+    next scheduled cycle. Pulls from the SAME rolling modify budget as the
+    scheduled cycle (_can_modify_ad1/_record_modify_ad1) so the two
+    together can never exceed Bybit's 10-modifies-per-5-minutes limit on a
+    single ad.
+
+    Deliberately minimal error handling: this is a bonus opportunistic
+    update, not a scheduled cycle, so any failure here is silently
+    skipped rather than counted towards the auto-stop failure counter —
+    the next tick (10s) or the regular scheduled cycle picks it up either
+    way. Only moves that increase the price are chased (a seller wants a
+    higher price sooner, not a lower one).
+    """
+    if not _can_modify_ad1(sess):
+        return
+    local_usdt_ref = float(sess.shared_local_usdt_ref or s.get("local_usdt_ref") or 0)
+    new_p_str, err = calc_floating_price(ad_data, float_pct, local_usdt_ref)
+    if err:
+        return
+    new_p = Decimal(new_p_str)
+    cur_p = _ad_current_price(sess, slot_idx)
+    if cur_p <= 0:
+        return
+    gap = get_min_price_gap(ad_data.get("currencyId",""), ad_data.get("tokenId",""), new_p)
+    if new_p - cur_p < gap:
+        return   # hasn't risen enough to be worth a fresh post yet
+
+    new_p_str = str(new_p.quantize(_quant, rounding=ROUND_HALF_UP))
+    _record_modify_ad1(sess)
+    result = await asyncio.get_event_loop().run_in_executor(
+        _ad_executor, modify_ad, s["ad_id"], new_p_str, ad_data, creds
+    )
+    if result.get("retCode", result.get("ret_code", -1)) == 0:
+        _set_ad_current_price(sess, slot_idx, new_p)
+        now = datetime.now().strftime("%H:%M:%S")
+        await bot.send_message(chat_id=chat_id,
+            text=(
+                f"⚡ <b>Fast update</b> <code>{now}</code>\n"
+                f"💲 <code>{new_p_str}</code> — price rose before the next scheduled cycle"
+            ),
+            parse_mode="HTML")
+    # Non-zero result: silently skipped, see docstring above.
+
+
 # ─────────────────────────────────────────
 # 🔄 PRICE UPDATE LOOP
 # ─────────────────────────────────────────
@@ -3695,6 +3769,8 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
         else:
             submit_price, submit_str = new_p, new_p_str
 
+        if slot_idx == -1:
+            _record_modify_ad1(sess)   # shared budget with the fast-chase check
         result   = await asyncio.get_event_loop().run_in_executor(
             _ad_executor, modify_ad, s["ad_id"], submit_str, ad_data, creds
         )
@@ -3761,6 +3837,8 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                 else:
                     break   # a genuinely different error — stop retrying, fall through to failure handling
 
+                if slot_idx == -1:
+                    _record_modify_ad1(sess)
                 retry_result = await asyncio.get_event_loop().run_in_executor(
                     _ad_executor, modify_ad, s["ad_id"], candidate_str, ad_data, creds
                 )
@@ -3827,6 +3905,8 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                     break   # a genuinely different error — stop retrying, fall through to failure handling
 
                 candidate_str = str(candidate)
+                if slot_idx == -1:
+                    _record_modify_ad1(sess)
                 retry_result = await asyncio.get_event_loop().run_in_executor(
                     _ad_executor, modify_ad, s["ad_id"], candidate_str, ad_data, creds
                 )
@@ -3877,8 +3957,12 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
             if await _handle_ad_cycle_failure(bot, chat_id, sess, slot_idx, label, cycle, ret_code, ret_msg, ad_data):
                 return
 
-        for _ in range(interval * 60):
+        _fast_chase = (slot_idx == -1 and mode == "floating"
+                       and sess.total_ad_slots() == 1)
+        for _tick in range(interval * 60):
             if not _ad_running(sess, slot_idx): break
+            if _fast_chase and _tick > 0 and _tick % 10 == 0:
+                await _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, creds, _quant)
             await asyncio.sleep(1)
 
     logger.info(f"🛑 PRICE LOOP STOPPED ({label}) for user {chat_id}")
@@ -5238,6 +5322,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             if err:
                 await edit_menu(query, f"❌ <code>{_esc(str(err))}</code>", InlineKeyboardMarkup(back_section("section_ads")))
                 return
+        _record_modify_ad1(_s(tuser.id))
         result = await asyncio.get_event_loop().run_in_executor(
             _ad_executor, modify_ad, _s(tuser.id).settings["ad_id"], price, _s(tuser.id).ad_data, _update_creds
         )
@@ -5260,6 +5345,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
                     candidate     = (bound_dec - margin) if was_too_high else (bound_dec + margin)
                     safe_rounding = ROUND_FLOOR if was_too_high else ROUND_CEILING
                     candidate_str = str(candidate.quantize(Decimal("0.01"), rounding=safe_rounding))
+                _record_modify_ad1(_s(tuser.id))
                 result = await asyncio.get_event_loop().run_in_executor(
                     _ad_executor, modify_ad, _s(tuser.id).settings["ad_id"], candidate_str, _s(tuser.id).ad_data, _update_creds
                 )
@@ -5275,6 +5361,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             _ad_data_now = _s(tuser.id).ad_data
             _nudge = get_min_price_gap(_ad_data_now.get("currencyId",""), _ad_data_now.get("tokenId",""), Decimal(str(price)))
             _nudged_price = str((Decimal(str(price)) - _nudge).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+            _record_modify_ad1(_s(tuser.id))
             result = await asyncio.get_event_loop().run_in_executor(
                 _ad_executor, modify_ad, _s(tuser.id).settings["ad_id"], _nudged_price, _ad_data_now, _update_creds
             )
