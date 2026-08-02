@@ -72,7 +72,7 @@ from user_session import get_session, clear_session, get_all_sessions, SessionSt
 # Dedicated thread pool for ad modification calls (modify_ad via run_in_executor).
 # Isolated from the default executor so order/chat monitor threads can never starve
 # ad-update threads (and vice versa), which was causing Telegram timeouts under load.
-_ad_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="ad_modify")
+_ad_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="ad_modify")
 
 # Admin-level Paga queue (shared worker, but each user's jobs are tagged with their uid)
 import asyncio as _asyncio
@@ -206,6 +206,14 @@ def _reset_ad_failures(sess, slot_idx: int):
 # leave headroom for a manual edit on Bybit's own site in the same window.
 _FAST_CHASE_BUDGET       = 8
 _FAST_CHASE_WINDOW_SECS  = 300
+
+# How often the fast-chase price check runs while waiting out the rest of
+# the scheduled interval. Was implicitly 10s (tick counter % 10). Dropped
+# to 8s for faster reaction to price moves — this only affects how often
+# we CHECK, not how many edits we're allowed (still capped by
+# _FAST_CHASE_BUDGET/_FAST_CHASE_WINDOW_SECS above, shared with the
+# scheduled cycle, so the 8-edits-per-5-minutes ceiling is unchanged).
+_FAST_CHASE_POLL_SECS    = 8
 
 def _can_modify_ad1(sess, need: int = 1) -> bool:
     now = datetime.now().timestamp()
@@ -3631,7 +3639,8 @@ def calc_floating_price(ad_data, float_pct, local_usdt_ref):
 
 async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, creds, _quant):
     """
-    Runs every 10 seconds while Ad 1 waits out the rest of its scheduled
+    Runs on its own wall-clock timer (see _FAST_CHASE_POLL_SECS in
+    auto_update_loop) while Ad 1 waits out the rest of its scheduled
     interval (floating mode, single-ad users only — see auto_update_loop,
     which gates this to slot_idx == -1 and sess.total_ad_slots() == 1
     before ever calling it, so a user with 2+ ads never triggers this and
@@ -3662,108 +3671,171 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
     where it is — the whole point of chase mode is to keep the ad on the
     highest price seen so far, never to drift it down.
 
-    Any failure past this point is silently skipped rather than counted
-    towards the auto-stop failure counter — this is a bonus opportunistic
-    update, not a scheduled cycle, so the next 10s tick or the regular
-    scheduled cycle picks it up either way.
+    RELIABILITY: every skip/decision point below is logged (why it did or
+    didn't act), and the whole function is wrapped in try/except so a
+    single bad response, timeout, or bug here can NEVER kill the parent
+    auto_update_loop task — it used to be able to, silently, since nothing
+    upstream caught exceptions raised from here. A failure past the budget
+    check is still treated as "skip, try again next cycle" rather than
+    counted towards the scheduled-cycle auto-stop counter — this is a
+    bonus opportunistic update, not a scheduled cycle.
     """
-    if not _can_modify_ad1(sess):
-        return
-    local_usdt_ref = float(sess.shared_local_usdt_ref or s.get("local_usdt_ref") or 0)
-    new_p_str, err = calc_floating_price(ad_data, float_pct, local_usdt_ref)
-    if err:
-        return
-    new_p    = Decimal(new_p_str)
-    cur_p    = _ad_current_price(sess, slot_idx)
-    if cur_p <= 0:
-        return
-    currency = ad_data.get("currencyId","")
-    token    = ad_data.get("tokenId","")
-    gap      = _fast_chase_gap(currency, token, new_p)
+    tag = f"[FastChase u={chat_id} ad={s.get('ad_id')}]"
+    try:
+        logger.info(f"{tag} poll start")
 
-    chase_ceiling = _wants_live_ceiling(currency, token, float_pct)
-    posted_price  = None
-
-    if not chase_ceiling:
-        # Plain floating mode: the formula number is the real candidate.
-        if new_p - cur_p < gap:
-            return   # hasn't risen enough to be worth a fresh post yet
-        submit_price = new_p.quantize(_quant, rounding=ROUND_HALF_UP)
-        _record_modify_ad1(sess)
-        result = await asyncio.get_event_loop().run_in_executor(
-            _ad_executor, modify_ad, s["ad_id"], str(submit_price), ad_data, creds
-        )
-        if result.get("retCode", result.get("ret_code", -1)) == 0:
-            posted_price = submit_price
-
-    else:
-        # Chase-ceiling needs TWO calls to ever actually change anything:
-        # the probe (guaranteed to be rejected, purely to learn Bybit's
-        # current boundary) and the follow-up post of that boundary. If
-        # only one slot is left in the shared budget, spending it on the
-        # probe burns the last slot on a call that can NEVER succeed by
-        # itself — the follow-up that would have actually raised the
-        # price then gets silently skipped for lack of budget. That's
-        # exactly what was happening: a single "MODIFY... 912120022"
-        # logged, then nothing — the discovered boundary was a real $21+
-        # improvement, but there was no budget left to post it. Wait for
-        # 2 free slots instead of spending on a probe we can't follow up.
-        if not _can_modify_ad1(sess, need=2):
+        if not _can_modify_ad1(sess):
+            logger.info(
+                f"{tag} skipped — modify budget exhausted "
+                f"({len(sess.modify_call_times)}/{_FAST_CHASE_BUDGET} used in the last "
+                f"{_FAST_CHASE_WINDOW_SECS}s window, shared with the scheduled cycle)"
+            )
             return
-        # Chase-ceiling: probe first (always — the natural formula number
-        # tells us nothing about where Bybit's real boundary currently
-        # sits), then decide whether the DISCOVERED boundary is worth
-        # posting — never the probe itself.
-        probe_price = (new_p * Decimal("5")).quantize(_quant, rounding=ROUND_HALF_UP)
-        _record_modify_ad1(sess)
-        result = await asyncio.get_event_loop().run_in_executor(
-            _ad_executor, modify_ad, s["ad_id"], str(probe_price), ad_data, creds
+
+        local_usdt_ref = float(sess.shared_local_usdt_ref or s.get("local_usdt_ref") or 0)
+
+        # calc_floating_price() ultimately calls requests.get() against Bybit's
+        # public ticker endpoint — a BLOCKING network call. Calling it directly
+        # on the event loop (as before) stalls the entire bot — every other
+        # user's monitor, every Telegram reply — for however long that HTTP
+        # call takes, with no exception and therefore no log line. Running it
+        # in the executor is what actually makes "the loop never stops
+        # unless disabled" true.
+        new_p_str, err = await asyncio.get_event_loop().run_in_executor(
+            _ad_executor, calc_floating_price, ad_data, float_pct, local_usdt_ref
         )
-        last_code = result.get("retCode", result.get("ret_code", -1))
-        last_msg  = result.get("retMsg",  result.get("ret_msg","Unknown"))
+        if err:
+            logger.warning(f"{tag} skipped — spot price fetch failed: {err}")
+            return
 
-        if last_code == 0:
-            # Extremely unlikely — the 5x probe was accepted outright.
-            posted_price = probe_price
-        elif last_code == 912120022:
-            min_str, max_str = _extract_bybit_bounds(last_msg)
-            bound_str = max_str if max_str else min_str
-            if bound_str:
-                candidate = Decimal(bound_str)
-                if candidate - cur_p >= gap and _can_modify_ad1(sess):
-                    _record_modify_ad1(sess)
-                    retry_result = await asyncio.get_event_loop().run_in_executor(
-                        _ad_executor, modify_ad, s["ad_id"], bound_str, ad_data, creds
-                    )
-                    retry_code = retry_result.get("retCode", retry_result.get("ret_code", -1))
-                    if retry_code == 0:
-                        posted_price = candidate
-                    elif retry_code == 90043 and _can_modify_ad1(sess):
-                        # Discovered boundary matches what's live after all —
-                        # nudge once. Still gated by the same "is it actually
-                        # an improvement" check so this can't sneak in a
-                        # downgrade either.
-                        nudged = (candidate - gap).quantize(_quant, rounding=ROUND_HALF_UP)
-                        if nudged - cur_p >= gap:
-                            _record_modify_ad1(sess)
-                            nudge_result = await asyncio.get_event_loop().run_in_executor(
-                                _ad_executor, modify_ad, s["ad_id"], str(nudged), ad_data, creds
-                            )
-                            if nudge_result.get("retCode", nudge_result.get("ret_code", -1)) == 0:
-                                posted_price = nudged
-                # else: Bybit's real ceiling hasn't risen above what's
-                # already live — leave the ad exactly where it is.
+        new_p = Decimal(new_p_str)
+        cur_p = _ad_current_price(sess, slot_idx)
+        logger.info(f"{tag} spot-derived price={new_p} | current ad price={cur_p}")
+        if cur_p <= 0:
+            logger.warning(f"{tag} skipped — no known current ad price yet")
+            return
 
-    if posted_price is not None:
-        _set_ad_current_price(sess, slot_idx, posted_price)
-        now = datetime.now().strftime("%H:%M:%S")
-        await bot.send_message(chat_id=chat_id,
-            text=(
-                f"⚡ <b>Fast update</b> <code>{now}</code>\n"
-                f"💲 <code>{posted_price}</code> — price rose before the next scheduled cycle"
-            ),
-            parse_mode="HTML")
-    # else: silently skipped, see docstring above.
+        currency = ad_data.get("currencyId", "")
+        token    = ad_data.get("tokenId", "")
+        gap      = _fast_chase_gap(currency, token, new_p)
+
+        chase_ceiling = _wants_live_ceiling(currency, token, float_pct)
+        posted_price  = None
+
+        if not chase_ceiling:
+            # Plain floating mode: the formula number is the real candidate.
+            diff = new_p - cur_p
+            logger.info(f"{tag} plain-floating | diff={diff} threshold={gap}")
+            if diff < gap:
+                logger.info(f"{tag} skipped — diff {diff} below the {gap} threshold, not worth a post yet")
+                return
+            submit_price = new_p.quantize(_quant, rounding=ROUND_HALF_UP)
+            _record_modify_ad1(sess)
+            logger.info(f"{tag} threshold met — submitting {submit_price}")
+            result = await asyncio.get_event_loop().run_in_executor(
+                _ad_executor, modify_ad, s["ad_id"], str(submit_price), ad_data, creds
+            )
+            code = result.get("retCode", result.get("ret_code", -1))
+            if code == 0:
+                posted_price = submit_price
+                logger.info(f"{tag} modify accepted — new ad price {posted_price}")
+            else:
+                logger.warning(
+                    f"{tag} modify rejected — code={code} "
+                    f"msg={result.get('retMsg', result.get('ret_msg',''))!r}"
+                )
+
+        else:
+            # Chase-ceiling needs TWO calls to ever actually change anything:
+            # the probe (guaranteed to be rejected, purely to learn Bybit's
+            # current boundary) and the follow-up post of that boundary. If
+            # only one slot is left in the shared budget, spending it on the
+            # probe burns the last slot on a call that can NEVER succeed by
+            # itself — the follow-up that would have actually raised the
+            # price then gets silently skipped for lack of budget. That's
+            # exactly what was happening: a single "MODIFY... 912120022"
+            # logged, then nothing — the discovered boundary was a real $21+
+            # improvement, but there was no budget left to post it. Wait for
+            # 2 free slots instead of spending on a probe we can't follow up.
+            if not _can_modify_ad1(sess, need=2):
+                logger.info(f"{tag} skipped — chase-ceiling needs 2 free budget slots, don't have them")
+                return
+            # Chase-ceiling: probe first (always — the natural formula number
+            # tells us nothing about where Bybit's real boundary currently
+            # sits), then decide whether the DISCOVERED boundary is worth
+            # posting — never the probe itself.
+            probe_price = (new_p * Decimal("5")).quantize(_quant, rounding=ROUND_HALF_UP)
+            _record_modify_ad1(sess)
+            logger.info(f"{tag} chase-ceiling probe — submitting {probe_price}")
+            result = await asyncio.get_event_loop().run_in_executor(
+                _ad_executor, modify_ad, s["ad_id"], str(probe_price), ad_data, creds
+            )
+            last_code = result.get("retCode", result.get("ret_code", -1))
+            last_msg  = result.get("retMsg",  result.get("ret_msg","Unknown"))
+            logger.info(f"{tag} probe result code={last_code} msg={last_msg!r}")
+
+            if last_code == 0:
+                # Extremely unlikely — the 5x probe was accepted outright.
+                posted_price = probe_price
+            elif last_code == 912120022:
+                min_str, max_str = _extract_bybit_bounds(last_msg)
+                bound_str = max_str if max_str else min_str
+                if not bound_str:
+                    logger.warning(f"{tag} could not parse a boundary out of msg={last_msg!r}")
+                else:
+                    candidate = Decimal(bound_str)
+                    logger.info(f"{tag} discovered boundary={candidate} vs current={cur_p} threshold={gap}")
+                    if candidate - cur_p >= gap and _can_modify_ad1(sess):
+                        _record_modify_ad1(sess)
+                        retry_result = await asyncio.get_event_loop().run_in_executor(
+                            _ad_executor, modify_ad, s["ad_id"], bound_str, ad_data, creds
+                        )
+                        retry_code = retry_result.get("retCode", retry_result.get("ret_code", -1))
+                        if retry_code == 0:
+                            posted_price = candidate
+                            logger.info(f"{tag} boundary post accepted — new ad price {posted_price}")
+                        elif retry_code == 90043 and _can_modify_ad1(sess):
+                            # Discovered boundary matches what's live after all —
+                            # nudge once. Still gated by the same "is it actually
+                            # an improvement" check so this can't sneak in a
+                            # downgrade either.
+                            nudged = (candidate - gap).quantize(_quant, rounding=ROUND_HALF_UP)
+                            if nudged - cur_p >= gap:
+                                _record_modify_ad1(sess)
+                                nudge_result = await asyncio.get_event_loop().run_in_executor(
+                                    _ad_executor, modify_ad, s["ad_id"], str(nudged), ad_data, creds
+                                )
+                                if nudge_result.get("retCode", nudge_result.get("ret_code", -1)) == 0:
+                                    posted_price = nudged
+                                    logger.info(f"{tag} nudged post accepted — new ad price {posted_price}")
+                        else:
+                            logger.warning(f"{tag} boundary post rejected — code={retry_code}")
+                    else:
+                        logger.info(
+                            f"{tag} skipped — Bybit's real ceiling hasn't risen enough above what's "
+                            f"already live (candidate-cur={candidate - cur_p} < {gap}, or budget exhausted)"
+                        )
+            else:
+                logger.warning(f"{tag} probe returned an unexpected code={last_code} msg={last_msg!r}")
+
+        if posted_price is not None:
+            _set_ad_current_price(sess, slot_idx, posted_price)
+            now = datetime.now().strftime("%H:%M:%S")
+            await bot.send_message(chat_id=chat_id,
+                text=(
+                    f"⚡ <b>Fast update</b> <code>{now}</code>\n"
+                    f"💲 <code>{posted_price}</code> — price rose before the next scheduled cycle"
+                ),
+                parse_mode="HTML")
+        else:
+            logger.info(f"{tag} poll complete — no update posted")
+
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        # This is the critical guarantee: nothing raised in this function can
+        # ever escape and take the parent auto_update_loop task down with it.
+        logger.error(f"{tag} unhandled exception: {e}", exc_info=True)
 
 
 # ─────────────────────────────────────────
@@ -3811,265 +3883,311 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
 
     cycle = 0
     while _ad_running(sess, slot_idx):
-        cycle += 1
-        now  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        mode = s.get("mode","fixed")
-        prefix = f"[{label}] " if sess.total_ad_slots() > 1 else ""
+        try:
+            cycle += 1
+            now  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            mode = s.get("mode","fixed")
+            prefix = f"[{label}] " if sess.total_ad_slots() > 1 else ""
 
-        if mode == "fixed":
-            new_p    = _ad_current_price(sess, slot_idx) + increment
-            _quant   = Decimal("0.00000001")   # unchanged — fixed mode's original precision
-            chase_ceiling = False   # live-ceiling chase only applies to floating mode
-        else:
-            try:
-                float_pct = float(s.get("float_pct") or 0)
-            except (TypeError, ValueError):
-                float_pct = 0
-            if float_pct <= 0:
-                await bot.send_message(chat_id=chat_id,
-                    text=(
-                        f"⚠️ {prefix}<b>Cycle {cycle}</b> — Float % isn't set yet.\n"
-                        f"Set it from the AD Price Bot menu, then restart {label}."
-                    ), parse_mode="HTML")
-                _set_ad_running(sess, slot_idx, False)
-                _set_ad_task(sess, slot_idx, None)
-                return
-            local_usdt_ref = float(sess.shared_local_usdt_ref or s.get("local_usdt_ref") or 0)
-            new_p_str, err = calc_floating_price(ad_data, float_pct, local_usdt_ref)
-            if err:
-                await bot.send_message(chat_id=chat_id,
-                    text=f"⚠️ {prefix}<b>Cycle {cycle} float error</b>\n<code>{_esc(str(err))}</code>", parse_mode="HTML")
-                for _ in range(interval * 60):
-                    if not _ad_running(sess, slot_idx): break
-                    await asyncio.sleep(1)
-                continue
-            new_p  = Decimal(new_p_str)   # calc_floating_price's own 0.01 precision
-            _quant = Decimal("0.01")
-            chase_ceiling = _wants_live_ceiling(
-                ad_data.get("currencyId",""), ad_data.get("tokenId",""), float_pct
-            )
-
-        # ── Same-float multi-ad support: same % is allowed across ads on
-        # the same pair now — this nudges the actual PRICE apart instead,
-        # only when another active ad on the identical pair would
-        # otherwise land within the minimum gap. ──
-        if sess.total_ad_slots() > 1:
-            new_p = _resolve_price_collision(
-                sess, slot_idx,
-                ad_data.get("currencyId",""), ad_data.get("tokenId",""),
-                new_p
-            )
-        new_p_str = str(new_p.quantize(_quant, rounding=ROUND_HALF_UP))
-
-        # ── Live-ceiling chase (max floating %) ──
-        # At the top float % for this pair, submit a price deliberately
-        # far beyond anything Bybit would ever accept, guaranteeing an
-        # out-of-range (912120022) rejection. Bybit's error message always
-        # includes its OWN current real max — the 912120022 handler below
-        # then posts exactly that. This makes the ad always track Bybit's
-        # true live ceiling every cycle instead of a fixed formula number
-        # that can drift from it as the order book moves.
-        if chase_ceiling:
-            probe_price = (new_p * Decimal("5")).quantize(_quant, rounding=ROUND_HALF_UP)
-            submit_price, submit_str = probe_price, str(probe_price)
-        else:
-            submit_price, submit_str = new_p, new_p_str
-
-        if slot_idx == -1:
-            _record_modify_ad1(sess)   # shared budget with the fast-chase check
-        result   = await asyncio.get_event_loop().run_in_executor(
-            _ad_executor, modify_ad, s["ad_id"], submit_str, ad_data, creds
-        )
-        ret_code = result.get("retCode", result.get("ret_code",-1))
-        ret_msg  = result.get("retMsg",  result.get("ret_msg","Unknown"))
-
-        if ret_code == 912120022:
-            # Out-of-range — Bybit tells us its own max/min. The FIRST
-            # retry posts that exact number — it's what Bybit itself just
-            # told us is valid, and with live BTC/ETH prices constantly
-            # moving there's essentially no risk of it colliding with
-            # anything. Only if that exact-boundary attempt ALSO fails
-            # do later attempts back off with a small safety margin, each
-            # time reading a FRESH boundary from the latest response.
-            #
-            # One specific failure mode handled here: if this ad already
-            # sits EXACTLY at Bybit's stated boundary (e.g. a previous
-            # cycle already parked it at the live max), resubmitting that
-            # same exact number gets rejected with 90043 ("price differs
-            # by less than 0%") instead of 912120022 — Bybit is telling us
-            # the number is valid, just unchanged. That used to bubble up
-            # as a totally different, unhandled error and get counted as
-            # a cycle failure after only 2 occurrences, auto-stopping the
-            # ad. Now it's treated the same way the top-level 90043 branch
-            # handles it: nudge off it by this pair's minimum price gap,
-            # in whichever direction we were already heading, and keep
-            # trying — rather than stopping the ad over a price that's
-            # perfectly fine, just identical to what's already live.
-            last_code, last_msg = ret_code, ret_msg
-            posted_price   = None
-            was_too_high   = None
-            candidate      = None
-            for _attempt in range(4):
-                if last_code == 912120022:
-                    min_str, max_str = _extract_bybit_bounds(last_msg)
-                    was_too_high = max_str is not None
-                    bound_str = max_str if was_too_high else min_str
-                    if not bound_str:
-                        break   # couldn't parse a boundary at all — nothing more we can do
-                    bound_dec = Decimal(bound_str)
-                    if _attempt < 2:
-                        # Use Bybit's own string EXACTLY — no re-quantizing. Bybit
-                        # doesn't always use the same decimal precision we do
-                        # (e.g. 3 decimals on some USD pairs vs 2 on NGN), so
-                        # rounding this to our own precision can round IT UP
-                        # past Bybit's actual limit and fail again for a reason
-                        # that has nothing to do with the price being wrong.
-                        candidate_str = bound_str
-                        candidate     = bound_dec
-                    else:
-                        # Last resort: nudge off the boundary. Round in the SAFE
-                        # direction (down if we were too high, up if too low) so
-                        # quantizing can never push us back out of range.
-                        margin    = _safety_margin(bound_dec)
-                        candidate = (bound_dec - margin) if was_too_high else (bound_dec + margin)
-                        safe_rounding = ROUND_FLOOR if was_too_high else ROUND_CEILING
-                        candidate     = candidate.quantize(_quant, rounding=safe_rounding)
-                        candidate_str = str(candidate)
-                elif last_code == 90043 and candidate is not None:
-                    gap = get_min_price_gap(ad_data.get("currencyId",""), ad_data.get("tokenId",""), candidate)
-                    candidate = (candidate - gap) if was_too_high else (candidate + gap)
-                    candidate = candidate.quantize(_quant, rounding=ROUND_HALF_UP)
-                    candidate_str = str(candidate)
-                else:
-                    break   # a genuinely different error — stop retrying, fall through to failure handling
-
-                if slot_idx == -1:
-                    _record_modify_ad1(sess)
-                retry_result = await asyncio.get_event_loop().run_in_executor(
-                    _ad_executor, modify_ad, s["ad_id"], candidate_str, ad_data, creds
-                )
-                last_code = retry_result.get("retCode", retry_result.get("ret_code",-1))
-                last_msg  = retry_result.get("retMsg",  retry_result.get("ret_msg","Unknown"))
-                if last_code == 0:
-                    posted_price = candidate
-                    break
-                if last_code not in (912120022, 90043):
-                    break   # a different error now — stop retrying, fall through to failure handling
-
-            if posted_price is not None:
-                _reset_ad_failures(sess, slot_idx)
-                _set_ad_current_price(sess, slot_idx, posted_price)
-                if chase_ceiling:
+            if mode == "fixed":
+                new_p    = _ad_current_price(sess, slot_idx) + increment
+                _quant   = Decimal("0.00000001")   # unchanged — fixed mode's original precision
+                chase_ceiling = False   # live-ceiling chase only applies to floating mode
+            else:
+                try:
+                    float_pct = float(s.get("float_pct") or 0)
+                except (TypeError, ValueError):
+                    float_pct = 0
+                if float_pct <= 0:
                     await bot.send_message(chat_id=chat_id,
                         text=(
-                            f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n"
-                            f"🏔 Chasing Bybit's live ceiling (max float {float_pct}%)\n"
-                            f"💲 Posted at Bybit's real-time max: <code>{posted_price}</code> ({mode.upper()})"
-                        ),
-                        parse_mode="HTML")
-                else:
-                    await bot.send_message(chat_id=chat_id,
-                        text=(
-                            f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n"
-                            f"⚠️ Original <code>{new_p_str}</code> was out of range\n"
-                            f"💲 Posted within Bybit's limit: <code>{posted_price}</code> ({mode.upper()})"
-                        ),
-                        parse_mode="HTML")
-            else:
-                if await _handle_ad_cycle_failure(bot, chat_id, sess, slot_idx, label, cycle, last_code, last_msg, ad_data):
+                            f"⚠️ {prefix}<b>Cycle {cycle}</b> — Float % isn't set yet.\n"
+                            f"Set it from the AD Price Bot menu, then restart {label}."
+                        ), parse_mode="HTML")
+                    _set_ad_running(sess, slot_idx, False)
+                    _set_ad_task(sess, slot_idx, None)
                     return
-
-
-        elif ret_code == 90043:
-            # "The price of this P2P ad differs from your existing ad by
-            # less than 0%." — this fires when the computed price rounds
-            # to the SAME value the ad already has live on Bybit (happens
-            # when the underlying market barely moves between cycles, or
-            # when this ad hasn't changed since its last successful post).
-            # This is fully recoverable — nudge the price by this pair's
-            # minimum gap and retry, same pattern as the out-of-range case
-            # above, instead of counting it as a failure. If one nudge
-            # isn't enough (e.g. the pair's flat gap is tiny relative to
-            # its price scale), each further attempt doubles the nudge; if
-            # Bybit instead reports we've now gone out of range, switch to
-            # posting its stated boundary directly.
-            last_code, last_msg = ret_code, ret_msg
-            candidate = new_p
-            posted_price = None
-            for _attempt in range(3):
-                if last_code == 90043:
-                    gap = get_min_price_gap(ad_data.get("currencyId",""), ad_data.get("tokenId",""), candidate) * (2 ** _attempt)
-                    candidate = candidate - gap
-                    candidate = candidate.quantize(_quant, rounding=ROUND_HALF_UP)
-                elif last_code == 912120022:
-                    min_str, max_str = _extract_bybit_bounds(last_msg)
-                    bound_str = max_str if max_str else min_str
-                    if not bound_str:
-                        break
-                    candidate = Decimal(bound_str)
-                else:
-                    break   # a genuinely different error — stop retrying, fall through to failure handling
-
-                candidate_str = str(candidate)
-                if slot_idx == -1:
-                    _record_modify_ad1(sess)
-                retry_result = await asyncio.get_event_loop().run_in_executor(
-                    _ad_executor, modify_ad, s["ad_id"], candidate_str, ad_data, creds
+                local_usdt_ref = float(sess.shared_local_usdt_ref or s.get("local_usdt_ref") or 0)
+                # Offload — calc_floating_price() blocks on a real HTTP call
+                # (Bybit's public ticker endpoint). Never call it directly on
+                # the event loop thread; see the matching fix in
+                # _try_fast_chase for why that silently stalls the whole bot.
+                new_p_str, err = await asyncio.get_event_loop().run_in_executor(
+                    _ad_executor, calc_floating_price, ad_data, float_pct, local_usdt_ref
                 )
-                last_code = retry_result.get("retCode", retry_result.get("ret_code",-1))
-                last_msg  = retry_result.get("retMsg",  retry_result.get("ret_msg","Unknown"))
-                if last_code == 0:
-                    posted_price = candidate
-                    break
-                if last_code not in (90043, 912120022):
-                    break
+                if err:
+                    await bot.send_message(chat_id=chat_id,
+                        text=f"⚠️ {prefix}<b>Cycle {cycle} float error</b>\n<code>{_esc(str(err))}</code>", parse_mode="HTML")
+                    for _ in range(interval * 60):
+                        if not _ad_running(sess, slot_idx): break
+                        await asyncio.sleep(1)
+                    continue
+                new_p  = Decimal(new_p_str)   # calc_floating_price's own 0.01 precision
+                _quant = Decimal("0.01")
+                chase_ceiling = _wants_live_ceiling(
+                    ad_data.get("currencyId",""), ad_data.get("tokenId",""), float_pct
+                )
 
-            if posted_price is not None:
-                _reset_ad_failures(sess, slot_idx)
-                _set_ad_current_price(sess, slot_idx, posted_price)
-                await bot.send_message(chat_id=chat_id,
-                    text=(
-                        f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n"
-                        f"⚠️ Price unchanged from last post — nudged\n"
-                        f"💲 <code>{posted_price}</code> ({mode.upper()})"
-                    ),
-                    parse_mode="HTML")
-            else:
-                if await _handle_ad_cycle_failure(bot, chat_id, sess, slot_idx, label, cycle, last_code, last_msg, ad_data):
-                    return
+            # ── Same-float multi-ad support: same % is allowed across ads on
+            # the same pair now — this nudges the actual PRICE apart instead,
+            # only when another active ad on the identical pair would
+            # otherwise land within the minimum gap. ──
+            if sess.total_ad_slots() > 1:
+                new_p = _resolve_price_collision(
+                    sess, slot_idx,
+                    ad_data.get("currencyId",""), ad_data.get("tokenId",""),
+                    new_p
+                )
+            new_p_str = str(new_p.quantize(_quant, rounding=ROUND_HALF_UP))
 
-        elif ret_code == 0:
-            _reset_ad_failures(sess, slot_idx)
-            _set_ad_current_price(sess, slot_idx, submit_price)
+            # ── Live-ceiling chase (max floating %) ──
+            # At the top float % for this pair, submit a price deliberately
+            # far beyond anything Bybit would ever accept, guaranteeing an
+            # out-of-range (912120022) rejection. Bybit's error message always
+            # includes its OWN current real max — the 912120022 handler below
+            # then posts exactly that. This makes the ad always track Bybit's
+            # true live ceiling every cycle instead of a fixed formula number
+            # that can drift from it as the order book moves.
             if chase_ceiling:
-                # Extremely unlikely — the probe price (5x the formula
-                # number) was accepted outright instead of triggering an
-                # out-of-range rejection. Flag it clearly rather than
-                # silently leaving the ad listed at that price, since this
-                # means Bybit's real ceiling for this ad is currently even
-                # higher than expected.
-                await bot.send_message(chat_id=chat_id,
-                    text=(
-                        f"⚠️ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n"
-                        f"🏔 Live-ceiling probe was accepted directly at <code>{submit_str}</code> — "
-                        f"Bybit's real max right now is at or above this. Double-check this ad on Bybit."
-                    ),
-                    parse_mode="HTML")
+                probe_price = (new_p * Decimal("5")).quantize(_quant, rounding=ROUND_HALF_UP)
+                submit_price, submit_str = probe_price, str(probe_price)
             else:
-                await bot.send_message(chat_id=chat_id,
-                    text=f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n💲 <code>{submit_str}</code> ({mode.upper()})",
-                    parse_mode="HTML")
-        else:
-            if await _handle_ad_cycle_failure(bot, chat_id, sess, slot_idx, label, cycle, ret_code, ret_msg, ad_data):
-                return
+                submit_price, submit_str = new_p, new_p_str
 
-        for _tick in range(interval * 60):
-            if not _ad_running(sess, slot_idx): break
-            if (_tick > 0 and _tick % 10 == 0
-                    and slot_idx == -1 and mode == "floating"
-                    and sess.total_ad_slots() == 1):
-                await _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, creds, _quant)
-            await asyncio.sleep(1)
+            if slot_idx == -1:
+                _record_modify_ad1(sess)   # shared budget with the fast-chase check
+            result   = await asyncio.get_event_loop().run_in_executor(
+                _ad_executor, modify_ad, s["ad_id"], submit_str, ad_data, creds
+            )
+            ret_code = result.get("retCode", result.get("ret_code",-1))
+            ret_msg  = result.get("retMsg",  result.get("ret_msg","Unknown"))
+
+            if ret_code == 912120022:
+                # Out-of-range — Bybit tells us its own max/min. The FIRST
+                # retry posts that exact number — it's what Bybit itself just
+                # told us is valid, and with live BTC/ETH prices constantly
+                # moving there's essentially no risk of it colliding with
+                # anything. Only if that exact-boundary attempt ALSO fails
+                # do later attempts back off with a small safety margin, each
+                # time reading a FRESH boundary from the latest response.
+                #
+                # One specific failure mode handled here: if this ad already
+                # sits EXACTLY at Bybit's stated boundary (e.g. a previous
+                # cycle already parked it at the live max), resubmitting that
+                # same exact number gets rejected with 90043 ("price differs
+                # by less than 0%") instead of 912120022 — Bybit is telling us
+                # the number is valid, just unchanged. That used to bubble up
+                # as a totally different, unhandled error and get counted as
+                # a cycle failure after only 2 occurrences, auto-stopping the
+                # ad. Now it's treated the same way the top-level 90043 branch
+                # handles it: nudge off it by this pair's minimum price gap,
+                # in whichever direction we were already heading, and keep
+                # trying — rather than stopping the ad over a price that's
+                # perfectly fine, just identical to what's already live.
+                last_code, last_msg = ret_code, ret_msg
+                posted_price   = None
+                was_too_high   = None
+                candidate      = None
+                for _attempt in range(4):
+                    if last_code == 912120022:
+                        min_str, max_str = _extract_bybit_bounds(last_msg)
+                        was_too_high = max_str is not None
+                        bound_str = max_str if was_too_high else min_str
+                        if not bound_str:
+                            break   # couldn't parse a boundary at all — nothing more we can do
+                        bound_dec = Decimal(bound_str)
+                        if _attempt < 2:
+                            # Use Bybit's own string EXACTLY — no re-quantizing. Bybit
+                            # doesn't always use the same decimal precision we do
+                            # (e.g. 3 decimals on some USD pairs vs 2 on NGN), so
+                            # rounding this to our own precision can round IT UP
+                            # past Bybit's actual limit and fail again for a reason
+                            # that has nothing to do with the price being wrong.
+                            candidate_str = bound_str
+                            candidate     = bound_dec
+                        else:
+                            # Last resort: nudge off the boundary. Round in the SAFE
+                            # direction (down if we were too high, up if too low) so
+                            # quantizing can never push us back out of range.
+                            margin    = _safety_margin(bound_dec)
+                            candidate = (bound_dec - margin) if was_too_high else (bound_dec + margin)
+                            safe_rounding = ROUND_FLOOR if was_too_high else ROUND_CEILING
+                            candidate     = candidate.quantize(_quant, rounding=safe_rounding)
+                            candidate_str = str(candidate)
+                    elif last_code == 90043 and candidate is not None:
+                        gap = get_min_price_gap(ad_data.get("currencyId",""), ad_data.get("tokenId",""), candidate)
+                        candidate = (candidate - gap) if was_too_high else (candidate + gap)
+                        candidate = candidate.quantize(_quant, rounding=ROUND_HALF_UP)
+                        candidate_str = str(candidate)
+                    else:
+                        break   # a genuinely different error — stop retrying, fall through to failure handling
+
+                    if slot_idx == -1:
+                        _record_modify_ad1(sess)
+                    retry_result = await asyncio.get_event_loop().run_in_executor(
+                        _ad_executor, modify_ad, s["ad_id"], candidate_str, ad_data, creds
+                    )
+                    last_code = retry_result.get("retCode", retry_result.get("ret_code",-1))
+                    last_msg  = retry_result.get("retMsg",  retry_result.get("ret_msg","Unknown"))
+                    if last_code == 0:
+                        posted_price = candidate
+                        break
+                    if last_code not in (912120022, 90043):
+                        break   # a different error now — stop retrying, fall through to failure handling
+
+                if posted_price is not None:
+                    _reset_ad_failures(sess, slot_idx)
+                    _set_ad_current_price(sess, slot_idx, posted_price)
+                    if chase_ceiling:
+                        await bot.send_message(chat_id=chat_id,
+                            text=(
+                                f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n"
+                                f"🏔 Chasing Bybit's live ceiling (max float {float_pct}%)\n"
+                                f"💲 Posted at Bybit's real-time max: <code>{posted_price}</code> ({mode.upper()})"
+                            ),
+                            parse_mode="HTML")
+                    else:
+                        await bot.send_message(chat_id=chat_id,
+                            text=(
+                                f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n"
+                                f"⚠️ Original <code>{new_p_str}</code> was out of range\n"
+                                f"💲 Posted within Bybit's limit: <code>{posted_price}</code> ({mode.upper()})"
+                            ),
+                            parse_mode="HTML")
+                else:
+                    if await _handle_ad_cycle_failure(bot, chat_id, sess, slot_idx, label, cycle, last_code, last_msg, ad_data):
+                        return
+
+
+            elif ret_code == 90043:
+                # "The price of this P2P ad differs from your existing ad by
+                # less than 0%." — this fires when the computed price rounds
+                # to the SAME value the ad already has live on Bybit (happens
+                # when the underlying market barely moves between cycles, or
+                # when this ad hasn't changed since its last successful post).
+                # This is fully recoverable — nudge the price by this pair's
+                # minimum gap and retry, same pattern as the out-of-range case
+                # above, instead of counting it as a failure. If one nudge
+                # isn't enough (e.g. the pair's flat gap is tiny relative to
+                # its price scale), each further attempt doubles the nudge; if
+                # Bybit instead reports we've now gone out of range, switch to
+                # posting its stated boundary directly.
+                last_code, last_msg = ret_code, ret_msg
+                candidate = new_p
+                posted_price = None
+                for _attempt in range(3):
+                    if last_code == 90043:
+                        gap = get_min_price_gap(ad_data.get("currencyId",""), ad_data.get("tokenId",""), candidate) * (2 ** _attempt)
+                        candidate = candidate - gap
+                        candidate = candidate.quantize(_quant, rounding=ROUND_HALF_UP)
+                    elif last_code == 912120022:
+                        min_str, max_str = _extract_bybit_bounds(last_msg)
+                        bound_str = max_str if max_str else min_str
+                        if not bound_str:
+                            break
+                        candidate = Decimal(bound_str)
+                    else:
+                        break   # a genuinely different error — stop retrying, fall through to failure handling
+
+                    candidate_str = str(candidate)
+                    if slot_idx == -1:
+                        _record_modify_ad1(sess)
+                    retry_result = await asyncio.get_event_loop().run_in_executor(
+                        _ad_executor, modify_ad, s["ad_id"], candidate_str, ad_data, creds
+                    )
+                    last_code = retry_result.get("retCode", retry_result.get("ret_code",-1))
+                    last_msg  = retry_result.get("retMsg",  retry_result.get("ret_msg","Unknown"))
+                    if last_code == 0:
+                        posted_price = candidate
+                        break
+                    if last_code not in (90043, 912120022):
+                        break
+
+                if posted_price is not None:
+                    _reset_ad_failures(sess, slot_idx)
+                    _set_ad_current_price(sess, slot_idx, posted_price)
+                    await bot.send_message(chat_id=chat_id,
+                        text=(
+                            f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n"
+                            f"⚠️ Price unchanged from last post — nudged\n"
+                            f"💲 <code>{posted_price}</code> ({mode.upper()})"
+                        ),
+                        parse_mode="HTML")
+                else:
+                    if await _handle_ad_cycle_failure(bot, chat_id, sess, slot_idx, label, cycle, last_code, last_msg, ad_data):
+                        return
+
+            elif ret_code == 0:
+                _reset_ad_failures(sess, slot_idx)
+                _set_ad_current_price(sess, slot_idx, submit_price)
+                if chase_ceiling:
+                    # Extremely unlikely — the probe price (5x the formula
+                    # number) was accepted outright instead of triggering an
+                    # out-of-range rejection. Flag it clearly rather than
+                    # silently leaving the ad listed at that price, since this
+                    # means Bybit's real ceiling for this ad is currently even
+                    # higher than expected.
+                    await bot.send_message(chat_id=chat_id,
+                        text=(
+                            f"⚠️ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n"
+                            f"🏔 Live-ceiling probe was accepted directly at <code>{submit_str}</code> — "
+                            f"Bybit's real max right now is at or above this. Double-check this ad on Bybit."
+                        ),
+                        parse_mode="HTML")
+                else:
+                    await bot.send_message(chat_id=chat_id,
+                        text=f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n💲 <code>{submit_str}</code> ({mode.upper()})",
+                        parse_mode="HTML")
+            else:
+                if await _handle_ad_cycle_failure(bot, chat_id, sess, slot_idx, label, cycle, ret_code, ret_msg, ad_data):
+                    return
+
+            # ── Fast-chase wait window ──────────────────────────────────────
+            # Previously this counted plain loop iterations ("every 10th
+            # tick") and assumed each iteration took ~1 real second. That
+            # assumption silently broke whenever a fast-chase call itself took
+            # several seconds (a slow Bybit response, a retry, a brief
+            # timeout) — the tick counter kept advancing by exactly 1 per
+            # iteration regardless of how long the previous await actually
+            # took, so real-world checks drifted later and later with no
+            # error anywhere to show it. Scheduling off the monotonic clock
+            # instead means a single slow poll can only ever delay ITS OWN
+            # next check by that same amount — it can never silently stack up
+            # and stall every check after it.
+            loop_clock       = asyncio.get_event_loop()
+            wait_until       = loop_clock.time() + interval * 60
+            next_fast_chase  = loop_clock.time() + _FAST_CHASE_POLL_SECS
+            while _ad_running(sess, slot_idx) and loop_clock.time() < wait_until:
+                if (loop_clock.time() >= next_fast_chase
+                        and slot_idx == -1 and mode == "floating"
+                        and sess.total_ad_slots() == 1):
+                    try:
+                        await _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, creds, _quant)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as _fce:
+                        # Belt-and-braces: _try_fast_chase already catches everything
+                        # internally, but this guarantees the scheduled cycle's own
+                        # wait loop can never be killed by a fast-chase failure either.
+                        logger.error(f"[FastChase] uncaught error for user {chat_id}: {_fce}", exc_info=True)
+                    next_fast_chase = loop_clock.time() + _FAST_CHASE_POLL_SECS
+                await asyncio.sleep(1)
+        except asyncio.CancelledError:
+            logger.info(f"[{label}] Auto-update task cancelled for user {chat_id}")
+            raise
+        except Exception as _cycle_exc:
+            # This is the core reliability fix: previously NOTHING wrapped the
+            # scheduled cycle body, so any unexpected exception here (a bad
+            # API response shape, a KeyError, a Decimal conversion issue, etc.)
+            # would propagate all the way out of auto_update_loop and silently
+            # kill the asyncio Task — refresh_running stayed True, the menu kept
+            # showing "running", and nothing was ever logged pointing at why it
+            # stopped. Now it's caught, logged loudly, and the loop keeps going.
+            logger.error(
+                f"[{label}] Cycle {cycle} crashed unexpectedly for user {chat_id}: {_cycle_exc}",
+                exc_info=True
+            )
+            await asyncio.sleep(2)   # brief backoff so a persistent error can't hot-loop
 
     logger.info(f"🛑 PRICE LOOP STOPPED ({label}) for user {chat_id}")
 
