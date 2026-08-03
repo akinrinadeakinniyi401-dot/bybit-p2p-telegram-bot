@@ -229,7 +229,7 @@ def _reset_ad_failures(sess, slot_idx: int):
 # Bybit actually enforces will simply get rejected by Bybit itself (handled
 # as an ordinary failure, same as any other rejection). It still exists so
 # every part of the codebase shares one consistent, adjustable number.
-_FAST_CHASE_BUDGET       = 20
+_FAST_CHASE_BUDGET       = 40
 _FAST_CHASE_WINDOW_SECS  = 300
 
 # Sentinel ret_code used ONLY internally when a scheduled cycle skips its
@@ -259,7 +259,7 @@ def _record_modify_ad1(sess):
 # (used everywhere else — collision avoidance between ads, retry nudges)
 # because that gap is sized to keep ads safely apart, not to decide
 # "was this worth an early post". BTC/ETH move in much smaller increments
-# than a $100/₦5,000 swing most 10-second windows, so using the same gap
+# than a $5/₦5,000 swing most 10-second windows, so using the same gap
 # here meant fast-chase rarely found a move big enough to act on. Only
 # applies inside _try_fast_chase — the scheduled cycle and multi-ad
 # collision logic are untouched.
@@ -289,7 +289,7 @@ def _resolve_price_collision(sess, slot_idx: int, currency_id: str, token_id: st
     float) would naturally compute the same number, so it gets pushed to
     ₦84,903,465.23 or lower instead.
 
-    Fixed-amount gap for BTC/ETH pairs (₦5,000 / $100 etc — see
+    Fixed-amount gap for BTC/ETH pairs (₦5,000 / $5 etc — see
     MIN_PRICE_GAP in bybit.py). For USDT/USDC specifically, the gap is 1%
     of the actual price instead, since a flat amount would be the wrong
     scale for a stablecoin price (see get_min_price_gap in bybit.py).
