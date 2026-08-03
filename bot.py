@@ -222,18 +222,14 @@ def _reset_ad_failures(sess, slot_idx: int):
 
 # ─────────────────────────────────────────
 # Fast-chase modify budget (Ad 1, single-ad, floating mode only)
-# Bybit's own limit: "a single advertisement can be modified no more than
-# 10 times within 5 minutes." Was capped at 8 to leave 2 slots of headroom
-# for a manual edit on Bybit's own site in the same window — raised to 10
-# (the true limit, no buffer) since in practice the count was reaching 10
-# anyway (a separate bug: internal retry loops in the scheduled cycle and
-# in "Update Once Now" were recording extra calls without checking the
-# budget first — fixed now, so the count can no longer silently overshoot
-# whatever this is set to). With no buffer left, a manual edit on Bybit's
-# own site inside the same 5-minute window can push the REAL count past
-# 10 and get rejected by Bybit directly — that's already handled as an
-# ordinary failure, just worth knowing the safety margin is now zero.
-_FAST_CHASE_BUDGET       = 10
+# Bybit's own DOCUMENTED limit is "a single advertisement can be modified
+# no more than 10 times within 5 minutes." This is set to 20 — above that
+# documented limit — by explicit request. This constant no longer acts as
+# real protection against Bybit's own rate limiting: calls beyond whatever
+# Bybit actually enforces will simply get rejected by Bybit itself (handled
+# as an ordinary failure, same as any other rejection). It still exists so
+# every part of the codebase shares one consistent, adjustable number.
+_FAST_CHASE_BUDGET       = 20
 _FAST_CHASE_WINDOW_SECS  = 300
 
 # Sentinel ret_code used ONLY internally when a scheduled cycle skips its
@@ -5695,13 +5691,6 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             if err:
                 await edit_menu(query, f"❌ <code>{_esc(str(err))}</code>", InlineKeyboardMarkup(back_section("section_ads")))
                 return
-        if not _can_modify_ad1(_s(tuser.id)):
-            await edit_menu(query,
-                "⏳ <b>Modify budget exhausted</b>\n\n"
-                "Too many recent edits in the last 5 minutes (shared with Fast Update and "
-                "the scheduled cycle) — protecting Bybit's real rate limit. Try again shortly.",
-                InlineKeyboardMarkup(back_section("section_ads")))
-            return
         _record_modify_ad1(_s(tuser.id))
         result = await asyncio.get_event_loop().run_in_executor(
             _ad_executor, modify_ad, _s(tuser.id).settings["ad_id"], price, _s(tuser.id).ad_data, _update_creds
@@ -5726,7 +5715,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
                     safe_rounding = ROUND_FLOOR if was_too_high else ROUND_CEILING
                     candidate_str = str(candidate.quantize(Decimal("0.01"), rounding=safe_rounding))
                 if not _can_modify_ad1(_s(tuser.id)):
-                    break
+                    logger.info(f"[UpdateOnce] user {tuser.id} — proceeding past internal budget (blocking disabled by request)")
                 _record_modify_ad1(_s(tuser.id))
                 result = await asyncio.get_event_loop().run_in_executor(
                     _ad_executor, modify_ad, _s(tuser.id).settings["ad_id"], candidate_str, _s(tuser.id).ad_data, _update_creds
@@ -5743,14 +5732,13 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             _ad_data_now = _s(tuser.id).ad_data
             _nudge = get_min_price_gap(_ad_data_now.get("currencyId",""), _ad_data_now.get("tokenId",""), Decimal(str(price)))
             _nudged_price = str((Decimal(str(price)) - _nudge).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
-            if _can_modify_ad1(_s(tuser.id)):
-                _record_modify_ad1(_s(tuser.id))
-                result = await asyncio.get_event_loop().run_in_executor(
-                    _ad_executor, modify_ad, _s(tuser.id).settings["ad_id"], _nudged_price, _ad_data_now, _update_creds
-                )
-                rc    = result.get("retCode", result.get("ret_code",-1))
-                rm    = result.get("retMsg",  result.get("ret_msg",""))
-                price = _nudged_price
+            _record_modify_ad1(_s(tuser.id))
+            result = await asyncio.get_event_loop().run_in_executor(
+                _ad_executor, modify_ad, _s(tuser.id).settings["ad_id"], _nudged_price, _ad_data_now, _update_creds
+            )
+            rc    = result.get("retCode", result.get("ret_code",-1))
+            rm    = result.get("retMsg",  result.get("ret_msg",""))
+            price = _nudged_price
         if rc == 0:
             # ── Advance current_price so the next cycle (auto or manual) continues from here.
             # Routed through _set_ad_current_price (not a direct assignment) so a manual
