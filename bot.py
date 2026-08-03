@@ -172,6 +172,21 @@ def _set_ad_current_price(sess, slot_idx: int, price):
     slot_idx = _valid_slot(sess, slot_idx)
     if slot_idx == -1:
         sess.current_price = price
+        # Keep the fast-chase chase-ceiling reference in sync with reality.
+        # This is the fix for a real staleness bug: the SCHEDULED cycle can
+        # push this ad's price up or down on its own (e.g. a normal cycle
+        # nudging it back down after an earlier fast-chase spike), and if
+        # last_known_ceiling weren't refreshed here too, fast-chase would
+        # keep comparing fresh spot prices against a stale number that no
+        # longer reflects what's actually live on Bybit — wrongly concluding
+        # "no movement" for real, threshold-clearing rises that happened
+        # AFTER the ad was moved by something else. Every confirmed price
+        # change, regardless of which code path caused it, is new
+        # information about reality and resets this baseline. Any earlier
+        # "pending" unposted discovery is superseded by this fresh
+        # confirmation too.
+        sess.last_known_ceiling = price
+        sess.pending_ceiling    = None
     else:
         sess.extra_ad_slots[slot_idx]["current_price"] = price
 
