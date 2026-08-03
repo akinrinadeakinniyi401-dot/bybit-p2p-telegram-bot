@@ -98,6 +98,16 @@ _flw_transfer_registry: dict = {}   # {transfer_ref: {order_id, user_id, slot, a
 # States: "completed", "rejected", "warned", "failed", "expired", "skipped"
 _order_final_states: dict = {}      # {(chat_id, order_id): state_str}
 
+# Next time _session_auto_reset_loop will fire, so the menu caption can show
+# a countdown. Seeded with a sane default here (in case anything reads it
+# before the loop's own task starts); the loop itself refreshes this every
+# cycle — see _session_auto_reset_loop.
+_next_session_reset_ts: float = datetime.now().timestamp() + 3600
+
+def _seconds_until_session_reset() -> int:
+    return max(0, int(_next_session_reset_ts - datetime.now().timestamp()))
+
+
 # ── Per-order Action Locks ─────────────────────────────────────────────────────
 # Prevents concurrent auto-pay + manual tap on the same order.
 _order_action_locks: dict = {}      # {(chat_id, order_id): asyncio.Lock}
@@ -212,14 +222,18 @@ def _reset_ad_failures(sess, slot_idx: int):
 
 # ─────────────────────────────────────────
 # Fast-chase modify budget (Ad 1, single-ad, floating mode only)
-# ─────────────────────────────────────────
 # Bybit's own limit: "a single advertisement can be modified no more than
-# 10 times within 5 minutes." The scheduled cycle already spends part of
-# that budget; the fast-chase 10-second price check spends from the SAME
-# rolling window rather than its own separate count, so the two together
-# can never add up to more than Bybit allows. Capped at 8, not 10, to
-# leave headroom for a manual edit on Bybit's own site in the same window.
-_FAST_CHASE_BUDGET       = 8
+# 10 times within 5 minutes." Was capped at 8 to leave 2 slots of headroom
+# for a manual edit on Bybit's own site in the same window — raised to 10
+# (the true limit, no buffer) since in practice the count was reaching 10
+# anyway (a separate bug: internal retry loops in the scheduled cycle and
+# in "Update Once Now" were recording extra calls without checking the
+# budget first — fixed now, so the count can no longer silently overshoot
+# whatever this is set to). With no buffer left, a manual edit on Bybit's
+# own site inside the same 5-minute window can push the REAL count past
+# 10 and get rejected by Bybit directly — that's already handled as an
+# ordinary failure, just worth knowing the safety margin is now zero.
+_FAST_CHASE_BUDGET       = 10
 _FAST_CHASE_WINDOW_SECS  = 300
 
 # Sentinel ret_code used ONLY internally when a scheduled cycle skips its
@@ -560,6 +574,10 @@ def main_menu_text(uid: int = 0) -> str:
     nm_status = "🔍 ON"     if sess.name_match_enabled     else "🔍 OFF"
     badge     = sub.plan_badge(uid) if uid else _current_plan_badge
 
+    _reset_secs = _seconds_until_session_reset()
+    _reset_m, _reset_s = divmod(_reset_secs, 60)
+    reset_line = f"⏱ Next system reset in: <b>{_reset_m}m {_reset_s}s</b>\n\n"
+
     return (
         "🤖 *P2P Auto Bot — Control Panel*\n\n"
         f"🆔 Your ID: <code>{uid}</code> | {badge}\n"
@@ -570,6 +588,7 @@ def main_menu_text(uid: int = 0) -> str:
         f"├ 💳 Auto-Pay: {p_status}\n"
         f"├ {bp_status} Buyer Protection\n"
         f"└ {nm_status} Name Match\n\n"
+        f"{reset_line}"
         "_Select a section below to get started:_"
     )
 
@@ -4133,6 +4152,9 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                         break   # a genuinely different error — stop retrying, fall through to failure handling
 
                     if slot_idx == -1:
+                        if not _can_modify_ad1(sess):
+                            logger.warning(f"[{label}] Cycle {cycle} retry stopped for user {chat_id} — modify budget exhausted mid-retry")
+                            break
                         _record_modify_ad1(sess)
                     retry_result = await asyncio.get_event_loop().run_in_executor(
                         _ad_executor, modify_ad, s["ad_id"], candidate_str, ad_data, creds
@@ -4201,6 +4223,9 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
 
                     candidate_str = str(candidate)
                     if slot_idx == -1:
+                        if not _can_modify_ad1(sess):
+                            logger.warning(f"[{label}] Cycle {cycle} retry stopped for user {chat_id} — modify budget exhausted mid-retry")
+                            break
                         _record_modify_ad1(sess)
                     retry_result = await asyncio.get_event_loop().run_in_executor(
                         _ad_executor, modify_ad, s["ad_id"], candidate_str, ad_data, creds
@@ -5670,6 +5695,13 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             if err:
                 await edit_menu(query, f"❌ <code>{_esc(str(err))}</code>", InlineKeyboardMarkup(back_section("section_ads")))
                 return
+        if not _can_modify_ad1(_s(tuser.id)):
+            await edit_menu(query,
+                "⏳ <b>Modify budget exhausted</b>\n\n"
+                "Too many recent edits in the last 5 minutes (shared with Fast Update and "
+                "the scheduled cycle) — protecting Bybit's real rate limit. Try again shortly.",
+                InlineKeyboardMarkup(back_section("section_ads")))
+            return
         _record_modify_ad1(_s(tuser.id))
         result = await asyncio.get_event_loop().run_in_executor(
             _ad_executor, modify_ad, _s(tuser.id).settings["ad_id"], price, _s(tuser.id).ad_data, _update_creds
@@ -5693,6 +5725,8 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
                     candidate     = (bound_dec - margin) if was_too_high else (bound_dec + margin)
                     safe_rounding = ROUND_FLOOR if was_too_high else ROUND_CEILING
                     candidate_str = str(candidate.quantize(Decimal("0.01"), rounding=safe_rounding))
+                if not _can_modify_ad1(_s(tuser.id)):
+                    break
                 _record_modify_ad1(_s(tuser.id))
                 result = await asyncio.get_event_loop().run_in_executor(
                     _ad_executor, modify_ad, _s(tuser.id).settings["ad_id"], candidate_str, _s(tuser.id).ad_data, _update_creds
@@ -5709,16 +5743,20 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             _ad_data_now = _s(tuser.id).ad_data
             _nudge = get_min_price_gap(_ad_data_now.get("currencyId",""), _ad_data_now.get("tokenId",""), Decimal(str(price)))
             _nudged_price = str((Decimal(str(price)) - _nudge).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
-            _record_modify_ad1(_s(tuser.id))
-            result = await asyncio.get_event_loop().run_in_executor(
-                _ad_executor, modify_ad, _s(tuser.id).settings["ad_id"], _nudged_price, _ad_data_now, _update_creds
-            )
-            rc    = result.get("retCode", result.get("ret_code",-1))
-            rm    = result.get("retMsg",  result.get("ret_msg",""))
-            price = _nudged_price
+            if _can_modify_ad1(_s(tuser.id)):
+                _record_modify_ad1(_s(tuser.id))
+                result = await asyncio.get_event_loop().run_in_executor(
+                    _ad_executor, modify_ad, _s(tuser.id).settings["ad_id"], _nudged_price, _ad_data_now, _update_creds
+                )
+                rc    = result.get("retCode", result.get("ret_code",-1))
+                rm    = result.get("retMsg",  result.get("ret_msg",""))
+                price = _nudged_price
         if rc == 0:
-            # ── Advance current_price so the next cycle (auto or manual) continues from here
-            _s(tuser.id).current_price = Decimal(str(price))
+            # ── Advance current_price so the next cycle (auto or manual) continues from here.
+            # Routed through _set_ad_current_price (not a direct assignment) so a manual
+            # update also keeps the fast-chase ceiling reference in sync with reality —
+            # same fix as the scheduled-cycle staleness bug, applied here too.
+            _set_ad_current_price(_s(tuser.id), -1, Decimal(str(price)))
             await edit_menu(query,
                 f"✅ <b>Updated!</b> Price: <code>{price}</code> ({mode.upper()})\n\n_{next_setup_hint(tuser.id)}_",
                 InlineKeyboardMarkup(back_section("section_ads"))
@@ -7531,7 +7569,9 @@ async def _session_auto_reset_loop(bot=None):
       2. Sends a Telegram notification so they can re-enable if still trading.
     Also trims global dicts to prevent unbounded memory growth.
     """
+    global _next_session_reset_ts
     while True:
+        _next_session_reset_ts = datetime.now().timestamp() + 3600
         await asyncio.sleep(3600)   # every 60 minutes
         try:
             MAX_IDS  = 500
