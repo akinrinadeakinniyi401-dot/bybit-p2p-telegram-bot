@@ -393,9 +393,25 @@ def _resolve_price_collision(sess, slot_idx: int, currency_id: str, token_id: st
     gives the same correct multi-way-collision behavior (a price that's
     too close to two different ads still clears both) without ever
     touching the same conflict twice.
+
+    IMPORTANT — the self-conflict ("its own last posted price") uses a
+    tiny epsilon, NOT the full inter-ad gap. Bybit's 90043 rejection
+    ("price differs from your existing ad by less than 0%") only fires on
+    an EXACT duplicate — it has nothing to do with staying $3/₦5,000 away
+    from your own old price, that requirement only applies BETWEEN
+    different ads. Treating the self-check with the full gap used to
+    stack an extra, unearned full-gap deduction on top of any real ad-vs-
+    ad collision (natural price clears Ad 2's gap fine, but then lands
+    close enough to this ad's OWN prior price — itself only ever gap-
+    distant from Ad 2's PREVIOUS price — to trip a second full
+    deduction), which is what produced $6/$9 nudges for what was really
+    only ever one $3 collision.
     """
     gap = get_min_price_gap(currency_id, token_id, natural_price)
-    conflicts = []   # list of (price, label)
+    # Deliberately tiny — just enough to dodge an exact-duplicate 90043,
+    # never a stand-in for the real inter-ad collision gap.
+    self_gap = Decimal("0.01")
+    conflicts = []   # list of (price, label, required_gap)
     for i in range(-1, len(sess.extra_ad_slots)):
         if i == slot_idx:
             continue
@@ -407,7 +423,7 @@ def _resolve_price_collision(sess, slot_idx: int, currency_id: str, token_id: st
             continue
         other_price = _ad_current_price(sess, i)
         if other_price and other_price > 0:
-            conflicts.append((other_price, _ad_slot_label(i)))
+            conflicts.append((other_price, _ad_slot_label(i), gap))
 
     # Also guard against landing back on THIS ad's own currently-live price.
     # Bybit rejects a submission with retCode 90043 ("price differs from
@@ -418,10 +434,11 @@ def _resolve_price_collision(sess, slot_idx: int, currency_id: str, token_id: st
     # market hadn't moved between cycles, a collision nudge could push this
     # ad's price right back onto its own last-posted value and get
     # rejected — which is exactly what showed up as repeated 90043 failures
-    # once a user had 2+ ads on the same pair/float %.
+    # once a user had 2+ ads on the same pair/float %. Uses self_gap (a
+    # tiny epsilon), not the full inter-ad gap — see docstring above.
     own_price = _ad_current_price(sess, slot_idx)
     if own_price and own_price > 0:
-        conflicts.append((own_price, "its own last posted price"))
+        conflicts.append((own_price, "its own last posted price", self_gap))
 
     # Process highest conflicting price first. Each conflict is visited
     # EXACTLY ONCE: we check it against whatever the running price is at
@@ -431,9 +448,9 @@ def _resolve_price_collision(sess, slot_idx: int, currency_id: str, token_id: st
     # handled, which is what caused the double-subtraction bug.
     price = natural_price
     collided_with = []
-    for cp, label in sorted(conflicts, key=lambda c: c[0], reverse=True):
-        if abs(price - cp) < gap:
-            candidate = cp - gap
+    for cp, label, req_gap in sorted(conflicts, key=lambda c: c[0], reverse=True):
+        if abs(price - cp) < req_gap:
+            candidate = cp - req_gap
             if candidate < price:
                 price = candidate
             if label not in collided_with:
@@ -3959,29 +3976,58 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                 # nothing had changed while the real Bybit ad sat at its old,
                 # lower, unconfirmed price.
                 pending_ceiling = _pending_ceiling(sess, slot_idx)
+                last_known      = _ceiling_ref(sess, slot_idx)
+
+                # Prefer an explicit pending ceiling, but ALSO fall back to the
+                # last CONFIRMED ceiling if the ad's own live price has simply
+                # fallen behind it. This is the fix for a real bug: pending_
+                # ceiling only gets set when a discovered boundary was actually
+                # attempted and rejected/skipped in the SAME cycle it was
+                # found. If that attempt was never made at all (e.g. the
+                # candidate cleared the gap against cur_p at discovery time but
+                # something else short-circuited before the post), last_known
+                # still holds a real, Bybit-confirmed number the ad has never
+                # caught up to — and the old code only ever compared FRESH
+                # spot movement against last_known, never the ad's own current
+                # price against it. That let an ad sit $9+ below a ceiling
+                # Bybit had already told it was valid, waiting for the market
+                # to rise even further before trying again.
+                actionable_ceiling = None
                 if pending_ceiling is not None and pending_ceiling - cur_p >= gap:
+                    actionable_ceiling = pending_ceiling
+                elif last_known is not None and last_known - cur_p >= gap:
+                    actionable_ceiling = last_known
+                    logger.info(
+                        f"{tag} chase-ceiling | live price {cur_p} has room to catch up to the last "
+                        f"confirmed ceiling {last_known} (diff={last_known - cur_p} >= {gap}) — "
+                        f"retrying it directly instead of waiting on fresh spot movement"
+                    )
+
+                if actionable_ceiling is not None:
                     if not _can_modify_slot(sess, slot_idx):
-                        logger.info(f"{tag} skipped — have a known unposted ceiling {pending_ceiling} but no budget yet")
+                        logger.info(f"{tag} skipped — have a known unposted ceiling {actionable_ceiling} but no budget yet")
                         return
                     # Same collision guard the scheduled cycle uses — with fast-
                     # chase now running on Ad 2/3 too, two ads on the same pair
                     # could otherwise land on the same discovered ceiling at
                     # nearly the same moment and one of them gets rejected.
-                    natural_before_collision = pending_ceiling
-                    pending_ceiling, collided_with = _resolve_price_collision(sess, slot_idx, currency, token, pending_ceiling)
-                    logger.info(f"{tag} retrying known unposted ceiling {pending_ceiling} directly (1 call, no re-probe)")
+                    natural_before_collision = actionable_ceiling
+                    resolved_ceiling, collided_with = _resolve_price_collision(sess, slot_idx, currency, token, actionable_ceiling)
+                    logger.info(f"{tag} retrying known ceiling {resolved_ceiling} directly (1 call, no re-probe)")
                     _record_modify_slot(sess, slot_idx)
                     retry_result = await asyncio.get_event_loop().run_in_executor(
-                        _ad_executor, modify_ad, s["ad_id"], str(pending_ceiling), ad_data, creds
+                        _ad_executor, modify_ad, s["ad_id"], str(resolved_ceiling), ad_data, creds
                     )
                     if retry_result.get("retCode", retry_result.get("ret_code", -1)) == 0:
-                        posted_price = pending_ceiling
+                        posted_price = resolved_ceiling
                         logger.info(f"{tag} pending ceiling post accepted — new ad price {posted_price}")
                     else:
+                        # Still couldn't post it (budget/collision/transient) —
+                        # remember it so the next check retries directly again.
+                        _set_pending_ceiling(sess, slot_idx, actionable_ceiling)
                         logger.warning(f"{tag} pending ceiling post still rejected — will keep retrying as budget allows")
 
                 else:
-                    last_known = _ceiling_ref(sess, slot_idx)
                     if last_known is not None:
                         formula_diff = new_p - last_known
                         logger.info(
