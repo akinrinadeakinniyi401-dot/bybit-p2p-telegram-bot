@@ -4243,8 +4243,21 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
     ad_data   = _ad_data_of(sess, slot_idx)
     interval  = s.get("interval", 2)
     increment = Decimal(str(s.get("increment","0.05")))
-    if s.get("mode") == "fixed":
-        _set_ad_current_price(sess, slot_idx, Decimal(str(ad_data.get("price","0"))))
+    # Sync our tracked state to Bybit's REAL live price for this ad the
+    # moment the loop (re)starts — for BOTH modes, not just "fixed". This
+    # used to only run for fixed mode, which meant every restart of a
+    # FLOATING-mode ad kept whatever current_price/ceiling_ref/
+    # pending_ceiling were left over from before it was last stopped —
+    # completely untethered from reality. That stale number then fed every
+    # downstream check: fast-chase's "has the market moved enough" gate,
+    # and sibling-collision math for OTHER ads reading this ad's price via
+    # _ad_current_price. A newly (re)started ad's first cycle could get an
+    # unexplained deduction purely because of a leftover number from a
+    # previous run, and any sibling ad's collision math against it would be
+    # wrong too. _set_ad_current_price also resets ceiling_ref to match and
+    # clears any stale pending_ceiling, so this brings the whole tracked
+    # state for this slot back in sync with Bybit in one call.
+    _set_ad_current_price(sess, slot_idx, Decimal(str(ad_data.get("price","0"))))
 
     # ── Load this user's credentials ONCE at loop start ──
     # Re-read from DB so any key updates take effect on next loop restart.
