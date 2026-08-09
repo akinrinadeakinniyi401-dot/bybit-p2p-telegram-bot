@@ -307,12 +307,33 @@ def _can_modify_ad1(sess, need: int = 1) -> bool:
 def _record_modify_ad1(sess):
     _record_modify_slot(sess, -1)
 
+def _fast_chase_lock(sess, slot_idx: int) -> asyncio.Lock:
+    """
+    Defense-in-depth: even though the real cause of overlapping runs on the
+    same ad was a task-duplication race in the start/stop toggle (now
+    fixed — see toggle_refresh), this guarantees two fast-chase checks for
+    the SAME ad slot can never execute concurrently regardless of cause.
+    Without it, two overlapping runs read/write the same cur_p and ceiling
+    state with no ordering guarantee — exactly what produced near-
+    simultaneous MODIFY calls with drifting internal price state and
+    repeated 90043 "price unchanged" rejections in production logs.
+    """
+    store = getattr(sess, "fast_chase_locks", None)
+    if store is None:
+        store = {}
+        sess.fast_chase_locks = store
+    lock = store.get(slot_idx)
+    if lock is None:
+        lock = asyncio.Lock()
+        store[slot_idx] = lock
+    return lock
+
 
 # Fast-chase-only gap thresholds. This is separate from get_min_price_gap
 # (used everywhere else — collision avoidance between ads, retry nudges)
 # because that gap is sized to keep ads safely apart, not to decide
 # "was this worth an early post". BTC/ETH move in much smaller increments
-# than a $5/₦5,000 swing most 10-second windows, so using the same gap
+# than a $3/₦5,000 swing most 10-second windows, so using the same gap
 # here meant fast-chase rarely found a move big enough to act on. Only
 # applies inside _try_fast_chase — the scheduled cycle and multi-ad
 # collision logic are untouched.
@@ -330,7 +351,7 @@ def _fast_chase_gap(currency_id: str, token_id: str, reference_price=None) -> De
     return get_min_price_gap(currency_id, token_id, reference_price)
 
 
-def _resolve_price_collision(sess, slot_idx: int, currency_id: str, token_id: str, natural_price: Decimal) -> Decimal:
+def _resolve_price_collision(sess, slot_idx: int, currency_id: str, token_id: str, natural_price: Decimal):
     """
     Multiple ads on the SAME (currency, coin) pair are allowed to use the
     same floating % (or fixed base) — Bybit doesn't reject on the % or the
@@ -342,18 +363,25 @@ def _resolve_price_collision(sess, slot_idx: int, currency_id: str, token_id: st
     float) would naturally compute the same number, so it gets pushed to
     ₦84,903,465.23 or lower instead.
 
-    Fixed-amount gap for BTC/ETH pairs (₦5,000 / $5 etc — see
+    Fixed-amount gap for BTC/ETH pairs (₦5,000 / $3 etc — see
     MIN_PRICE_GAP in bybit.py). For USDT/USDC specifically, the gap is 1%
     of the actual price instead, since a flat amount would be the wrong
     scale for a stablecoin price (see get_min_price_gap in bybit.py).
 
-    This only ever looks at OTHER slots — never changes which ad "wins"
-    the natural price, it just moves the others out of the way. Resolves
-    iteratively so a 3-way collision clears every conflict, not just the
-    nearest one.
+    This only ever looks at OTHER slots (plus this ad's own last-posted
+    price, to avoid a 90043 "unchanged" rejection) — never changes which
+    ad "wins" the natural price, it just moves the others out of the way.
+    Resolves iteratively so a 3-way collision clears every conflict, not
+    just the nearest one.
+
+    Returns (resolved_price, collided_with) — collided_with is a list of
+    human-readable labels (e.g. ["Ad 1"], or ["its own last posted price"])
+    this price was adjusted away from, empty if no adjustment was needed.
+    Callers use this to tell the user WHY a price isn't at the natural
+    maximum, instead of leaving it unexplained.
     """
     gap = get_min_price_gap(currency_id, token_id, natural_price)
-    conflicting_prices = []
+    conflicts = []   # list of (price, label)
     for i in range(-1, len(sess.extra_ad_slots)):
         if i == slot_idx:
             continue
@@ -365,7 +393,7 @@ def _resolve_price_collision(sess, slot_idx: int, currency_id: str, token_id: st
             continue
         other_price = _ad_current_price(sess, i)
         if other_price and other_price > 0:
-            conflicting_prices.append(other_price)
+            conflicts.append((other_price, _ad_slot_label(i)))
 
     # Also guard against landing back on THIS ad's own currently-live price.
     # Bybit rejects a submission with retCode 90043 ("price differs from
@@ -379,18 +407,21 @@ def _resolve_price_collision(sess, slot_idx: int, currency_id: str, token_id: st
     # once a user had 2+ ads on the same pair/float %.
     own_price = _ad_current_price(sess, slot_idx)
     if own_price and own_price > 0:
-        conflicting_prices.append(own_price)
+        conflicts.append((own_price, "its own last posted price"))
 
     price = natural_price
+    collided_with = []
     for _ in range(10):   # safety cap — converges in 1-2 passes in practice
         adjusted = False
-        for cp in conflicting_prices:
+        for cp, label in conflicts:
             if abs(price - cp) < gap:
                 price = cp - gap
                 adjusted = True
+                if label not in collided_with:
+                    collided_with.append(label)
         if not adjusted:
             break
-    return price
+    return price, collided_with
 
 
 def _settings(uid: int) -> dict:
@@ -3777,258 +3808,276 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
     counted towards the scheduled-cycle auto-stop counter — this is a
     bonus opportunistic update, not a scheduled cycle.
     """
-    tag = f"[FastChase u={chat_id} ad={s.get('ad_id')}]"
-    try:
-        logger.info(f"{tag} poll start")
+    lock = _fast_chase_lock(sess, slot_idx)
+    if lock.locked():
+        logger.info(f"[FastChase u={chat_id} ad={s.get('ad_id')}] skipped — a check is already in progress for this ad (defense-in-depth against overlapping runs)")
+        return
+    async with lock:
+        tag = f"[FastChase u={chat_id} ad={s.get('ad_id')}]"
+        try:
+            logger.info(f"{tag} poll start")
 
-        if not _can_modify_slot(sess, slot_idx):
-            logger.info(
-                f"{tag} skipped — modify budget exhausted "
-                f"({len(_modify_times(sess, slot_idx))}/{_FAST_CHASE_BUDGET} used in the last "
-                f"{_FAST_CHASE_WINDOW_SECS}s window, shared with this ad's scheduled cycle)"
-            )
-            return
-
-        local_usdt_ref = float(sess.shared_local_usdt_ref or s.get("local_usdt_ref") or 0)
-
-        # calc_floating_price() ultimately calls requests.get() against Bybit's
-        # public ticker endpoint — a BLOCKING network call. Calling it directly
-        # on the event loop (as before) stalls the entire bot — every other
-        # user's monitor, every Telegram reply — for however long that HTTP
-        # call takes, with no exception and therefore no log line. Running it
-        # in the executor is what actually makes "the loop never stops
-        # unless disabled" true.
-        new_p_str, err = await asyncio.get_event_loop().run_in_executor(
-            _ad_executor, calc_floating_price, ad_data, float_pct, local_usdt_ref
-        )
-        if err:
-            logger.warning(f"{tag} skipped — spot price fetch failed: {err}")
-            return
-
-        new_p = Decimal(new_p_str)
-        cur_p = _ad_current_price(sess, slot_idx)
-        logger.info(f"{tag} spot-derived price={new_p} | current ad price={cur_p}")
-        if cur_p <= 0:
-            logger.warning(f"{tag} skipped — no known current ad price yet")
-            return
-
-        currency = ad_data.get("currencyId", "")
-        token    = ad_data.get("tokenId", "")
-        gap      = _fast_chase_gap(currency, token, new_p)
-
-        chase_ceiling = _wants_live_ceiling(currency, token, float_pct)
-        posted_price  = None
-
-        if not chase_ceiling:
-            # Plain floating mode: the formula number is the real candidate.
-            diff = new_p - cur_p
-            logger.info(f"{tag} plain-floating | diff={diff} threshold={gap}")
-            if diff < gap:
-                logger.info(f"{tag} skipped — diff {diff} below the {gap} threshold, not worth a post yet")
+            if not _can_modify_slot(sess, slot_idx):
+                logger.info(
+                    f"{tag} skipped — modify budget exhausted "
+                    f"({len(_modify_times(sess, slot_idx))}/{_FAST_CHASE_BUDGET} used in the last "
+                    f"{_FAST_CHASE_WINDOW_SECS}s window, shared with this ad's scheduled cycle)"
+                )
                 return
-            # Collision guard — with fast-chase now able to run on Ad 2/3 as
-            # well as Ad 1, two ads on the same pair can independently see
-            # the same threshold-clearing spot move at nearly the same
-            # moment and compute the same candidate price. This steps this
-            # ad's price below any other active ad on the same pair before
-            # ever submitting — same guard, same convention, as the
-            # scheduled cycle already uses.
-            resolved_p = new_p
-            if sess.total_ad_slots() > 1:
-                resolved_p = _resolve_price_collision(sess, slot_idx, currency, token, new_p)
-            submit_price = resolved_p.quantize(_quant, rounding=ROUND_HALF_UP)
-            _record_modify_slot(sess, slot_idx)
-            logger.info(f"{tag} threshold met — submitting {submit_price}")
-            result = await asyncio.get_event_loop().run_in_executor(
-                _ad_executor, modify_ad, s["ad_id"], str(submit_price), ad_data, creds
+
+            local_usdt_ref = float(sess.shared_local_usdt_ref or s.get("local_usdt_ref") or 0)
+
+            # calc_floating_price() ultimately calls requests.get() against Bybit's
+            # public ticker endpoint — a BLOCKING network call. Calling it directly
+            # on the event loop (as before) stalls the entire bot — every other
+            # user's monitor, every Telegram reply — for however long that HTTP
+            # call takes, with no exception and therefore no log line. Running it
+            # in the executor is what actually makes "the loop never stops
+            # unless disabled" true.
+            new_p_str, err = await asyncio.get_event_loop().run_in_executor(
+                _ad_executor, calc_floating_price, ad_data, float_pct, local_usdt_ref
             )
-            code = result.get("retCode", result.get("ret_code", -1))
-            if code == 0:
-                posted_price = submit_price
-                logger.info(f"{tag} modify accepted — new ad price {posted_price}")
-            else:
-                logger.warning(
-                    f"{tag} modify rejected — code={code} "
-                    f"msg={result.get('retMsg', result.get('ret_msg',''))!r}"
-                )
+            if err:
+                logger.warning(f"{tag} skipped — spot price fetch failed: {err}")
+                return
 
-        else:
-            # Chase-ceiling needs TWO calls to ever actually change anything:
-            # the probe (guaranteed to be rejected, purely to learn Bybit's
-            # current boundary) and the follow-up post of that boundary. If
-            # only one slot is left in the shared budget, spending it on the
-            # probe burns the last slot on a call that can NEVER succeed by
-            # itself — the follow-up that would have actually raised the
-            # price then gets silently skipped for lack of budget. That's
-            # exactly what was happening: a single "MODIFY... 912120022"
-            # logged, then nothing — the discovered boundary was a real $21+
-            # improvement, but there was no budget left to post it. Wait for
-            # 2 free slots instead of spending on a probe we can't follow up.
-            #
-            # THE ACTUAL FIX: unlike plain-floating mode (which only spends
-            # budget once diff >= gap against the ad's own current price),
-            # chase-ceiling had NO local gate at all — it asked Bybit
-            # (spending 1-2 of the 8 shared slots) on every single poll,
-            # whether or not the market had moved at all. That's what burns
-            # the budget down to nothing within the first minute, timer-
-            # throttled or not.
-            #
-            # get_token_usdt_price()/calc_floating_price() hit Bybit's PUBLIC
-            # market endpoint (no API key, no signature) — it does not touch
-            # the account's rate limit at all, only modify_ad() does. So we
-            # can fetch that price as often as we like for free, and use it
-            # to decide WHETHER to spend a Bybit call, the same way plain-
-            # floating mode already does.
-            #
-            # Two pieces of memory, kept deliberately separate:
-            #   last_known_ceiling  — a boundary Bybit ITSELF has told us,
-            #                         via a real rejection message. This is
-            #                         confirmed information regardless of
-            #                         whether we managed to post it.
-            #   pending_ceiling     — set only when we discovered a real
-            #                         improvement but couldn't post it (ran
-            #                         out of budget, or the post itself was
-            #                         rejected) — something worth trying
-            #                         again with a plain 1-call post before
-            #                         ever spending 2 calls on a fresh probe.
-            # cur_p (the ad's actual live price on Bybit, only ever updated
-            # on a CONFIRMED successful post) is never touched by either of
-            # these — that bug (comparing against an attempted-but-unposted
-            # price as if it were live) is exactly what made the bot think
-            # nothing had changed while the real Bybit ad sat at its old,
-            # lower, unconfirmed price.
-            pending_ceiling = _pending_ceiling(sess, slot_idx)
-            if pending_ceiling is not None and pending_ceiling - cur_p >= gap:
-                if not _can_modify_slot(sess, slot_idx):
-                    logger.info(f"{tag} skipped — have a known unposted ceiling {pending_ceiling} but no budget yet")
-                    return
-                # Same collision guard the scheduled cycle uses — with fast-
-                # chase now running on Ad 2/3 too, two ads on the same pair
-                # could otherwise land on the same discovered ceiling at
-                # nearly the same moment and one of them gets rejected.
-                pending_ceiling = _resolve_price_collision(sess, slot_idx, currency, token, pending_ceiling)
-                logger.info(f"{tag} retrying known unposted ceiling {pending_ceiling} directly (1 call, no re-probe)")
-                _record_modify_slot(sess, slot_idx)
-                retry_result = await asyncio.get_event_loop().run_in_executor(
-                    _ad_executor, modify_ad, s["ad_id"], str(pending_ceiling), ad_data, creds
-                )
-                if retry_result.get("retCode", retry_result.get("ret_code", -1)) == 0:
-                    posted_price = pending_ceiling
-                    logger.info(f"{tag} pending ceiling post accepted — new ad price {posted_price}")
-                else:
-                    logger.warning(f"{tag} pending ceiling post still rejected — will keep retrying as budget allows")
+            new_p = Decimal(new_p_str)
+            cur_p = _ad_current_price(sess, slot_idx)
+            logger.info(f"{tag} spot-derived price={new_p} | current ad price={cur_p}")
+            if cur_p <= 0:
+                logger.warning(f"{tag} skipped — no known current ad price yet")
+                return
 
-            else:
-                last_known = _ceiling_ref(sess, slot_idx)
-                if last_known is not None:
-                    formula_diff = new_p - last_known
-                    logger.info(
-                        f"{tag} chase-ceiling | fetched price={new_p} vs last known real ceiling={last_known} "
-                        f"diff={formula_diff} threshold={gap}"
-                    )
-                    if formula_diff < gap:
-                        logger.info(
-                            f"{tag} skipped — underlying price hasn't moved enough above the last "
-                            f"confirmed Bybit ceiling to be worth spending a call (no API request made)"
-                        )
-                        return
-                if not _can_modify_slot(sess, slot_idx, need=2):
-                    logger.info(f"{tag} skipped — chase-ceiling needs 2 free budget slots, don't have them")
+            currency = ad_data.get("currencyId", "")
+            token    = ad_data.get("tokenId", "")
+            gap      = _fast_chase_gap(currency, token, new_p)
+
+            chase_ceiling = _wants_live_ceiling(currency, token, float_pct)
+            posted_price  = None
+            collided_with = []   # which other ad(s)/self this price had to dodge, for the user-facing notice
+
+            if not chase_ceiling:
+                # Plain floating mode: the formula number is the real candidate.
+                diff = new_p - cur_p
+                logger.info(f"{tag} plain-floating | diff={diff} threshold={gap}")
+                if diff < gap:
+                    logger.info(f"{tag} skipped — diff {diff} below the {gap} threshold, not worth a post yet")
                     return
-                # Probe first (always — the natural formula number tells us
-                # nothing about where Bybit's real boundary currently sits),
-                # then decide whether the DISCOVERED boundary is worth
-                # posting — never the probe itself.
-                probe_price = (new_p * Decimal("5")).quantize(_quant, rounding=ROUND_HALF_UP)
+                # Collision guard — with fast-chase now able to run on Ad 2/3 as
+                # well as Ad 1, two ads on the same pair can independently see
+                # the same threshold-clearing spot move at nearly the same
+                # moment and compute the same candidate price. This steps this
+                # ad's price below any other active ad on the same pair before
+                # ever submitting — same guard, same convention, as the
+                # scheduled cycle already uses.
+                resolved_p = new_p
+                if sess.total_ad_slots() > 1:
+                    resolved_p, collided_with = _resolve_price_collision(sess, slot_idx, currency, token, new_p)
+                submit_price = resolved_p.quantize(_quant, rounding=ROUND_HALF_UP)
                 _record_modify_slot(sess, slot_idx)
-                logger.info(f"{tag} chase-ceiling probe — submitting {probe_price}")
+                logger.info(f"{tag} threshold met — submitting {submit_price}")
                 result = await asyncio.get_event_loop().run_in_executor(
-                    _ad_executor, modify_ad, s["ad_id"], str(probe_price), ad_data, creds
+                    _ad_executor, modify_ad, s["ad_id"], str(submit_price), ad_data, creds
                 )
-                last_code = result.get("retCode", result.get("ret_code", -1))
-                last_msg  = result.get("retMsg",  result.get("ret_msg","Unknown"))
-                logger.info(f"{tag} probe result code={last_code} msg={last_msg!r}")
-
-                if last_code == 0:
-                    # Extremely unlikely — the 5x probe was accepted outright.
-                    posted_price = probe_price
-                    _set_ceiling_ref(sess, slot_idx, probe_price)
-                elif last_code == 912120022:
-                    min_str, max_str = _extract_bybit_bounds(last_msg)
-                    bound_str = max_str if max_str else min_str
-                    if not bound_str:
-                        logger.warning(f"{tag} could not parse a boundary out of msg={last_msg!r}")
-                    else:
-                        candidate = Decimal(bound_str)
-                        # Confirmed information from Bybit itself — record it
-                        # regardless of what happens with the follow-up post.
-                        _set_ceiling_ref(sess, slot_idx, candidate)
-                        logger.info(f"{tag} discovered boundary={candidate} vs current={cur_p} threshold={gap}")
-                        if candidate - cur_p >= gap and _can_modify_slot(sess, slot_idx):
-                            # Same collision guard as above — with 2+ ads on
-                            # the same pair fast-chasing independently, the
-                            # discovered boundary can coincide with another
-                            # ad's live price even though it clears the gap
-                            # against THIS ad's own last price.
-                            post_candidate = _resolve_price_collision(sess, slot_idx, currency, token, candidate)
-                            _record_modify_slot(sess, slot_idx)
-                            retry_result = await asyncio.get_event_loop().run_in_executor(
-                                _ad_executor, modify_ad, s["ad_id"], str(post_candidate), ad_data, creds
-                            )
-                            retry_code = retry_result.get("retCode", retry_result.get("ret_code", -1))
-                            if retry_code == 0:
-                                posted_price = post_candidate
-                                logger.info(f"{tag} boundary post accepted — new ad price {posted_price}")
-                            elif retry_code == 90043 and _can_modify_slot(sess, slot_idx):
-                                # Discovered boundary matches what's live after all —
-                                # nudge once. Still gated by the same "is it actually
-                                # an improvement" check so this can't sneak in a
-                                # downgrade either.
-                                nudged = (post_candidate - gap).quantize(_quant, rounding=ROUND_HALF_UP)
-                                if nudged - cur_p >= gap:
-                                    _record_modify_slot(sess, slot_idx)
-                                    nudge_result = await asyncio.get_event_loop().run_in_executor(
-                                        _ad_executor, modify_ad, s["ad_id"], str(nudged), ad_data, creds
-                                    )
-                                    if nudge_result.get("retCode", nudge_result.get("ret_code", -1)) == 0:
-                                        posted_price = nudged
-                                        logger.info(f"{tag} nudged post accepted — new ad price {posted_price}")
-                            else:
-                                # Discovered a real improvement but couldn't post it
-                                # right now (out of budget, or a transient rejection).
-                                # Remember it so the NEXT check can try posting it
-                                # directly for 1 call instead of re-probing for 2.
-                                _set_pending_ceiling(sess, slot_idx, candidate)
-                                logger.warning(
-                                    f"{tag} boundary post rejected/skipped — code={retry_code} — "
-                                    f"remembered {candidate} as a pending ceiling to retry"
-                                )
-                        else:
-                            logger.info(
-                                f"{tag} skipped — Bybit's real ceiling hasn't risen enough above what's "
-                                f"already live (candidate-cur={candidate - cur_p} < {gap}, or budget exhausted)"
-                            )
+                code = result.get("retCode", result.get("ret_code", -1))
+                if code == 0:
+                    posted_price = submit_price
+                    logger.info(f"{tag} modify accepted — new ad price {posted_price}")
                 else:
-                    logger.warning(f"{tag} probe returned an unexpected code={last_code} msg={last_msg!r}")
+                    logger.warning(
+                        f"{tag} modify rejected — code={code} "
+                        f"msg={result.get('retMsg', result.get('ret_msg',''))!r}"
+                    )
 
-        if posted_price is not None:
-            _set_ad_current_price(sess, slot_idx, posted_price)
-            now = datetime.now().strftime("%H:%M:%S")
-            await bot.send_message(chat_id=chat_id,
-                text=(
-                    f"⚡ <b>Fast update</b> <code>{now}</code>\n"
-                    f"💲 <code>{posted_price}</code> — price rose before the next scheduled cycle"
-                ),
-                parse_mode="HTML")
-        else:
-            logger.info(f"{tag} poll complete — no update posted")
+            else:
+                # Chase-ceiling needs TWO calls to ever actually change anything:
+                # the probe (guaranteed to be rejected, purely to learn Bybit's
+                # current boundary) and the follow-up post of that boundary. If
+                # only one slot is left in the shared budget, spending it on the
+                # probe burns the last slot on a call that can NEVER succeed by
+                # itself — the follow-up that would have actually raised the
+                # price then gets silently skipped for lack of budget. That's
+                # exactly what was happening: a single "MODIFY... 912120022"
+                # logged, then nothing — the discovered boundary was a real $21+
+                # improvement, but there was no budget left to post it. Wait for
+                # 2 free slots instead of spending on a probe we can't follow up.
+                #
+                # THE ACTUAL FIX: unlike plain-floating mode (which only spends
+                # budget once diff >= gap against the ad's own current price),
+                # chase-ceiling had NO local gate at all — it asked Bybit
+                # (spending 1-2 of the 8 shared slots) on every single poll,
+                # whether or not the market had moved at all. That's what burns
+                # the budget down to nothing within the first minute, timer-
+                # throttled or not.
+                #
+                # get_token_usdt_price()/calc_floating_price() hit Bybit's PUBLIC
+                # market endpoint (no API key, no signature) — it does not touch
+                # the account's rate limit at all, only modify_ad() does. So we
+                # can fetch that price as often as we like for free, and use it
+                # to decide WHETHER to spend a Bybit call, the same way plain-
+                # floating mode already does.
+                #
+                # Two pieces of memory, kept deliberately separate:
+                #   last_known_ceiling  — a boundary Bybit ITSELF has told us,
+                #                         via a real rejection message. This is
+                #                         confirmed information regardless of
+                #                         whether we managed to post it.
+                #   pending_ceiling     — set only when we discovered a real
+                #                         improvement but couldn't post it (ran
+                #                         out of budget, or the post itself was
+                #                         rejected) — something worth trying
+                #                         again with a plain 1-call post before
+                #                         ever spending 2 calls on a fresh probe.
+                # cur_p (the ad's actual live price on Bybit, only ever updated
+                # on a CONFIRMED successful post) is never touched by either of
+                # these — that bug (comparing against an attempted-but-unposted
+                # price as if it were live) is exactly what made the bot think
+                # nothing had changed while the real Bybit ad sat at its old,
+                # lower, unconfirmed price.
+                pending_ceiling = _pending_ceiling(sess, slot_idx)
+                if pending_ceiling is not None and pending_ceiling - cur_p >= gap:
+                    if not _can_modify_slot(sess, slot_idx):
+                        logger.info(f"{tag} skipped — have a known unposted ceiling {pending_ceiling} but no budget yet")
+                        return
+                    # Same collision guard the scheduled cycle uses — with fast-
+                    # chase now running on Ad 2/3 too, two ads on the same pair
+                    # could otherwise land on the same discovered ceiling at
+                    # nearly the same moment and one of them gets rejected.
+                    pending_ceiling, collided_with = _resolve_price_collision(sess, slot_idx, currency, token, pending_ceiling)
+                    logger.info(f"{tag} retrying known unposted ceiling {pending_ceiling} directly (1 call, no re-probe)")
+                    _record_modify_slot(sess, slot_idx)
+                    retry_result = await asyncio.get_event_loop().run_in_executor(
+                        _ad_executor, modify_ad, s["ad_id"], str(pending_ceiling), ad_data, creds
+                    )
+                    if retry_result.get("retCode", retry_result.get("ret_code", -1)) == 0:
+                        posted_price = pending_ceiling
+                        logger.info(f"{tag} pending ceiling post accepted — new ad price {posted_price}")
+                    else:
+                        logger.warning(f"{tag} pending ceiling post still rejected — will keep retrying as budget allows")
 
-    except asyncio.CancelledError:
-        raise
-    except Exception as e:
-        # This is the critical guarantee: nothing raised in this function can
-        # ever escape and take the parent auto_update_loop task down with it.
-        logger.error(f"{tag} unhandled exception: {e}", exc_info=True)
+                else:
+                    last_known = _ceiling_ref(sess, slot_idx)
+                    if last_known is not None:
+                        formula_diff = new_p - last_known
+                        logger.info(
+                            f"{tag} chase-ceiling | fetched price={new_p} vs last known real ceiling={last_known} "
+                            f"diff={formula_diff} threshold={gap}"
+                        )
+                        if formula_diff < gap:
+                            logger.info(
+                                f"{tag} skipped — underlying price hasn't moved enough above the last "
+                                f"confirmed Bybit ceiling to be worth spending a call (no API request made)"
+                            )
+                            return
+                    if not _can_modify_slot(sess, slot_idx, need=2):
+                        logger.info(f"{tag} skipped — chase-ceiling needs 2 free budget slots, don't have them")
+                        return
+                    # Probe first (always — the natural formula number tells us
+                    # nothing about where Bybit's real boundary currently sits),
+                    # then decide whether the DISCOVERED boundary is worth
+                    # posting — never the probe itself.
+                    probe_price = (new_p * Decimal("5")).quantize(_quant, rounding=ROUND_HALF_UP)
+                    _record_modify_slot(sess, slot_idx)
+                    logger.info(f"{tag} chase-ceiling probe — submitting {probe_price}")
+                    result = await asyncio.get_event_loop().run_in_executor(
+                        _ad_executor, modify_ad, s["ad_id"], str(probe_price), ad_data, creds
+                    )
+                    last_code = result.get("retCode", result.get("ret_code", -1))
+                    last_msg  = result.get("retMsg",  result.get("ret_msg","Unknown"))
+                    logger.info(f"{tag} probe result code={last_code} msg={last_msg!r}")
+
+                    if last_code == 0:
+                        # Extremely unlikely — the 5x probe was accepted outright.
+                        posted_price = probe_price
+                        _set_ceiling_ref(sess, slot_idx, probe_price)
+                    elif last_code == 912120022:
+                        min_str, max_str = _extract_bybit_bounds(last_msg)
+                        bound_str = max_str if max_str else min_str
+                        if not bound_str:
+                            logger.warning(f"{tag} could not parse a boundary out of msg={last_msg!r}")
+                        else:
+                            candidate = Decimal(bound_str)
+                            # Confirmed information from Bybit itself — record it
+                            # regardless of what happens with the follow-up post.
+                            _set_ceiling_ref(sess, slot_idx, candidate)
+                            logger.info(f"{tag} discovered boundary={candidate} vs current={cur_p} threshold={gap}")
+                            if candidate - cur_p >= gap and _can_modify_slot(sess, slot_idx):
+                                # Same collision guard as above — with 2+ ads on
+                                # the same pair fast-chasing independently, the
+                                # discovered boundary can coincide with another
+                                # ad's live price even though it clears the gap
+                                # against THIS ad's own last price.
+                                post_candidate, collided_with = _resolve_price_collision(sess, slot_idx, currency, token, candidate)
+                                _record_modify_slot(sess, slot_idx)
+                                retry_result = await asyncio.get_event_loop().run_in_executor(
+                                    _ad_executor, modify_ad, s["ad_id"], str(post_candidate), ad_data, creds
+                                )
+                                retry_code = retry_result.get("retCode", retry_result.get("ret_code", -1))
+                                if retry_code == 0:
+                                    posted_price = post_candidate
+                                    logger.info(f"{tag} boundary post accepted — new ad price {posted_price}")
+                                elif retry_code == 90043 and _can_modify_slot(sess, slot_idx):
+                                    # Discovered boundary matches what's live after all —
+                                    # nudge once. Still gated by the same "is it actually
+                                    # an improvement" check so this can't sneak in a
+                                    # downgrade either.
+                                    nudged = (post_candidate - gap).quantize(_quant, rounding=ROUND_HALF_UP)
+                                    if nudged - cur_p >= gap:
+                                        _record_modify_slot(sess, slot_idx)
+                                        nudge_result = await asyncio.get_event_loop().run_in_executor(
+                                            _ad_executor, modify_ad, s["ad_id"], str(nudged), ad_data, creds
+                                        )
+                                        if nudge_result.get("retCode", nudge_result.get("ret_code", -1)) == 0:
+                                            posted_price = nudged
+                                            logger.info(f"{tag} nudged post accepted — new ad price {posted_price}")
+                                else:
+                                    # Discovered a real improvement but couldn't post it
+                                    # right now (out of budget, or a transient rejection).
+                                    # Remember it so the NEXT check can try posting it
+                                    # directly for 1 call instead of re-probing for 2.
+                                    _set_pending_ceiling(sess, slot_idx, candidate)
+                                    logger.warning(
+                                        f"{tag} boundary post rejected/skipped — code={retry_code} — "
+                                        f"remembered {candidate} as a pending ceiling to retry"
+                                    )
+                            else:
+                                logger.info(
+                                    f"{tag} skipped — Bybit's real ceiling hasn't risen enough above what's "
+                                    f"already live (candidate-cur={candidate - cur_p} < {gap}, or budget exhausted)"
+                                )
+                    else:
+                        logger.warning(f"{tag} probe returned an unexpected code={last_code} msg={last_msg!r}")
+
+            if posted_price is not None:
+                _set_ad_current_price(sess, slot_idx, posted_price)
+                now   = datetime.now().strftime("%H:%M:%S")
+                label = _ad_slot_label(slot_idx)
+                if collided_with:
+                    # Explain the deduction instead of leaving a lower-than-expected
+                    # price unexplained — e.g. "Fast update for Ad 2 matched Ad 1's
+                    # price — nudged by $3 to post 84276.08 for Ad 2".
+                    gap_amt = get_min_price_gap(currency, token, posted_price)
+                    reason  = " and ".join(collided_with)
+                    text = (
+                        f"⚡ <b>Fast update — {label}</b> <code>{now}</code>\n"
+                        f"⚠️ Matched {reason} — nudged by {gap_amt} to stay clear\n"
+                        f"💲 <code>{posted_price}</code> posted for {label}"
+                    )
+                else:
+                    text = (
+                        f"⚡ <b>Fast update — {label}</b> <code>{now}</code>\n"
+                        f"💲 <code>{posted_price}</code> — price rose before the next scheduled cycle"
+                    )
+                await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+            else:
+                logger.info(f"{tag} poll complete — no update posted")
+
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            # This is the critical guarantee: nothing raised in this function can
+            # ever escape and take the parent auto_update_loop task down with it.
+            logger.error(f"{tag} unhandled exception: {e}", exc_info=True)
 
 
 # ─────────────────────────────────────────
@@ -4126,7 +4175,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
             # only when another active ad on the identical pair would
             # otherwise land within the minimum gap. ──
             if sess.total_ad_slots() > 1:
-                new_p = _resolve_price_collision(
+                new_p, _cycle_collided = _resolve_price_collision(
                     sess, slot_idx,
                     ad_data.get("currencyId",""), ad_data.get("tokenId",""),
                     new_p
@@ -6526,7 +6575,20 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 return
             mode     = s.get("mode","fixed")
             interval = s.get("interval",2)
+            if _ad_running(sess, slot_idx):
+                # A concurrent press already won the race and started this
+                # ad while we were validating above — don't spin up a
+                # second task for the same slot. Two tasks both polling and
+                # editing the same ad_id independently is exactly what
+                # caused near-simultaneous MODIFY calls with drifting
+                # internal price state and repeated 90043 rejections.
+                await edit_menu(query,
+                    f"⚠️ <b>{label} is already running.</b>\n\n" + ads_section_text(tuser.id),
+                    ads_section_keyboard(tuser.id)
+                )
+                return
             _reset_ad_failures(sess, slot_idx)
+            _set_ad_running(sess, slot_idx, True)   # set BEFORE create_task, no await in between — closes the race
             task = asyncio.create_task(auto_update_loop(context.bot, chat_id, slot_idx))
             _set_ad_task(sess, slot_idx, task)
             await edit_menu(query,
