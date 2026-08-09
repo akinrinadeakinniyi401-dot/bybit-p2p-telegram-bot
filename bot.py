@@ -4392,12 +4392,19 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                             )
                         candidate_str = str(candidate)
                     elif last_code == 90043 and candidate is not None:
-                        # Self-duplicate only (Bybit compares against THIS
-                        # ad's own previous price here) — a tiny epsilon is
-                        # enough, not the full inter-ad gap. See
-                        # _SELF_DUPLICATE_EPSILON.
-                        nudge = _SELF_DUPLICATE_EPSILON
-                        candidate = (candidate - nudge) if was_too_high else (candidate + nudge)
+                        # Reactive recovery from an ACTUAL rejection — unlike
+                        # the preventative self-check in
+                        # _resolve_price_collision (which only needs to dodge
+                        # an avoidable duplicate before ever submitting),
+                        # real-world testing showed Bybit's own duplicate
+                        # threshold for this is bigger than a cent: repeated
+                        # $0.01 nudges (84789.161 → .15 → .14 → .13) all
+                        # still came back 90043 here. Use the pair's real
+                        # minimum gap instead — flat, not the old
+                        # exponentially-doubling version, so a genuine retry
+                        # sequence costs at most a few flat gaps, never 7x+.
+                        gap = get_min_price_gap(ad_data.get("currencyId",""), ad_data.get("tokenId",""), candidate)
+                        candidate = (candidate - gap) if was_too_high else (candidate + gap)
                         candidate = candidate.quantize(_quant, rounding=ROUND_HALF_UP)
                         candidate_str = str(candidate)
                     else:
@@ -4448,25 +4455,26 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                 # to the SAME value the ad already has live on Bybit (happens
                 # when the underlying market barely moves between cycles, or
                 # when this ad hasn't changed since its last successful post).
-                # This is fully recoverable — nudge the price by a tiny
-                # epsilon and retry, instead of counting it as a failure.
+                # This is fully recoverable — nudge the price by this pair's
+                # real minimum gap and retry, instead of counting it as a
+                # failure.
                 #
-                # This nudge is deliberately NOT the inter-ad collision gap.
-                # 90043 is Bybit comparing this ad against only its OWN
-                # previous price — it has nothing to do with staying
-                # $3/₦5,000 clear of a sibling ad. The previous version used
-                # get_min_price_gap() here, DOUBLING on every retry attempt
-                # (1x, then 2x, then 4x) — three attempts could stack up to
-                # 7x the real gap onto a price that never needed more than a
-                # cent of separation from itself, which is exactly what
-                # produced unexplained -6/-7/-10 swings instead of the
-                # expected -3.
+                # This used to double on every attempt (1x, then 2x, then
+                # 4x — up to 7x the gap across 3 attempts), which is what
+                # produced unexplained -6/-7/-10 swings instead of -3. A
+                # tiny epsilon nudge was tried in place of the real gap, but
+                # real Bybit responses showed that's too small to register
+                # as a genuine change at all — repeated $0.01 decrements
+                # (84789.161 → .15 → .14 → .13) still came back 90043 every
+                # time. So: flat, single gap per attempt — big enough to
+                # actually register, never compounding.
                 last_code, last_msg = ret_code, ret_msg
                 candidate = new_p
                 posted_price = None
                 for _attempt in range(3):
                     if last_code == 90043:
-                        candidate = candidate - (_SELF_DUPLICATE_EPSILON * (_attempt + 1))
+                        gap = get_min_price_gap(ad_data.get("currencyId",""), ad_data.get("tokenId",""), candidate)
+                        candidate = candidate - gap
                         candidate = candidate.quantize(_quant, rounding=ROUND_HALF_UP)
                     elif last_code == 912120022:
                         min_str, max_str = _extract_bybit_bounds(last_msg)
