@@ -421,17 +421,6 @@ def _resolve_price_collision(sess, slot_idx: int, currency_id: str, token_id: st
     only ever one $3 collision.
     """
     gap = get_min_price_gap(currency_id, token_id, natural_price)
-    # Self-duplicate avoidance uses the SAME real gap as inter-ad conflicts.
-    # An earlier version used a tiny $0.01 epsilon here on the theory that
-    # Bybit's 90043 only cares about exact duplicates — but real testing
-    # showed two problems with that: (1) the strict "<" check meant a
-    # price landing EXACTLY $0.01 from its own live price didn't even
-    # trigger the safety adjustment, and (2) when it did trigger, a
-    # $0.01 push still wasn't enough to register as "different" to Bybit
-    # in practice. The single-pass rewrite above already prevents the
-    # original unwanted-stacking bug, so there's no benefit left to
-    # keeping this smaller than the real gap.
-    self_gap = gap
     conflicts = []   # list of (price, label, required_gap)
     for i in range(-1, len(sess.extra_ad_slots)):
         if i == slot_idx:
@@ -446,20 +435,25 @@ def _resolve_price_collision(sess, slot_idx: int, currency_id: str, token_id: st
         if other_price and other_price > 0:
             conflicts.append((other_price, _ad_slot_label(i), gap))
 
-    # Also guard against landing back on THIS ad's own currently-live price.
-    # Bybit rejects a submission with retCode 90043 ("price differs from
-    # your existing ad by less than 0%") whenever the new price rounds to
-    # what this SAME ad already has posted — that's a per-ad comparison
-    # Bybit makes internally, nothing to do with any other ad. Previously
-    # this function only ever checked OTHER ads, so when the underlying
-    # market hadn't moved between cycles, a collision nudge could push this
-    # ad's price right back onto its own last-posted value and get
-    # rejected — which is exactly what showed up as repeated 90043 failures
-    # once a user had 2+ ads on the same pair/float %. Uses self_gap (a
-    # tiny epsilon), not the full inter-ad gap — see docstring above.
-    own_price = _ad_current_price(sess, slot_idx)
-    if own_price and own_price > 0:
-        conflicts.append((own_price, "its own last posted price", self_gap))
+    # NOTE — deliberately no "own last posted price" entry here anymore.
+    # An earlier version preventatively avoided this ad's own tracked price
+    # too, on the theory that it was cheap insurance against a 90043
+    # self-duplicate. In practice that made results UNPREDICTABLE instead:
+    # a price that already cleared every real sibling conflict could still
+    # get an extra, hard-to-predict cascade tacked on just because it
+    # happened to land near this ad's own price history — e.g. a discovered
+    # boundary $3.02 clear of every real conflict getting knocked down a
+    # further $3 anyway, for no reason a user watching the logs could
+    # anticipate. Sibling conflicts are the only thing this function
+    # protects against now — fully deterministic (N other ads on the same
+    # pair means at most N applications of `gap`, cascading from whichever
+    # sibling price is highest). A genuine self-duplicate (this ad's new
+    # price rounding to exactly what's already live) is comparatively rare
+    # and is caught REACTIVELY instead — every call site posts, and if
+    # Bybit comes back with 90043, retries once with a single real-gap
+    # nudge. That's simpler to reason about and matches how Bybit itself
+    # actually enforces it (an exact-match check on ITS side, not a
+    # $3-radius exclusion zone).
 
     # Process highest conflicting price first. Each conflict is visited
     # EXACTLY ONCE: we check it against whatever the running price is at
@@ -3945,6 +3939,28 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                 if code == 0:
                     posted_price = submit_price
                     logger.info(f"{tag} modify accepted — new ad price {posted_price}")
+                elif code == 90043 and _can_modify_slot(sess, slot_idx):
+                    # Self-duplicate — this ad's own new price rounds to
+                    # what's already live (can happen if the market barely
+                    # moved since the last successful post). Reactive, single
+                    # nudge by the real gap; see the note in
+                    # _resolve_price_collision for why this is handled here
+                    # instead of preventatively.
+                    nudged = (submit_price - gap).quantize(_quant, rounding=ROUND_HALF_UP)
+                    logger.info(f"{tag} modify got 90043 (self-duplicate) — retrying at {nudged}")
+                    _record_modify_slot(sess, slot_idx)
+                    nudge_result = await asyncio.get_event_loop().run_in_executor(
+                        _ad_executor, modify_ad, s["ad_id"], str(nudged), ad_data, creds
+                    )
+                    if nudge_result.get("retCode", nudge_result.get("ret_code", -1)) == 0:
+                        posted_price = nudged
+                        logger.info(f"{tag} nudged modify accepted — new ad price {posted_price}")
+                    else:
+                        logger.warning(
+                            f"{tag} nudged modify also rejected — code="
+                            f"{nudge_result.get('retCode', nudge_result.get('ret_code', -1))} "
+                            f"msg={nudge_result.get('retMsg', nudge_result.get('ret_msg',''))!r}"
+                        )
                 else:
                     logger.warning(
                         f"{tag} modify rejected — code={code} "
