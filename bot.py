@@ -379,6 +379,20 @@ def _resolve_price_collision(sess, slot_idx: int, currency_id: str, token_id: st
     this price was adjusted away from, empty if no adjustment was needed.
     Callers use this to tell the user WHY a price isn't at the natural
     maximum, instead of leaving it unexplained.
+
+    IMPORTANT — single pass, never re-checks a conflict it already
+    resolved. This used to be an iterative "keep looping until nothing
+    changes" loop that re-scanned the FULL conflict list on every pass.
+    That looks safe but isn't: once a conflict is resolved the running
+    price sits EXACTLY `gap` away from it, and on the very next pass that
+    same conflict (or a different one at the same price) could still read
+    as "too close" and get subtracted a second time — silently doubling
+    (or worse) the actual nudge while the notification only ever recorded
+    the label once, so users saw "nudged by $3" while the real drop was
+    $6, $9, etc. Processing conflicts exactly once, highest price first,
+    gives the same correct multi-way-collision behavior (a price that's
+    too close to two different ads still clears both) without ever
+    touching the same conflict twice.
     """
     gap = get_min_price_gap(currency_id, token_id, natural_price)
     conflicts = []   # list of (price, label)
@@ -409,18 +423,21 @@ def _resolve_price_collision(sess, slot_idx: int, currency_id: str, token_id: st
     if own_price and own_price > 0:
         conflicts.append((own_price, "its own last posted price"))
 
+    # Process highest conflicting price first. Each conflict is visited
+    # EXACTLY ONCE: we check it against whatever the running price is at
+    # that point (so a genuine multi-way collision still cascades
+    # correctly — clearing the top ad can bring you within range of a
+    # lower one) but we never go back and re-check a conflict already
+    # handled, which is what caused the double-subtraction bug.
     price = natural_price
     collided_with = []
-    for _ in range(10):   # safety cap — converges in 1-2 passes in practice
-        adjusted = False
-        for cp, label in conflicts:
-            if abs(price - cp) < gap:
-                price = cp - gap
-                adjusted = True
-                if label not in collided_with:
-                    collided_with.append(label)
-        if not adjusted:
-            break
+    for cp, label in sorted(conflicts, key=lambda c: c[0], reverse=True):
+        if abs(price - cp) < gap:
+            candidate = cp - gap
+            if candidate < price:
+                price = candidate
+            if label not in collided_with:
+                collided_with.append(label)
     return price, collided_with
 
 
@@ -3855,6 +3872,12 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
             chase_ceiling = _wants_live_ceiling(currency, token, float_pct)
             posted_price  = None
             collided_with = []   # which other ad(s)/self this price had to dodge, for the user-facing notice
+            # The pre-collision "natural" price, captured at whichever call
+            # site actually invokes _resolve_price_collision. Used only to
+            # compute the REAL total nudge (natural - final) for the
+            # user-facing message, instead of re-deriving a nominal gap
+            # from the already-adjusted price (see message block below).
+            natural_before_collision = None
 
             if not chase_ceiling:
                 # Plain floating mode: the formula number is the real candidate.
@@ -3872,6 +3895,7 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                 # scheduled cycle already uses.
                 resolved_p = new_p
                 if sess.total_ad_slots() > 1:
+                    natural_before_collision = new_p
                     resolved_p, collided_with = _resolve_price_collision(sess, slot_idx, currency, token, new_p)
                 submit_price = resolved_p.quantize(_quant, rounding=ROUND_HALF_UP)
                 _record_modify_slot(sess, slot_idx)
@@ -3943,6 +3967,7 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                     # chase now running on Ad 2/3 too, two ads on the same pair
                     # could otherwise land on the same discovered ceiling at
                     # nearly the same moment and one of them gets rejected.
+                    natural_before_collision = pending_ceiling
                     pending_ceiling, collided_with = _resolve_price_collision(sess, slot_idx, currency, token, pending_ceiling)
                     logger.info(f"{tag} retrying known unposted ceiling {pending_ceiling} directly (1 call, no re-probe)")
                     _record_modify_slot(sess, slot_idx)
@@ -4007,6 +4032,7 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                                 # discovered boundary can coincide with another
                                 # ad's live price even though it clears the gap
                                 # against THIS ad's own last price.
+                                natural_before_collision = candidate
                                 post_candidate, collided_with = _resolve_price_collision(sess, slot_idx, currency, token, candidate)
                                 _record_modify_slot(sess, slot_idx)
                                 retry_result = await asyncio.get_event_loop().run_in_executor(
@@ -4056,7 +4082,20 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                     # Explain the deduction instead of leaving a lower-than-expected
                     # price unexplained — e.g. "Fast update for Ad 2 matched Ad 1's
                     # price — nudged by $3 to post 84276.08 for Ad 2".
-                    gap_amt = get_min_price_gap(currency, token, posted_price)
+                    #
+                    # This reports the ACTUAL total amount subtracted
+                    # (natural price computed before collision resolution
+                    # minus what was actually posted), not a nominal gap
+                    # re-derived from the final price. The two used to be
+                    # able to disagree — e.g. the message would say "nudged
+                    # by 3" while the real drop was 6 or more — because the
+                    # old code recalculated a fresh "gap" for display
+                    # instead of reporting what collision resolution
+                    # actually did.
+                    if natural_before_collision is not None:
+                        gap_amt = natural_before_collision - posted_price
+                    else:
+                        gap_amt = get_min_price_gap(currency, token, posted_price)
                     reason  = " and ".join(collided_with)
                     text = (
                         f"⚡ <b>Fast update — {label}</b> <code>{now}</code>\n"
