@@ -421,10 +421,17 @@ def _resolve_price_collision(sess, slot_idx: int, currency_id: str, token_id: st
     only ever one $3 collision.
     """
     gap = get_min_price_gap(currency_id, token_id, natural_price)
-    # Deliberately tiny — just enough to dodge an exact-duplicate 90043,
-    # never a stand-in for the real inter-ad collision gap. Shared with the
-    # scheduled cycle's own 90043 handler — see _SELF_DUPLICATE_EPSILON.
-    self_gap = _SELF_DUPLICATE_EPSILON
+    # Self-duplicate avoidance uses the SAME real gap as inter-ad conflicts.
+    # An earlier version used a tiny $0.01 epsilon here on the theory that
+    # Bybit's 90043 only cares about exact duplicates — but real testing
+    # showed two problems with that: (1) the strict "<" check meant a
+    # price landing EXACTLY $0.01 from its own live price didn't even
+    # trigger the safety adjustment, and (2) when it did trigger, a
+    # $0.01 push still wasn't enough to register as "different" to Bybit
+    # in practice. The single-pass rewrite above already prevents the
+    # original unwanted-stacking bug, so there's no benefit left to
+    # keeping this smaller than the real gap.
+    self_gap = gap
     conflicts = []   # list of (price, label, required_gap)
     for i in range(-1, len(sess.extra_ad_slots)):
         if i == slot_idx:
