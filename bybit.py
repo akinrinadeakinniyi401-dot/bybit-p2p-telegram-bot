@@ -123,7 +123,7 @@ def currency_needs_ref(currency_id: str) -> bool:
 # confirmed Bybit already accepts — tune per currency here if needed.
 MIN_PRICE_GAP = {
     "NGN": Decimal("5000"),
-    "USD": Decimal("5"),
+    "USD": Decimal("3"),
     "GHS": Decimal("50"),
     "GBP": Decimal("50"),
     "EUR": Decimal("50"),
