@@ -178,27 +178,49 @@ def _ad_current_price(sess, slot_idx: int) -> Decimal:
     slot_idx = _valid_slot(sess, slot_idx)
     return sess.current_price if slot_idx == -1 else sess.extra_ad_slots[slot_idx]["current_price"]
 
+def _ceiling_ref(sess, slot_idx: int):
+    """Last real ceiling Bybit has confirmed for THIS ad slot (see
+    _set_ad_current_price, which keeps this in sync with reality)."""
+    return getattr(sess, "last_known_ceiling_by_slot", {}).get(slot_idx)
+
+def _set_ceiling_ref(sess, slot_idx: int, value):
+    store = getattr(sess, "last_known_ceiling_by_slot", None)
+    if store is None:
+        store = {}
+        sess.last_known_ceiling_by_slot = store
+    store[slot_idx] = value
+
+def _pending_ceiling(sess, slot_idx: int):
+    """A discovered-but-not-yet-posted ceiling for THIS ad slot (ran out of
+    budget, or the post itself was rejected) — worth a plain 1-call retry
+    before ever spending 2 calls on a fresh probe."""
+    return getattr(sess, "pending_ceiling_by_slot", {}).get(slot_idx)
+
+def _set_pending_ceiling(sess, slot_idx: int, value):
+    store = getattr(sess, "pending_ceiling_by_slot", None)
+    if store is None:
+        store = {}
+        sess.pending_ceiling_by_slot = store
+    store[slot_idx] = value
+
 def _set_ad_current_price(sess, slot_idx: int, price):
     slot_idx = _valid_slot(sess, slot_idx)
     if slot_idx == -1:
         sess.current_price = price
-        # Keep the fast-chase chase-ceiling reference in sync with reality.
-        # This is the fix for a real staleness bug: the SCHEDULED cycle can
-        # push this ad's price up or down on its own (e.g. a normal cycle
-        # nudging it back down after an earlier fast-chase spike), and if
-        # last_known_ceiling weren't refreshed here too, fast-chase would
-        # keep comparing fresh spot prices against a stale number that no
-        # longer reflects what's actually live on Bybit — wrongly concluding
-        # "no movement" for real, threshold-clearing rises that happened
-        # AFTER the ad was moved by something else. Every confirmed price
-        # change, regardless of which code path caused it, is new
-        # information about reality and resets this baseline. Any earlier
-        # "pending" unposted discovery is superseded by this fresh
-        # confirmation too.
-        sess.last_known_ceiling = price
-        sess.pending_ceiling    = None
     else:
         sess.extra_ad_slots[slot_idx]["current_price"] = price
+    # Keep the fast-chase chase-ceiling reference in sync with reality, for
+    # ANY ad slot (Ad 1/2/3, not just Ad 1). This is the fix for a real
+    # staleness bug: the scheduled cycle can push an ad's price up or down
+    # independently of fast-chase, and if the ceiling reference weren't
+    # refreshed here too, fast-chase would keep comparing fresh spot prices
+    # against a stale number that no longer reflects what's actually live
+    # on Bybit. Every confirmed price change, from ANY source, is new
+    # information about reality and resets this baseline for that slot.
+    # Any earlier "pending" unposted discovery for this slot is superseded
+    # by this fresh confirmation too.
+    _set_ceiling_ref(sess, slot_idx, price)
+    _set_pending_ceiling(sess, slot_idx, None)
 
 def _ad_slot_label(slot_idx: int) -> str:
     return "Ad 1" if slot_idx == -1 else f"Ad {slot_idx + 2}"
@@ -246,13 +268,44 @@ _BUDGET_COOLDOWN = "BUDGET_COOLDOWN"
 # scheduled cycle, so the 8-edits-per-5-minutes ceiling is unchanged).
 _FAST_CHASE_POLL_SECS    = 8
 
+def _modify_times(sess, slot_idx: int) -> list:
+    """
+    Per-ad-slot rolling list of recent modify_ad() call timestamps. Bybit
+    enforces its 10-per-5-minutes limit PER AD (per ad_id), not per user —
+    so each ad slot (-1/0/1 = Ad 1/2/3) needs its own independent budget.
+    A single shared counter across all of a user's ads (the old design)
+    would throttle Ad 2 and Ad 3 based on Ad 1's activity for no real
+    reason, and vice versa.
+
+    Stored as a dynamic dict attribute rather than something declared in
+    SessionState (user_session.py) — Python objects allow this as long as
+    they don't use __slots__, and it means this works without needing to
+    touch that file at all.
+    """
+    store = getattr(sess, "modify_times_by_slot", None)
+    if store is None:
+        store = {}
+        sess.modify_times_by_slot = store
+    return store.setdefault(slot_idx, [])
+
+def _can_modify_slot(sess, slot_idx: int, need: int = 1) -> bool:
+    now   = datetime.now().timestamp()
+    times = _modify_times(sess, slot_idx)
+    times[:] = [t for t in times if now - t < _FAST_CHASE_WINDOW_SECS]
+    return len(times) <= _FAST_CHASE_BUDGET - need
+
+def _record_modify_slot(sess, slot_idx: int):
+    _modify_times(sess, slot_idx).append(datetime.now().timestamp())
+
+# Back-compat aliases — Ad 1 (slot -1) used to be the only ad allowed to
+# fast-chase, so every existing call site uses these names. They're now
+# thin wrappers over the general per-slot functions above, hardcoded to
+# slot -1, so nothing else needs to change.
 def _can_modify_ad1(sess, need: int = 1) -> bool:
-    now = datetime.now().timestamp()
-    sess.modify_call_times = [t for t in sess.modify_call_times if now - t < _FAST_CHASE_WINDOW_SECS]
-    return len(sess.modify_call_times) <= _FAST_CHASE_BUDGET - need
+    return _can_modify_slot(sess, -1, need)
 
 def _record_modify_ad1(sess):
-    sess.modify_call_times.append(datetime.now().timestamp())
+    _record_modify_slot(sess, -1)
 
 
 # Fast-chase-only gap thresholds. This is separate from get_min_price_gap
@@ -3676,15 +3729,23 @@ def calc_floating_price(ad_data, float_pct, local_usdt_ref):
 async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, creds, _quant):
     """
     Runs on its own wall-clock timer (see _FAST_CHASE_POLL_SECS in
-    auto_update_loop) while Ad 1 waits out the rest of its scheduled
-    interval (floating mode, single-ad users only — see auto_update_loop,
-    which gates this to slot_idx == -1 and sess.total_ad_slots() == 1
-    before ever calling it, so a user with 2+ ads never triggers this and
-    can't out-update everyone else on the same pair).
+    auto_update_loop) while THIS ad slot waits out the rest of its
+    scheduled interval (floating mode). Each ad slot (Ad 1/2/3) runs its
+    own separate auto_update_loop task, so each one calls this
+    independently for its own ad — no longer restricted to single-ad
+    users. Budget (_can_modify_slot/_record_modify_slot) and the
+    chase-ceiling reference (_ceiling_ref/_pending_ceiling) are tracked
+    PER SLOT, since Bybit enforces its modify-rate limit per ad_id, not
+    per user — Ad 2 running its own fast-chase doesn't eat into Ad 1's
+    budget or vice versa. Where two ads share the same (currency, coin)
+    pair and could otherwise land on the same computed/discovered price,
+    _resolve_price_collision() is applied before every submission here,
+    the same guard the scheduled cycle already uses.
 
-    Pulls from the SAME rolling modify budget as the scheduled cycle
-    (_can_modify_ad1/_record_modify_ad1) so the two together can never
-    exceed Bybit's 10-modifies-per-5-minutes limit on a single ad.
+    Pulls from the SAME rolling modify budget as this ad's own scheduled
+    cycle (_can_modify_slot/_record_modify_slot, keyed by slot_idx) so the
+    two together can never exceed Bybit's modifies-per-5-minutes limit on
+    this one ad.
 
     Two different modes, handled separately:
 
@@ -3720,11 +3781,11 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
     try:
         logger.info(f"{tag} poll start")
 
-        if not _can_modify_ad1(sess):
+        if not _can_modify_slot(sess, slot_idx):
             logger.info(
                 f"{tag} skipped — modify budget exhausted "
-                f"({len(sess.modify_call_times)}/{_FAST_CHASE_BUDGET} used in the last "
-                f"{_FAST_CHASE_WINDOW_SECS}s window, shared with the scheduled cycle)"
+                f"({len(_modify_times(sess, slot_idx))}/{_FAST_CHASE_BUDGET} used in the last "
+                f"{_FAST_CHASE_WINDOW_SECS}s window, shared with this ad's scheduled cycle)"
             )
             return
 
@@ -3765,8 +3826,18 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
             if diff < gap:
                 logger.info(f"{tag} skipped — diff {diff} below the {gap} threshold, not worth a post yet")
                 return
-            submit_price = new_p.quantize(_quant, rounding=ROUND_HALF_UP)
-            _record_modify_ad1(sess)
+            # Collision guard — with fast-chase now able to run on Ad 2/3 as
+            # well as Ad 1, two ads on the same pair can independently see
+            # the same threshold-clearing spot move at nearly the same
+            # moment and compute the same candidate price. This steps this
+            # ad's price below any other active ad on the same pair before
+            # ever submitting — same guard, same convention, as the
+            # scheduled cycle already uses.
+            resolved_p = new_p
+            if sess.total_ad_slots() > 1:
+                resolved_p = _resolve_price_collision(sess, slot_idx, currency, token, new_p)
+            submit_price = resolved_p.quantize(_quant, rounding=ROUND_HALF_UP)
+            _record_modify_slot(sess, slot_idx)
             logger.info(f"{tag} threshold met — submitting {submit_price}")
             result = await asyncio.get_event_loop().run_in_executor(
                 _ad_executor, modify_ad, s["ad_id"], str(submit_price), ad_data, creds
@@ -3826,25 +3897,29 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
             # price as if it were live) is exactly what made the bot think
             # nothing had changed while the real Bybit ad sat at its old,
             # lower, unconfirmed price.
-            pending_ceiling = getattr(sess, "pending_ceiling", None)
+            pending_ceiling = _pending_ceiling(sess, slot_idx)
             if pending_ceiling is not None and pending_ceiling - cur_p >= gap:
-                if not _can_modify_ad1(sess):
+                if not _can_modify_slot(sess, slot_idx):
                     logger.info(f"{tag} skipped — have a known unposted ceiling {pending_ceiling} but no budget yet")
                     return
+                # Same collision guard the scheduled cycle uses — with fast-
+                # chase now running on Ad 2/3 too, two ads on the same pair
+                # could otherwise land on the same discovered ceiling at
+                # nearly the same moment and one of them gets rejected.
+                pending_ceiling = _resolve_price_collision(sess, slot_idx, currency, token, pending_ceiling)
                 logger.info(f"{tag} retrying known unposted ceiling {pending_ceiling} directly (1 call, no re-probe)")
-                _record_modify_ad1(sess)
+                _record_modify_slot(sess, slot_idx)
                 retry_result = await asyncio.get_event_loop().run_in_executor(
                     _ad_executor, modify_ad, s["ad_id"], str(pending_ceiling), ad_data, creds
                 )
                 if retry_result.get("retCode", retry_result.get("ret_code", -1)) == 0:
                     posted_price = pending_ceiling
-                    sess.pending_ceiling = None
                     logger.info(f"{tag} pending ceiling post accepted — new ad price {posted_price}")
                 else:
                     logger.warning(f"{tag} pending ceiling post still rejected — will keep retrying as budget allows")
 
             else:
-                last_known = getattr(sess, "last_known_ceiling", None)
+                last_known = _ceiling_ref(sess, slot_idx)
                 if last_known is not None:
                     formula_diff = new_p - last_known
                     logger.info(
@@ -3857,7 +3932,7 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                             f"confirmed Bybit ceiling to be worth spending a call (no API request made)"
                         )
                         return
-                if not _can_modify_ad1(sess, need=2):
+                if not _can_modify_slot(sess, slot_idx, need=2):
                     logger.info(f"{tag} skipped — chase-ceiling needs 2 free budget slots, don't have them")
                     return
                 # Probe first (always — the natural formula number tells us
@@ -3865,7 +3940,7 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                 # then decide whether the DISCOVERED boundary is worth
                 # posting — never the probe itself.
                 probe_price = (new_p * Decimal("5")).quantize(_quant, rounding=ROUND_HALF_UP)
-                _record_modify_ad1(sess)
+                _record_modify_slot(sess, slot_idx)
                 logger.info(f"{tag} chase-ceiling probe — submitting {probe_price}")
                 result = await asyncio.get_event_loop().run_in_executor(
                     _ad_executor, modify_ad, s["ad_id"], str(probe_price), ad_data, creds
@@ -3877,7 +3952,7 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                 if last_code == 0:
                     # Extremely unlikely — the 5x probe was accepted outright.
                     posted_price = probe_price
-                    sess.last_known_ceiling = probe_price
+                    _set_ceiling_ref(sess, slot_idx, probe_price)
                 elif last_code == 912120022:
                     min_str, max_str = _extract_bybit_bounds(last_msg)
                     bound_str = max_str if max_str else min_str
@@ -3887,25 +3962,31 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                         candidate = Decimal(bound_str)
                         # Confirmed information from Bybit itself — record it
                         # regardless of what happens with the follow-up post.
-                        sess.last_known_ceiling = candidate
+                        _set_ceiling_ref(sess, slot_idx, candidate)
                         logger.info(f"{tag} discovered boundary={candidate} vs current={cur_p} threshold={gap}")
-                        if candidate - cur_p >= gap and _can_modify_ad1(sess):
-                            _record_modify_ad1(sess)
+                        if candidate - cur_p >= gap and _can_modify_slot(sess, slot_idx):
+                            # Same collision guard as above — with 2+ ads on
+                            # the same pair fast-chasing independently, the
+                            # discovered boundary can coincide with another
+                            # ad's live price even though it clears the gap
+                            # against THIS ad's own last price.
+                            post_candidate = _resolve_price_collision(sess, slot_idx, currency, token, candidate)
+                            _record_modify_slot(sess, slot_idx)
                             retry_result = await asyncio.get_event_loop().run_in_executor(
-                                _ad_executor, modify_ad, s["ad_id"], bound_str, ad_data, creds
+                                _ad_executor, modify_ad, s["ad_id"], str(post_candidate), ad_data, creds
                             )
                             retry_code = retry_result.get("retCode", retry_result.get("ret_code", -1))
                             if retry_code == 0:
-                                posted_price = candidate
+                                posted_price = post_candidate
                                 logger.info(f"{tag} boundary post accepted — new ad price {posted_price}")
-                            elif retry_code == 90043 and _can_modify_ad1(sess):
+                            elif retry_code == 90043 and _can_modify_slot(sess, slot_idx):
                                 # Discovered boundary matches what's live after all —
                                 # nudge once. Still gated by the same "is it actually
                                 # an improvement" check so this can't sneak in a
                                 # downgrade either.
-                                nudged = (candidate - gap).quantize(_quant, rounding=ROUND_HALF_UP)
+                                nudged = (post_candidate - gap).quantize(_quant, rounding=ROUND_HALF_UP)
                                 if nudged - cur_p >= gap:
-                                    _record_modify_ad1(sess)
+                                    _record_modify_slot(sess, slot_idx)
                                     nudge_result = await asyncio.get_event_loop().run_in_executor(
                                         _ad_executor, modify_ad, s["ad_id"], str(nudged), ad_data, creds
                                     )
@@ -3917,7 +3998,7 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                                 # right now (out of budget, or a transient rejection).
                                 # Remember it so the NEXT check can try posting it
                                 # directly for 1 call instead of re-probing for 2.
-                                sess.pending_ceiling = candidate
+                                _set_pending_ceiling(sess, slot_idx, candidate)
                                 logger.warning(
                                     f"{tag} boundary post rejected/skipped — code={retry_code} — "
                                     f"remembered {candidate} as a pending ceiling to retry"
@@ -4066,21 +4147,18 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
             else:
                 submit_price, submit_str = new_p, new_p_str
 
-            if slot_idx == -1 and not _can_modify_ad1(sess, need=2 if chase_ceiling else 1):
-                # SAFETY NET: previously this cycle never checked the shared
-                # budget at all — it always fired, chase-ceiling always
-                # costing 2 calls. Combined with fast-chase running the same
-                # 8-slot budget, that could blow straight past Bybit's real
-                # 10-per-5-minutes limit on this ad, not just our own
-                # self-imposed 8. Skip this one cycle's post instead —
-                # _BUDGET_COOLDOWN is a sentinel _handle_ad_cycle_failure
-                # treats as a soft skip, never as a real failure, so it can
-                # never trip the 2-in-a-row auto-stop.
+            if not _can_modify_slot(sess, slot_idx, need=2 if chase_ceiling else 1):
+                # SAFETY NET: previously this only checked/tracked budget for
+                # Ad 1 — Ad 2/3 cycles fired completely ungated. Now every ad
+                # slot has its own independent budget (Bybit enforces its
+                # 10-per-5-minutes limit per ad_id, not per user), so this
+                # applies uniformly. _BUDGET_COOLDOWN is a sentinel
+                # _handle_ad_cycle_failure treats as a soft skip, never as a
+                # real failure, so it can never trip the 2-in-a-row auto-stop.
                 ret_code, ret_msg = _BUDGET_COOLDOWN, "Internal modify budget exhausted this window"
                 logger.warning(f"[{label}] Cycle {cycle} skipped for user {chat_id} — {ret_msg}, protecting Bybit's real rate limit")
             else:
-                if slot_idx == -1:
-                    _record_modify_ad1(sess)   # shared budget with the fast-chase check
+                _record_modify_slot(sess, slot_idx)   # this ad's own budget, shared with its own fast-chase checks
                 result   = await asyncio.get_event_loop().run_in_executor(
                     _ad_executor, modify_ad, s["ad_id"], submit_str, ad_data, creds
                 )
@@ -4147,11 +4225,10 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                     else:
                         break   # a genuinely different error — stop retrying, fall through to failure handling
 
-                    if slot_idx == -1:
-                        if not _can_modify_ad1(sess):
-                            logger.warning(f"[{label}] Cycle {cycle} retry stopped for user {chat_id} — modify budget exhausted mid-retry")
-                            break
-                        _record_modify_ad1(sess)
+                    if not _can_modify_slot(sess, slot_idx):
+                        logger.warning(f"[{label}] Cycle {cycle} retry stopped for user {chat_id} — modify budget exhausted mid-retry")
+                        break
+                    _record_modify_slot(sess, slot_idx)
                     retry_result = await asyncio.get_event_loop().run_in_executor(
                         _ad_executor, modify_ad, s["ad_id"], candidate_str, ad_data, creds
                     )
@@ -4218,11 +4295,10 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                         break   # a genuinely different error — stop retrying, fall through to failure handling
 
                     candidate_str = str(candidate)
-                    if slot_idx == -1:
-                        if not _can_modify_ad1(sess):
-                            logger.warning(f"[{label}] Cycle {cycle} retry stopped for user {chat_id} — modify budget exhausted mid-retry")
-                            break
-                        _record_modify_ad1(sess)
+                    if not _can_modify_slot(sess, slot_idx):
+                        logger.warning(f"[{label}] Cycle {cycle} retry stopped for user {chat_id} — modify budget exhausted mid-retry")
+                        break
+                    _record_modify_slot(sess, slot_idx)
                     retry_result = await asyncio.get_event_loop().run_in_executor(
                         _ad_executor, modify_ad, s["ad_id"], candidate_str, ad_data, creds
                     )
@@ -4289,9 +4365,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
             wait_until       = loop_clock.time() + interval * 60
             next_fast_chase  = loop_clock.time() + _FAST_CHASE_POLL_SECS
             while _ad_running(sess, slot_idx) and loop_clock.time() < wait_until:
-                if (loop_clock.time() >= next_fast_chase
-                        and slot_idx == -1 and mode == "floating"
-                        and sess.total_ad_slots() == 1):
+                if loop_clock.time() >= next_fast_chase and mode == "floating":
                     try:
                         await _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, creds, _quant)
                     except asyncio.CancelledError:
