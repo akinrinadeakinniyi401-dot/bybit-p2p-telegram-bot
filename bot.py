@@ -351,6 +351,19 @@ def _fast_chase_gap(currency_id: str, token_id: str, reference_price=None) -> De
     return get_min_price_gap(currency_id, token_id, reference_price)
 
 
+# How far to nudge a price off of ITS OWN last posted value when Bybit
+# rejects it as an exact duplicate (90043 — "differs from your existing ad
+# by less than 0%"). Deliberately tiny, and shared by every place that
+# handles a self-duplicate rejection: that 90043 check is Bybit comparing
+# an ad against ONLY its own previous price, it has nothing to do with the
+# real inter-ad collision gap (get_min_price_gap / _fast_chase_gap), which
+# exists to keep DIFFERENT ads apart. Using the full inter-ad gap (or worse,
+# an exponentially growing multiple of it) here used to stack an unearned
+# extra $3/$6/$9+ on top of a price that may already have correctly cleared
+# every real ad-vs-ad collision.
+_SELF_DUPLICATE_EPSILON = Decimal("0.01")
+
+
 def _resolve_price_collision(sess, slot_idx: int, currency_id: str, token_id: str, natural_price: Decimal):
     """
     Multiple ads on the SAME (currency, coin) pair are allowed to use the
@@ -409,8 +422,9 @@ def _resolve_price_collision(sess, slot_idx: int, currency_id: str, token_id: st
     """
     gap = get_min_price_gap(currency_id, token_id, natural_price)
     # Deliberately tiny — just enough to dodge an exact-duplicate 90043,
-    # never a stand-in for the real inter-ad collision gap.
-    self_gap = Decimal("0.01")
+    # never a stand-in for the real inter-ad collision gap. Shared with the
+    # scheduled cycle's own 90043 handler — see _SELF_DUPLICATE_EPSILON.
+    self_gap = _SELF_DUPLICATE_EPSILON
     conflicts = []   # list of (price, label, required_gap)
     for i in range(-1, len(sess.extra_ad_slots)):
         if i == slot_idx:
@@ -4018,14 +4032,29 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                     retry_result = await asyncio.get_event_loop().run_in_executor(
                         _ad_executor, modify_ad, s["ad_id"], str(resolved_ceiling), ad_data, creds
                     )
-                    if retry_result.get("retCode", retry_result.get("ret_code", -1)) == 0:
+                    retry_code = retry_result.get("retCode", retry_result.get("ret_code", -1))
+                    if retry_code == 0:
                         posted_price = resolved_ceiling
                         logger.info(f"{tag} pending ceiling post accepted — new ad price {posted_price}")
+                    elif retry_code == 90043:
+                        # Bybit is telling us, literally, that this price
+                        # "differs from your existing ad by less than 0%" —
+                        # i.e. it's ALREADY live. Our tracked cur_p disagreed
+                        # (that's WHY we thought this was worth posting), so
+                        # cur_p had fallen out of sync with reality — most
+                        # likely an earlier attempt actually succeeded on
+                        # Bybit's side but wasn't recorded here (a timeout or
+                        # ambiguous response). Trust Bybit's own statement and
+                        # sync our state to it now, rather than leaving cur_p
+                        # stale and retrying this exact same doomed post every
+                        # cycle from now on.
+                        _set_ad_current_price(sess, slot_idx, resolved_ceiling)
+                        logger.info(f"{tag} ceiling retry got 90043 — Bybit confirms {resolved_ceiling} is already live, syncing tracked price to match")
                     else:
                         # Still couldn't post it (budget/collision/transient) —
                         # remember it so the next check retries directly again.
                         _set_pending_ceiling(sess, slot_idx, actionable_ceiling)
-                        logger.warning(f"{tag} pending ceiling post still rejected — will keep retrying as budget allows")
+                        logger.warning(f"{tag} pending ceiling post still rejected — code={retry_code} — will keep retrying as budget allows")
 
                 else:
                     if last_known is not None:
@@ -4340,8 +4369,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                             # rounding this to our own precision can round IT UP
                             # past Bybit's actual limit and fail again for a reason
                             # that has nothing to do with the price being wrong.
-                            candidate_str = bound_str
-                            candidate     = bound_dec
+                            candidate = bound_dec
                         else:
                             # Last resort: nudge off the boundary. Round in the SAFE
                             # direction (down if we were too high, up if too low) so
@@ -4350,10 +4378,26 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                             candidate = (bound_dec - margin) if was_too_high else (bound_dec + margin)
                             safe_rounding = ROUND_FLOOR if was_too_high else ROUND_CEILING
                             candidate     = candidate.quantize(_quant, rounding=safe_rounding)
-                            candidate_str = str(candidate)
+                        # Sibling-collision guard — Bybit's stated boundary is a
+                        # real market number, but with 2+ ads on the same pair
+                        # it can still land within another active ad's gap.
+                        # This loop used to post it straight to Bybit with no
+                        # check at all (fast-chase's equivalent path already
+                        # did this; the scheduled cycle didn't).
+                        if sess.total_ad_slots() > 1:
+                            candidate, _cycle_collided3 = _resolve_price_collision(
+                                sess, slot_idx,
+                                ad_data.get("currencyId",""), ad_data.get("tokenId",""),
+                                candidate
+                            )
+                        candidate_str = str(candidate)
                     elif last_code == 90043 and candidate is not None:
-                        gap = get_min_price_gap(ad_data.get("currencyId",""), ad_data.get("tokenId",""), candidate)
-                        candidate = (candidate - gap) if was_too_high else (candidate + gap)
+                        # Self-duplicate only (Bybit compares against THIS
+                        # ad's own previous price here) — a tiny epsilon is
+                        # enough, not the full inter-ad gap. See
+                        # _SELF_DUPLICATE_EPSILON.
+                        nudge = _SELF_DUPLICATE_EPSILON
+                        candidate = (candidate - nudge) if was_too_high else (candidate + nudge)
                         candidate = candidate.quantize(_quant, rounding=ROUND_HALF_UP)
                         candidate_str = str(candidate)
                     else:
@@ -4404,20 +4448,25 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                 # to the SAME value the ad already has live on Bybit (happens
                 # when the underlying market barely moves between cycles, or
                 # when this ad hasn't changed since its last successful post).
-                # This is fully recoverable — nudge the price by this pair's
-                # minimum gap and retry, same pattern as the out-of-range case
-                # above, instead of counting it as a failure. If one nudge
-                # isn't enough (e.g. the pair's flat gap is tiny relative to
-                # its price scale), each further attempt doubles the nudge; if
-                # Bybit instead reports we've now gone out of range, switch to
-                # posting its stated boundary directly.
+                # This is fully recoverable — nudge the price by a tiny
+                # epsilon and retry, instead of counting it as a failure.
+                #
+                # This nudge is deliberately NOT the inter-ad collision gap.
+                # 90043 is Bybit comparing this ad against only its OWN
+                # previous price — it has nothing to do with staying
+                # $3/₦5,000 clear of a sibling ad. The previous version used
+                # get_min_price_gap() here, DOUBLING on every retry attempt
+                # (1x, then 2x, then 4x) — three attempts could stack up to
+                # 7x the real gap onto a price that never needed more than a
+                # cent of separation from itself, which is exactly what
+                # produced unexplained -6/-7/-10 swings instead of the
+                # expected -3.
                 last_code, last_msg = ret_code, ret_msg
                 candidate = new_p
                 posted_price = None
                 for _attempt in range(3):
                     if last_code == 90043:
-                        gap = get_min_price_gap(ad_data.get("currencyId",""), ad_data.get("tokenId",""), candidate) * (2 ** _attempt)
-                        candidate = candidate - gap
+                        candidate = candidate - (_SELF_DUPLICATE_EPSILON * (_attempt + 1))
                         candidate = candidate.quantize(_quant, rounding=ROUND_HALF_UP)
                     elif last_code == 912120022:
                         min_str, max_str = _extract_bybit_bounds(last_msg)
@@ -4427,6 +4476,18 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                         candidate = Decimal(bound_str)
                     else:
                         break   # a genuinely different error — stop retrying, fall through to failure handling
+
+                    # Sibling-collision guard — this loop previously posted
+                    # candidate straight to Bybit with no check against other
+                    # active ads on the same pair at all, unlike fast-chase's
+                    # equivalent paths. A self-duplicate recovery here could
+                    # land right on top of another ad's live price.
+                    if sess.total_ad_slots() > 1:
+                        candidate, _cycle_collided2 = _resolve_price_collision(
+                            sess, slot_idx,
+                            ad_data.get("currencyId",""), ad_data.get("tokenId",""),
+                            candidate
+                        )
 
                     candidate_str = str(candidate)
                     if not _can_modify_slot(sess, slot_idx):
