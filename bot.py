@@ -268,6 +268,94 @@ _BUDGET_COOLDOWN = "BUDGET_COOLDOWN"
 # scheduled cycle, so the 8-edits-per-5-minutes ceiling is unchanged).
 _FAST_CHASE_POLL_SECS    = 8
 
+# ─────────────────────────────────────────────────────────────────────────
+# Shared per-user fast-chase coordinator
+# ─────────────────────────────────────────────────────────────────────────
+# Previously each ad slot's auto_update_loop ran its OWN independent
+# fast-chase timer, started whenever THAT specific ad was activated. With
+# 2-3 ads on the same pair, those timers drifted out of phase with each
+# other — Ad 1 might be 3 seconds into its own 8-second window while Ad 2
+# was 7 seconds in, so a market move could get picked up by one ad several
+# seconds (or, if a user activated them minutes apart, much longer) before
+# a sibling even looked. That's what read as the bot "forgetting" to
+# fast-chase Ad 2/3 and only reacting for Ad 1.
+#
+# One coordinator task per user now owns ALL of that user's fast-chase
+# polling: a single timer, one tick every _FAST_CHASE_POLL_SECS, checking
+# every currently-active floating-mode ad slot for that user IN THE SAME
+# TICK, always in Ad 1 → Ad 2 → Ad 3 order. A price move now reaches every
+# active ad within the same few-second window instead of drifting apart,
+# and there's no separate per-ad clock that can silently fall out of sync.
+_fast_chase_coordinators: dict = {}   # chat_id -> asyncio.Task
+
+
+def _ensure_fast_chase_coordinator(bot, chat_id):
+    """Start the shared fast-chase coordinator for this user if it isn't
+    already running. Cheap and safe to call every time any ad slot for
+    this user (re)activates — a coordinator already running for this
+    chat_id is left alone."""
+    existing = _fast_chase_coordinators.get(chat_id)
+    if existing is not None and not existing.done():
+        return
+    task = asyncio.create_task(_fast_chase_coordinator(bot, chat_id))
+    _fast_chase_coordinators[chat_id] = task
+
+
+async def _fast_chase_coordinator(bot, chat_id):
+    """
+    One shared timer, all of this user's active floating-mode ad slots
+    checked on every tick, always Ad 1 → Ad 2 → Ad 3. Exits once none of
+    this user's ad slots are running; a later ad activation starts a fresh
+    coordinator via _ensure_fast_chase_coordinator.
+    """
+    sess = _s(chat_id)
+    logger.info(f"[FastChase] coordinator started for user {chat_id}")
+    try:
+        while True:
+            any_running = False
+            for slot_idx in (-1, 0, 1):
+                if not _ad_running(sess, slot_idx):
+                    continue
+                any_running = True
+                s = _ad_settings(sess, slot_idx)
+                if s.get("mode") != "floating":
+                    continue   # fixed-mode ads don't fast-chase
+                ad_data = _ad_data_of(sess, slot_idx)
+                if not ad_data:
+                    continue
+                try:
+                    float_pct = float(s.get("float_pct") or 0)
+                except (TypeError, ValueError):
+                    float_pct = 0
+                if float_pct <= 0:
+                    continue
+                creds = get_user_creds(chat_id)
+                if not creds or not creds.get("key"):
+                    continue
+                _quant = Decimal("0.01")   # floating mode's precision, matches auto_update_loop
+                try:
+                    await _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, creds, _quant)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as _fce:
+                    # Belt-and-braces — _try_fast_chase already catches
+                    # everything internally, but this guarantees one slot's
+                    # failure can never take down the coordinator (and with
+                    # it, every OTHER active ad's fast-chase) for this user.
+                    logger.error(
+                        f"[FastChase] coordinator uncaught error for user {chat_id} slot {slot_idx}: {_fce}",
+                        exc_info=True
+                    )
+            if not any_running:
+                break
+            await asyncio.sleep(_FAST_CHASE_POLL_SECS)
+    except asyncio.CancelledError:
+        logger.info(f"[FastChase] coordinator cancelled for user {chat_id}")
+        raise
+    finally:
+        _fast_chase_coordinators.pop(chat_id, None)
+        logger.info(f"[FastChase] coordinator stopped for user {chat_id}")
+
 def _modify_times(sess, slot_idx: int) -> list:
     """
     Per-ad-slot rolling list of recent modify_ad() call timestamps. Bybit
@@ -3808,17 +3896,16 @@ def calc_floating_price(ad_data, float_pct, local_usdt_ref):
 
 async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, creds, _quant):
     """
-    Runs on its own wall-clock timer (see _FAST_CHASE_POLL_SECS in
-    auto_update_loop) while THIS ad slot waits out the rest of its
-    scheduled interval (floating mode). Each ad slot (Ad 1/2/3) runs its
-    own separate auto_update_loop task, so each one calls this
-    independently for its own ad — no longer restricted to single-ad
-    users. Budget (_can_modify_slot/_record_modify_slot) and the
-    chase-ceiling reference (_ceiling_ref/_pending_ceiling) are tracked
-    PER SLOT, since Bybit enforces its modify-rate limit per ad_id, not
-    per user — Ad 2 running its own fast-chase doesn't eat into Ad 1's
-    budget or vice versa. Where two ads share the same (currency, coin)
-    pair and could otherwise land on the same computed/discovered price,
+    Called once per tick, for this ad slot, by the shared per-user
+    _fast_chase_coordinator (see _FAST_CHASE_POLL_SECS) — every active
+    floating-mode ad slot for a user is checked on the SAME tick, in
+    Ad 1 → Ad 2 → Ad 3 order, rather than each slot running its own
+    independent timer. Budget (_can_modify_slot/_record_modify_slot) and
+    the chase-ceiling reference (_ceiling_ref/_pending_ceiling) are still
+    tracked PER SLOT, since Bybit enforces its modify-rate limit per
+    ad_id, not per user — Ad 2's fast-chase doesn't eat into Ad 1's budget
+    or vice versa. Where two ads share the same (currency, coin) pair and
+    could otherwise land on the same computed/discovered price,
     _resolve_price_collision() is applied before every submission here,
     the same guard the scheduled cycle already uses.
 
@@ -4238,6 +4325,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
     """
     sess = _s(chat_id)
     _set_ad_running(sess, slot_idx, True)
+    _ensure_fast_chase_coordinator(bot, chat_id)   # shared timer covers this slot now — see note above
     label     = _ad_slot_label(slot_idx)
     s         = _ad_settings(sess, slot_idx)
     ad_data   = _ad_data_of(sess, slot_idx)
@@ -4588,33 +4676,16 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                 if await _handle_ad_cycle_failure(bot, chat_id, sess, slot_idx, label, cycle, ret_code, ret_msg, ad_data):
                     return
 
-            # ── Fast-chase wait window ──────────────────────────────────────
-            # Previously this counted plain loop iterations ("every 10th
-            # tick") and assumed each iteration took ~1 real second. That
-            # assumption silently broke whenever a fast-chase call itself took
-            # several seconds (a slow Bybit response, a retry, a brief
-            # timeout) — the tick counter kept advancing by exactly 1 per
-            # iteration regardless of how long the previous await actually
-            # took, so real-world checks drifted later and later with no
-            # error anywhere to show it. Scheduling off the monotonic clock
-            # instead means a single slow poll can only ever delay ITS OWN
-            # next check by that same amount — it can never silently stack up
-            # and stall every check after it.
-            loop_clock       = asyncio.get_event_loop()
-            wait_until       = loop_clock.time() + interval * 60
-            next_fast_chase  = loop_clock.time() + _FAST_CHASE_POLL_SECS
+            # ── Wait out the rest of the scheduled interval ────────────────
+            # Fast-chase polling for this slot is now handled entirely by
+            # the shared per-user coordinator (_fast_chase_coordinator) —
+            # see the note near _FAST_CHASE_POLL_SECS for why. This loop just
+            # waits for the next scheduled cycle, scheduled off the
+            # monotonic clock so a slow iteration can only ever delay
+            # itself, never stack up and stall later checks.
+            loop_clock = asyncio.get_event_loop()
+            wait_until = loop_clock.time() + interval * 60
             while _ad_running(sess, slot_idx) and loop_clock.time() < wait_until:
-                if loop_clock.time() >= next_fast_chase and mode == "floating":
-                    try:
-                        await _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, creds, _quant)
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as _fce:
-                        # Belt-and-braces: _try_fast_chase already catches everything
-                        # internally, but this guarantees the scheduled cycle's own
-                        # wait loop can never be killed by a fast-chase failure either.
-                        logger.error(f"[FastChase] uncaught error for user {chat_id}: {_fce}", exc_info=True)
-                    next_fast_chase = loop_clock.time() + _FAST_CHASE_POLL_SECS
                 await asyncio.sleep(1)
         except asyncio.CancelledError:
             logger.info(f"[{label}] Auto-update task cancelled for user {chat_id}")
