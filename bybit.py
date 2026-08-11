@@ -114,11 +114,12 @@ def currency_needs_ref(currency_id: str) -> bool:
 # Minimum PRICE gap for same-float multi-ad setups
 # ─────────────────────────────────────────
 # Multiple ads on the exact same (currency, coin) pair are now allowed to
-# use the SAME floating % (or fixed base) — Bybit doesn't reject on % or
-# starting price alone, it rejects when the *final posted prices* land too
-# close together. So instead of forcing distinct floats, the bot keeps
-# each ad's actual price at least this far apart, in the currency's own
-# units, adjusting automatically (see _resolve_price_collision in bot.py).
+# use the SAME floating % (or fixed base) AND the same computed price —
+# every ad slot attempts it with zero deduction first. This gap is only
+# used REACTIVELY, after Bybit actually rejects a post as a duplicate/too
+# -close price: bot.py steps the retry down by a flat multiple of this gap
+# based on which ad slot it is (see _ad_rejection_nudge_multiplier in
+# bot.py). Never applied before a real rejection happens.
 # ₦5,000 default for NGN is a safety margin above the ₦4,465.23 gap a user
 # confirmed Bybit already accepts — tune per currency here if needed.
 MIN_PRICE_GAP = {
@@ -172,10 +173,11 @@ def get_min_price_gap(currency_id: str, token_id: str = "", reference_price=None
 #
 # NOTE: ads on the same pair are now allowed to use the SAME floating %
 # (this used to be blocked by a 1-percentage-point gap requirement here —
-# that's been removed). Bybit doesn't actually reject on matching %, it
-# rejects when the final POSTED PRICES land too close together, so that's
-# handled at the price level instead, live, right before each submission —
-# see _resolve_price_collision() in bot.py.
+# that's been removed). Bybit doesn't actually reject on matching %, and
+# the bot no longer preemptively nudges prices apart either — every ad
+# posts the same natural price first. Only a REAL rejection from Bybit
+# triggers a retry, nudged by a flat multiple of this gap — see
+# _ad_rejection_nudge_multiplier() in bot.py.
 MIN_AD_INTERVAL_MINUTES = 2
 MAX_ADS_PER_USER = 3
 
