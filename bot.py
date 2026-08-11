@@ -4330,21 +4330,6 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
     ad_data   = _ad_data_of(sess, slot_idx)
     interval  = s.get("interval", 2)
     increment = Decimal(str(s.get("increment","0.05")))
-    # Sync our tracked state to Bybit's REAL live price for this ad the
-    # moment the loop (re)starts — for BOTH modes, not just "fixed". This
-    # used to only run for fixed mode, which meant every restart of a
-    # FLOATING-mode ad kept whatever current_price/ceiling_ref/
-    # pending_ceiling were left over from before it was last stopped —
-    # completely untethered from reality. That stale number then fed every
-    # downstream check: fast-chase's "has the market moved enough" gate,
-    # and sibling-collision math for OTHER ads reading this ad's price via
-    # _ad_current_price. A newly (re)started ad's first cycle could get an
-    # unexplained deduction purely because of a leftover number from a
-    # previous run, and any sibling ad's collision math against it would be
-    # wrong too. _set_ad_current_price also resets ceiling_ref to match and
-    # clears any stale pending_ceiling, so this brings the whole tracked
-    # state for this slot back in sync with Bybit in one call.
-    _set_ad_current_price(sess, slot_idx, Decimal(str(ad_data.get("price","0"))))
 
     # ── Load this user's credentials ONCE at loop start ──
     # Re-read from DB so any key updates take effect on next loop restart.
@@ -4359,6 +4344,46 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
             parse_mode="HTML")
         _set_ad_running(sess, slot_idx, False)
         return
+
+    # ── Re-fetch this ad's details FRESH from Bybit before doing anything
+    # else. This used to just trust whatever was already sitting in
+    # ad_data — but ad_data is only ever populated by the separate
+    # "📋 Fetch Ad Details" button, which a user might have tapped minutes
+    # or hours before actually pressing Start. Auto-Update's very first
+    # job is to know Bybit's REAL current price for this ad, not compare
+    # against a snapshot from whenever it was last manually loaded. If the
+    # re-fetch fails for any reason, fall back to whatever's already in
+    # ad_data rather than blocking the start entirely.
+    _fresh_result = await asyncio.get_event_loop().run_in_executor(
+        None, partial(get_ad_details, s["ad_id"], creds=creds)
+    )
+    if _fresh_result.get("retCode", _fresh_result.get("ret_code", -1)) == 0:
+        ad_data.clear()
+        ad_data.update(_fresh_result.get("result", {}))
+        logger.info(f"[{label}] fresh ad details loaded at start — live price on Bybit is {ad_data.get('price')}")
+    else:
+        logger.warning(
+            f"[{label}] could not re-fetch fresh ad details at start "
+            f"(code={_fresh_result.get('retCode', _fresh_result.get('ret_code',-1))}) — "
+            f"proceeding with whatever was already cached"
+        )
+
+    # Sync our tracked state to Bybit's REAL live price for this ad the
+    # moment the loop (re)starts — for BOTH modes, not just "fixed". This
+    # used to only run for fixed mode, which meant every restart of a
+    # FLOATING-mode ad kept whatever current_price/ceiling_ref/
+    # pending_ceiling were left over from before it was last stopped —
+    # completely untethered from reality. That stale number then fed every
+    # downstream check: fast-chase's "has the market moved enough" gate,
+    # and sibling-collision math for OTHER ads reading this ad's price via
+    # _ad_current_price. A newly (re)started ad's first cycle could get an
+    # unexplained deduction purely because of a leftover number from a
+    # previous run, and any sibling ad's collision math against it would be
+    # wrong too. _set_ad_current_price also resets ceiling_ref to match and
+    # clears any stale pending_ceiling, so this brings the whole tracked
+    # state for this slot back in sync with Bybit in one call. Now fed by
+    # the freshly re-fetched ad_data above, not a possibly-stale cache.
+    _set_ad_current_price(sess, slot_idx, Decimal(str(ad_data.get("price","0"))))
 
     cycle = 0
     while _ad_running(sess, slot_idx):
