@@ -428,8 +428,8 @@ def _fast_chase_lock(sess, slot_idx: int) -> asyncio.Lock:
 _FAST_CHASE_GAP_OVERRIDE = {
     ("NGN", "BTC"): Decimal("5000"),
     ("NGN", "ETH"): Decimal("5000"),
-    ("USD", "BTC"): Decimal("3"),
-    ("USD", "ETH"): Decimal("3"),
+    ("USD", "BTC"): Decimal("4"),
+    ("USD", "ETH"): Decimal("4"),
 }
 
 def _fast_chase_gap(currency_id: str, token_id: str, reference_price=None) -> Decimal:
