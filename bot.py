@@ -561,6 +561,29 @@ def _resolve_price_collision(sess, slot_idx: int, currency_id: str, token_id: st
     return price, collided_with
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# Reactive, ad-index-based rejection nudge — same-pair multi-ad posting
+# ─────────────────────────────────────────────────────────────────────────
+# Replaces the old PREEMPTIVE approach (_resolve_price_collision nudging a
+# price down before it was ever submitted, just because a sibling ad's
+# last-known price was nearby). Every ad slot on the same (currency, coin)
+# pair now always attempts the SAME freshly-computed/natural price FIRST,
+# with zero deduction — no $3, no $6, no nudge of any kind on the first
+# attempt, for ANY ad (Ad 1, 2, or 3).
+#
+# Only if Bybit actually REJECTS that post do we retry — once — at a price
+# stepped down from that SAME natural price by a flat multiple of this
+# pair's minimum gap, based on which ad slot this is:
+#   Ad 1 (slot -1) → 1x gap  (unchanged single-ad self-duplicate recovery)
+#   Ad 2 (slot  0) → 1x gap  (e.g. -$3 on USD/BTC or USD/ETH)
+#   Ad 3 (slot  1) → 2x gap  (e.g. -$6 on USD/BTC or USD/ETH)
+# Always computed from the ORIGINAL natural price — never cascaded from
+# another ad's already-nudged attempt — so Ad 3's retry is always exactly
+# 2 gaps below the shared starting price, regardless of what Ad 2 did.
+def _ad_rejection_nudge_multiplier(slot_idx: int) -> int:
+    return max(1, slot_idx + 1)
+
+
 def _settings(uid: int) -> dict:
     """Shorthand: get the mutable settings dict for uid."""
     return get_session(uid).settings
@@ -3905,9 +3928,11 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
     tracked PER SLOT, since Bybit enforces its modify-rate limit per
     ad_id, not per user — Ad 2's fast-chase doesn't eat into Ad 1's budget
     or vice versa. Where two ads share the same (currency, coin) pair and
-    could otherwise land on the same computed/discovered price,
-    _resolve_price_collision() is applied before every submission here,
-    the same guard the scheduled cycle already uses.
+    land on the same computed/discovered price, NO preemptive nudge is
+    applied — every slot submits that same price first. Only a real
+    rejection from Bybit (90043) triggers a single reactive retry, stepped
+    down from that same price by _ad_rejection_nudge_multiplier(slot_idx)
+    gaps — the same convention the scheduled cycle uses.
 
     Pulls from the SAME rolling modify budget as this ad's own scheduled
     cycle (_can_modify_slot/_record_modify_slot, keyed by slot_idx) so the
@@ -4005,18 +4030,13 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                 if diff < gap:
                     logger.info(f"{tag} skipped — diff {diff} below the {gap} threshold, not worth a post yet")
                     return
-                # Collision guard — with fast-chase now able to run on Ad 2/3 as
-                # well as Ad 1, two ads on the same pair can independently see
-                # the same threshold-clearing spot move at nearly the same
-                # moment and compute the same candidate price. This steps this
-                # ad's price below any other active ad on the same pair before
-                # ever submitting — same guard, same convention, as the
-                # scheduled cycle already uses.
-                resolved_p = new_p
-                if sess.total_ad_slots() > 1:
-                    natural_before_collision = new_p
-                    resolved_p, collided_with = _resolve_price_collision(sess, slot_idx, currency, token, new_p)
-                submit_price = resolved_p.quantize(_quant, rounding=ROUND_HALF_UP)
+                # No preemptive sibling-collision nudge — every active ad on
+                # this pair (Ad 1, 2, 3) submits this SAME natural price
+                # first, zero deduction. If it collides with a sibling ad's
+                # price (or this ad's own last price), Bybit rejects it with
+                # 90043 and that's handled reactively right below, scaled by
+                # which ad slot this is.
+                submit_price = new_p.quantize(_quant, rounding=ROUND_HALF_UP)
                 _record_modify_slot(sess, slot_idx)
                 logger.info(f"{tag} threshold met — submitting {submit_price}")
                 result = await asyncio.get_event_loop().run_in_executor(
@@ -4027,14 +4047,17 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                     posted_price = submit_price
                     logger.info(f"{tag} modify accepted — new ad price {posted_price}")
                 elif code == 90043 and _can_modify_slot(sess, slot_idx):
-                    # Self-duplicate — this ad's own new price rounds to
-                    # what's already live (can happen if the market barely
-                    # moved since the last successful post). Reactive, single
-                    # nudge by the real gap; see the note in
-                    # _resolve_price_collision for why this is handled here
-                    # instead of preventatively.
-                    nudged = (submit_price - gap).quantize(_quant, rounding=ROUND_HALF_UP)
-                    logger.info(f"{tag} modify got 90043 (self-duplicate) — retrying at {nudged}")
+                    # Rejected — either a genuine self-duplicate (market
+                    # barely moved) or this ad's price landed on a sibling
+                    # ad's. Reactive, single retry, stepped down from the
+                    # SAME natural price by this slot's gap multiplier
+                    # (Ad 1/2 → 1x gap, Ad 3 → 2x gap) — never a preemptive
+                    # nudge, never cascaded from another ad's own retry.
+                    multiplier = _ad_rejection_nudge_multiplier(slot_idx)
+                    nudged = (new_p - multiplier * gap).quantize(_quant, rounding=ROUND_HALF_UP)
+                    collided_with = [f"a rejected duplicate/sibling price ({multiplier}x gap nudge)"]
+                    natural_before_collision = new_p
+                    logger.info(f"{tag} modify got 90043 — retrying at {nudged} ({multiplier}x gap below natural price)")
                     _record_modify_slot(sess, slot_idx)
                     nudge_result = await asyncio.get_event_loop().run_in_executor(
                         _ad_executor, modify_ad, s["ad_id"], str(nudged), ad_data, creds
@@ -4131,35 +4154,42 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                     if not _can_modify_slot(sess, slot_idx):
                         logger.info(f"{tag} skipped — have a known unposted ceiling {actionable_ceiling} but no budget yet")
                         return
-                    # Same collision guard the scheduled cycle uses — with fast-
-                    # chase now running on Ad 2/3 too, two ads on the same pair
-                    # could otherwise land on the same discovered ceiling at
-                    # nearly the same moment and one of them gets rejected.
-                    natural_before_collision = actionable_ceiling
-                    resolved_ceiling, collided_with = _resolve_price_collision(sess, slot_idx, currency, token, actionable_ceiling)
-                    logger.info(f"{tag} retrying known ceiling {resolved_ceiling} directly (1 call, no re-probe)")
+                    # No preemptive sibling-collision nudge — post the known
+                    # ceiling exactly as discovered.
+                    logger.info(f"{tag} retrying known ceiling {actionable_ceiling} directly (1 call, no re-probe)")
                     _record_modify_slot(sess, slot_idx)
                     retry_result = await asyncio.get_event_loop().run_in_executor(
-                        _ad_executor, modify_ad, s["ad_id"], str(resolved_ceiling), ad_data, creds
+                        _ad_executor, modify_ad, s["ad_id"], str(actionable_ceiling), ad_data, creds
                     )
                     retry_code = retry_result.get("retCode", retry_result.get("ret_code", -1))
                     if retry_code == 0:
-                        posted_price = resolved_ceiling
+                        posted_price = actionable_ceiling
                         logger.info(f"{tag} pending ceiling post accepted — new ad price {posted_price}")
-                    elif retry_code == 90043:
-                        # Bybit is telling us, literally, that this price
-                        # "differs from your existing ad by less than 0%" —
-                        # i.e. it's ALREADY live. Our tracked cur_p disagreed
-                        # (that's WHY we thought this was worth posting), so
-                        # cur_p had fallen out of sync with reality — most
-                        # likely an earlier attempt actually succeeded on
-                        # Bybit's side but wasn't recorded here (a timeout or
-                        # ambiguous response). Trust Bybit's own statement and
-                        # sync our state to it now, rather than leaving cur_p
-                        # stale and retrying this exact same doomed post every
-                        # cycle from now on.
-                        _set_ad_current_price(sess, slot_idx, resolved_ceiling)
-                        logger.info(f"{tag} ceiling retry got 90043 — Bybit confirms {resolved_ceiling} is already live, syncing tracked price to match")
+                    elif retry_code == 90043 and _can_modify_slot(sess, slot_idx):
+                        # Could genuinely already be live, or this ad landed
+                        # on a SIBLING ad's price. Try one reactive retry,
+                        # scaled by ad slot (Ad 1/2 → 1x gap, Ad 3 → 2x gap),
+                        # before assuming it's already live.
+                        multiplier     = _ad_rejection_nudge_multiplier(slot_idx)
+                        nudged_ceiling = (actionable_ceiling - multiplier * gap).quantize(_quant, rounding=ROUND_HALF_UP)
+                        _record_modify_slot(sess, slot_idx)
+                        nudge_retry = await asyncio.get_event_loop().run_in_executor(
+                            _ad_executor, modify_ad, s["ad_id"], str(nudged_ceiling), ad_data, creds
+                        )
+                        if nudge_retry.get("retCode", nudge_retry.get("ret_code", -1)) == 0:
+                            posted_price = nudged_ceiling
+                            collided_with = [f"a rejected duplicate/sibling ceiling ({multiplier}x gap nudge)"]
+                            natural_before_collision = actionable_ceiling
+                            logger.info(f"{tag} ceiling nudge retry accepted — new ad price {posted_price}")
+                        else:
+                            # Bybit is telling us, literally, that this price
+                            # "differs from your existing ad by less than 0%"
+                            # even after stepping away from any sibling —
+                            # trust it and sync our tracked state to match,
+                            # rather than retrying this exact doomed post
+                            # every cycle from now on.
+                            _set_ad_current_price(sess, slot_idx, actionable_ceiling)
+                            logger.info(f"{tag} ceiling retry got 90043 twice — Bybit confirms {actionable_ceiling} is already live, syncing tracked price to match")
                     else:
                         # Still couldn't post it (budget/collision/transient) —
                         # remember it so the next check retries directly again.
@@ -4212,13 +4242,10 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                             _set_ceiling_ref(sess, slot_idx, candidate)
                             logger.info(f"{tag} discovered boundary={candidate} vs current={cur_p} threshold={gap}")
                             if candidate - cur_p >= gap and _can_modify_slot(sess, slot_idx):
-                                # Same collision guard as above — with 2+ ads on
-                                # the same pair fast-chasing independently, the
-                                # discovered boundary can coincide with another
-                                # ad's live price even though it clears the gap
-                                # against THIS ad's own last price.
-                                natural_before_collision = candidate
-                                post_candidate, collided_with = _resolve_price_collision(sess, slot_idx, currency, token, candidate)
+                                # No preemptive sibling-collision nudge — post
+                                # the discovered boundary exactly as Bybit
+                                # reported it.
+                                post_candidate = candidate
                                 _record_modify_slot(sess, slot_idx)
                                 retry_result = await asyncio.get_event_loop().run_in_executor(
                                     _ad_executor, modify_ad, s["ad_id"], str(post_candidate), ad_data, creds
@@ -4228,12 +4255,20 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                                     posted_price = post_candidate
                                     logger.info(f"{tag} boundary post accepted — new ad price {posted_price}")
                                 elif retry_code == 90043 and _can_modify_slot(sess, slot_idx):
-                                    # Discovered boundary matches what's live after all —
-                                    # nudge once. Still gated by the same "is it actually
-                                    # an improvement" check so this can't sneak in a
-                                    # downgrade either.
-                                    nudged = (post_candidate - gap).quantize(_quant, rounding=ROUND_HALF_UP)
+                                    # Rejected — either genuinely unchanged, or
+                                    # this ad's boundary landed on a sibling
+                                    # ad's price. Reactive, single retry,
+                                    # scaled by ad slot (Ad 1/2 → 1x gap,
+                                    # Ad 3 → 2x gap), stepped down from the
+                                    # SAME discovered boundary — never
+                                    # preemptive. Still gated by the same "is
+                                    # it actually an improvement" check so
+                                    # this can't sneak in a downgrade either.
+                                    multiplier = _ad_rejection_nudge_multiplier(slot_idx)
+                                    nudged = (post_candidate - multiplier * gap).quantize(_quant, rounding=ROUND_HALF_UP)
                                     if nudged - cur_p >= gap:
+                                        collided_with = [f"a rejected duplicate/sibling boundary ({multiplier}x gap nudge)"]
+                                        natural_before_collision = post_candidate
                                         _record_modify_slot(sess, slot_idx)
                                         nudge_result = await asyncio.get_event_loop().run_in_executor(
                                             _ad_executor, modify_ad, s["ad_id"], str(nudged), ad_data, creds
@@ -4408,16 +4443,14 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                     ad_data.get("currencyId",""), ad_data.get("tokenId",""), float_pct
                 )
 
-            # ── Same-float multi-ad support: same % is allowed across ads on
-            # the same pair now — this nudges the actual PRICE apart instead,
-            # only when another active ad on the identical pair would
-            # otherwise land within the minimum gap. ──
-            if sess.total_ad_slots() > 1:
-                new_p, _cycle_collided = _resolve_price_collision(
-                    sess, slot_idx,
-                    ad_data.get("currencyId",""), ad_data.get("tokenId",""),
-                    new_p
-                )
+            # ── Same-float multi-ad support: same % (and the same computed
+            # price) is allowed across ads on the same pair now. Every ad
+            # slot always attempts this SAME natural price FIRST — zero
+            # preemptive deduction, for Ad 1, 2, or 3. If Bybit actually
+            # rejects a sibling's post because it lands too close to
+            # another of this user's ads, that's handled reactively, once,
+            # in the 90043 branch below via _ad_rejection_nudge_multiplier —
+            # never nudged in advance based on a sibling's last-known price. ──
             new_p_str = str(new_p.quantize(_quant, rounding=ROUND_HALF_UP))
 
             # ── Live-ceiling chase (max floating %) ──
@@ -4502,18 +4535,10 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                             candidate = (bound_dec - margin) if was_too_high else (bound_dec + margin)
                             safe_rounding = ROUND_FLOOR if was_too_high else ROUND_CEILING
                             candidate     = candidate.quantize(_quant, rounding=safe_rounding)
-                        # Sibling-collision guard — Bybit's stated boundary is a
-                        # real market number, but with 2+ ads on the same pair
-                        # it can still land within another active ad's gap.
-                        # This loop used to post it straight to Bybit with no
-                        # check at all (fast-chase's equivalent path already
-                        # did this; the scheduled cycle didn't).
-                        if sess.total_ad_slots() > 1:
-                            candidate, _cycle_collided3 = _resolve_price_collision(
-                                sess, slot_idx,
-                                ad_data.get("currencyId",""), ad_data.get("tokenId",""),
-                                candidate
-                            )
+                        # No preemptive sibling-collision nudge here — Bybit's
+                        # stated boundary is posted as-is. If it happens to
+                        # collide with another of this user's ads, that comes
+                        # back as 90043 and is handled reactively below.
                         candidate_str = str(candidate)
                     elif last_code == 90043 and candidate is not None:
                         # Reactive recovery from an ACTUAL rejection — unlike
@@ -4575,56 +4600,28 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
 
             elif ret_code == 90043:
                 # "The price of this P2P ad differs from your existing ad by
-                # less than 0%." — this fires when the computed price rounds
-                # to the SAME value the ad already has live on Bybit (happens
-                # when the underlying market barely moves between cycles, or
-                # when this ad hasn't changed since its last successful post).
-                # This is fully recoverable — nudge the price by this pair's
-                # real minimum gap and retry, instead of counting it as a
-                # failure.
+                # less than 0%." — this fires either when the computed price
+                # rounds to the SAME value THIS ad already has live (market
+                # barely moved since the last post), or — now that every ad
+                # slot on the same pair attempts the identical natural price
+                # with zero preemptive deduction — when this ad's post landed
+                # on top of a SIBLING ad's price instead.
                 #
-                # This used to double on every attempt (1x, then 2x, then
-                # 4x — up to 7x the gap across 3 attempts), which is what
-                # produced unexplained -6/-7/-10 swings instead of -3. A
-                # tiny epsilon nudge was tried in place of the real gap, but
-                # real Bybit responses showed that's too small to register
-                # as a genuine change at all — repeated $0.01 decrements
-                # (84789.161 → .15 → .14 → .13) still came back 90043 every
-                # time. So: flat, single gap per attempt — big enough to
-                # actually register, never compounding.
+                # Reactive-only, single retry: step down from the SAME
+                # natural price (new_p) by a flat multiple of this pair's
+                # minimum gap, based on which ad slot this is —
+                # Ad 1 → 1x gap, Ad 2 → 1x gap (e.g. -$3), Ad 3 → 2x gap
+                # (e.g. -$6). Never cascaded from another ad's own retry,
+                # never applied before this first rejection actually happened.
                 last_code, last_msg = ret_code, ret_msg
-                candidate = new_p
-                posted_price = None
-                for _attempt in range(3):
-                    if last_code == 90043:
-                        gap = get_min_price_gap(ad_data.get("currencyId",""), ad_data.get("tokenId",""), candidate)
-                        candidate = candidate - gap
-                        candidate = candidate.quantize(_quant, rounding=ROUND_HALF_UP)
-                    elif last_code == 912120022:
-                        min_str, max_str = _extract_bybit_bounds(last_msg)
-                        bound_str = max_str if max_str else min_str
-                        if not bound_str:
-                            break
-                        candidate = Decimal(bound_str)
-                    else:
-                        break   # a genuinely different error — stop retrying, fall through to failure handling
-
-                    # Sibling-collision guard — this loop previously posted
-                    # candidate straight to Bybit with no check against other
-                    # active ads on the same pair at all, unlike fast-chase's
-                    # equivalent paths. A self-duplicate recovery here could
-                    # land right on top of another ad's live price.
-                    if sess.total_ad_slots() > 1:
-                        candidate, _cycle_collided2 = _resolve_price_collision(
-                            sess, slot_idx,
-                            ad_data.get("currencyId",""), ad_data.get("tokenId",""),
-                            candidate
-                        )
-
-                    candidate_str = str(candidate)
-                    if not _can_modify_slot(sess, slot_idx):
-                        logger.warning(f"[{label}] Cycle {cycle} retry stopped for user {chat_id} — modify budget exhausted mid-retry")
-                        break
+                gap        = get_min_price_gap(ad_data.get("currencyId",""), ad_data.get("tokenId",""), new_p)
+                multiplier = _ad_rejection_nudge_multiplier(slot_idx)
+                candidate  = (new_p - multiplier * gap).quantize(_quant, rounding=ROUND_HALF_UP)
+                candidate_str = str(candidate)
+                posted_price  = None
+                if not _can_modify_slot(sess, slot_idx):
+                    logger.warning(f"[{label}] Cycle {cycle} retry skipped for user {chat_id} — modify budget exhausted")
+                else:
                     _record_modify_slot(sess, slot_idx)
                     retry_result = await asyncio.get_event_loop().run_in_executor(
                         _ad_executor, modify_ad, s["ad_id"], candidate_str, ad_data, creds
@@ -4633,9 +4630,6 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                     last_msg  = retry_result.get("retMsg",  retry_result.get("ret_msg","Unknown"))
                     if last_code == 0:
                         posted_price = candidate
-                        break
-                    if last_code not in (90043, 912120022):
-                        break
 
                 if posted_price is not None:
                     _reset_ad_failures(sess, slot_idx)
@@ -4643,7 +4637,8 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                     await bot.send_message(chat_id=chat_id,
                         text=(
                             f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n"
-                            f"⚠️ Price unchanged from last post — nudged\n"
+                            f"⚠️ <code>{new_p_str}</code> rejected (unchanged or matched a sibling ad) — "
+                            f"retried {multiplier}x gap lower\n"
                             f"💲 <code>{posted_price}</code> ({mode.upper()})"
                         ),
                         parse_mode="HTML")
