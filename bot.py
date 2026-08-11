@@ -495,18 +495,26 @@ def _resolve_price_collision(sess, slot_idx: int, currency_id: str, token_id: st
     too close to two different ads still clears both) without ever
     touching the same conflict twice.
 
-    IMPORTANT — the self-conflict ("its own last posted price") uses a
-    tiny epsilon, NOT the full inter-ad gap. Bybit's 90043 rejection
-    ("price differs from your existing ad by less than 0%") only fires on
-    an EXACT duplicate — it has nothing to do with staying $3/₦5,000 away
-    from your own old price, that requirement only applies BETWEEN
-    different ads. Treating the self-check with the full gap used to
-    stack an extra, unearned full-gap deduction on top of any real ad-vs-
-    ad collision (natural price clears Ad 2's gap fine, but then lands
-    close enough to this ad's OWN prior price — itself only ever gap-
-    distant from Ad 2's PREVIOUS price — to trip a second full
-    deduction), which is what produced $6/$9 nudges for what was really
-    only ever one $3 collision.
+    IMPORTANT — self-duplicates are NOT handled here. See the note below,
+    just above the conflicts list, for why: it's handled reactively by
+    each call site instead, using the real gap, not preventatively here.
+
+    IMPORTANT — for any ad OTHER than Ad 1 (slot_idx != -1) that shares
+    its pair with at least one other active ad, the final resolved price
+    is additionally floored to a whole currency unit (no cents/decimals).
+    This is a deliberate robustness margin, not a mathematical necessity:
+    Bybit's own discovered-boundary numbers (from a 912120022 response)
+    always carry several decimal places (e.g. 84784.161), and real-world
+    testing showed its duplicate-price check (90043) doesn't always behave
+    the way a flat $gap subtraction would predict when working with those
+    decimal-heavy numbers. Rounding every NON-Ad-1 ad on a shared pair
+    down to a clean whole number sidesteps that ambiguity entirely — it's
+    trivially, unmistakably different from both a sibling's decimal-heavy
+    price and Bybit's own boundary string, at the cost of at most $1 (or
+    1 currency unit) of otherwise-available price. Ad 1 is left
+    untouched — it's the one establishing/tracking the real boundary, and
+    rounding it down would throw away real, verified ceiling headroom for
+    no benefit.
     """
     gap = get_min_price_gap(currency_id, token_id, natural_price)
     conflicts = []   # list of (price, label, required_gap)
@@ -522,6 +530,7 @@ def _resolve_price_collision(sess, slot_idx: int, currency_id: str, token_id: st
         other_price = _ad_current_price(sess, i)
         if other_price and other_price > 0:
             conflicts.append((other_price, _ad_slot_label(i), gap))
+    has_sibling_on_pair = len(conflicts) > 0
 
     # NOTE — deliberately no "own last posted price" entry here anymore.
     # An earlier version preventatively avoided this ad's own tracked price
@@ -558,6 +567,18 @@ def _resolve_price_collision(sess, slot_idx: int, currency_id: str, token_id: st
                 price = candidate
             if label not in collided_with:
                 collided_with.append(label)
+
+    if slot_idx != -1 and has_sibling_on_pair:
+        # Round-figure safety margin for Ad 2/3 — see docstring above.
+        # ROUND_FLOOR only: never round UP, that could push the price back
+        # into (or past) a conflict we just resolved away from, or above a
+        # ceiling this ad has no confirmed right to.
+        floored = price.quantize(Decimal("1"), rounding=ROUND_FLOOR)
+        if floored != price:
+            price = floored
+            if "rounded to a whole number" not in collided_with:
+                collided_with.append("rounded to a whole number")
+
     return price, collided_with
 
 
@@ -6050,6 +6071,24 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 "⚠️ <b>Cannot update while monitoring is active</b>\n\n"
                 f"<b>{' and '.join(_active2)}</b> is currently running.\n\n"
                 "Stop your active monitors first before updating ad price.",
+                InlineKeyboardMarkup(back_section("section_ads"))
+            )
+            return
+        # ── Conflict guard: block manual update while THIS ad's own
+        # auto-update loop is running. This used to be missing entirely —
+        # a single-ad user (the only case this button is reachable for)
+        # could tap "Update Once Now" while auto-update was already live,
+        # and both would call modify_ad for the same ad_id at the same
+        # time. Two concurrent submissions racing is exactly the kind of
+        # thing that can leave the bot's tracked current_price out of sync
+        # with whatever Bybit actually ends up keeping — whichever call
+        # happens to finish LAST wins the local state, regardless of which
+        # one actually reflects the newer price.
+        if _ad_running(_s(tuser.id), -1):
+            await edit_menu(query,
+                "⚠️ <b>Cannot update while Auto-Update is running</b>\n\n"
+                "Ad 1's auto-update loop is already live and posting prices on its own.\n\n"
+                "Stop it first before using Update Once Now.",
                 InlineKeyboardMarkup(back_section("section_ads"))
             )
             return
