@@ -203,6 +203,38 @@ def _set_pending_ceiling(sess, slot_idx: int, value):
         sess.pending_ceiling_by_slot = store
     store[slot_idx] = value
 
+# ─────────────────────────────────────────────────────────────────────────
+# Cycle-restart-on-fast-chase (floating mode only)
+# ─────────────────────────────────────────────────────────────────────────
+# Bybit resets its own "5 min to auto-offline" countdown on a USD/NGN ad
+# every time the ad is successfully modified — not just on the bot's own
+# scheduled cycle. So whenever fast-chase pushes a price up between
+# scheduled cycles, the bot's own next-scheduled-cycle timer for THAT slot
+# should restart too, the same way Bybit's real countdown just did —
+# otherwise the bot's schedule silently drifts out of sync with what
+# Bybit is actually counting down, and a scheduled cycle can fire only a
+# couple of minutes after a fast-chase post instead of a full interval
+# later.
+#
+# Tracked PER SLOT (Ad 1/2/3 each have their own independent Bybit-side
+# countdown, same convention as the modify budget / ceiling ref above) and
+# uses the asyncio loop's own monotonic clock — the same clock
+# auto_update_loop already schedules its waits against — so there's no
+# wall-clock/monotonic-clock mismatch between the two tasks.
+def _last_fast_modify_ts(sess, slot_idx: int):
+    """Loop-clock timestamp of this slot's last successful fast-chase
+    post, or None if fast-chase hasn't posted anything for it yet since
+    this loop iteration's wait phase began watching."""
+    return getattr(sess, "last_fast_modify_ts_by_slot", {}).get(slot_idx)
+
+def _touch_last_fast_modify(sess, slot_idx: int):
+    store = getattr(sess, "last_fast_modify_ts_by_slot", None)
+    if store is None:
+        store = {}
+        sess.last_fast_modify_ts_by_slot = store
+    store[slot_idx] = asyncio.get_event_loop().time()
+
+
 def _set_ad_current_price(sess, slot_idx: int, price):
     slot_idx = _valid_slot(sess, slot_idx)
     if slot_idx == -1:
@@ -4261,6 +4293,11 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
 
             if posted_price is not None:
                 _set_ad_current_price(sess, slot_idx, posted_price)
+                # A real, confirmed modify just happened for this slot — this
+                # is what Bybit itself would restart its own 5-min countdown
+                # on. Mirror that by restarting this slot's own scheduled-
+                # cycle timer too (see auto_update_loop's wait phase).
+                _touch_last_fast_modify(sess, slot_idx)
                 now   = datetime.now().strftime("%H:%M:%S")
                 label = _ad_slot_label(slot_idx)
                 if collided_with:
@@ -4683,10 +4720,34 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
             # waits for the next scheduled cycle, scheduled off the
             # monotonic clock so a slow iteration can only ever delay
             # itself, never stack up and stall later checks.
+            #
+            # ── Cycle-restart-on-fast-chase (floating mode only) ───────────
+            # Bybit resets its own 5-min countdown-to-offline on THIS ad
+            # every time it's actually modified — including a fast-chase
+            # post that lands between scheduled cycles, not just this
+            # loop's own scheduled posts. So while waiting, watch this
+            # slot's last-fast-modify timestamp: every time fast-chase
+            # posts a real update here, push wait_until out a full fresh
+            # interval from that moment, exactly mirroring what Bybit's
+            # own countdown just did. No cap — if the market keeps moving
+            # every few seconds, this keeps restarting indefinitely, same
+            # as Bybit's real countdown would. Fixed-mode ads never touch
+            # last_fast_modify_ts_by_slot (fast-chase skips them entirely),
+            # so this is a no-op for them and behaves exactly as before.
             loop_clock = asyncio.get_event_loop()
             wait_until = loop_clock.time() + interval * 60
+            _seen_fast_modify_ts = _last_fast_modify_ts(sess, slot_idx) if mode == "floating" else None
             while _ad_running(sess, slot_idx) and loop_clock.time() < wait_until:
                 await asyncio.sleep(1)
+                if mode == "floating":
+                    _fc_ts = _last_fast_modify_ts(sess, slot_idx)
+                    if _fc_ts is not None and _fc_ts != _seen_fast_modify_ts:
+                        _seen_fast_modify_ts = _fc_ts
+                        wait_until = _fc_ts + interval * 60
+                        logger.info(
+                            f"[{label}] Fast-chase modified price during wait for user {chat_id} — "
+                            f"cycle timer restarted, next scheduled cycle now ~{interval}min from that post"
+                        )
         except asyncio.CancelledError:
             logger.info(f"[{label}] Auto-update task cancelled for user {chat_id}")
             raise
