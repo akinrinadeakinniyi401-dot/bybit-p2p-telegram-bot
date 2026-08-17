@@ -293,12 +293,20 @@ _FAST_CHASE_WINDOW_SECS  = 300
 _BUDGET_COOLDOWN = "BUDGET_COOLDOWN"
 
 # How often the fast-chase price check runs while waiting out the rest of
-# the scheduled interval. Was implicitly 10s (tick counter % 10). Dropped
-# to 8s for faster reaction to price moves — this only affects how often
-# we CHECK, not how many edits we're allowed (still capped by
+# the scheduled interval. Was implicitly 10s (tick counter % 10), then 8s.
+# Dropped to 5s for faster reaction to price moves — this only affects how
+# often we CHECK, not how many edits we're allowed (still capped by
 # _FAST_CHASE_BUDGET/_FAST_CHASE_WINDOW_SECS above, shared with the
 # scheduled cycle, so the 8-edits-per-5-minutes ceiling is unchanged).
-_FAST_CHASE_POLL_SECS    = 8
+# Safe at current scale: this poll only drives calls to Bybit's PUBLIC,
+# unauthenticated price endpoint (get_token_usdt_price), shared by IP
+# across all users, limited to 600 req/5s (120 req/s) there. Worst case
+# today — under 20 users, all 3 ad slots each, all floating — is ~60
+# requests per tick, i.e. ~12 req/s at 5s polling: comfortably inside the
+# limit even accounting for ticks landing in sync across users (bursty
+# rather than smoothed). Re-check this math before dropping it further or
+# if concurrent active floating ad slots grow well past ~100-150.
+_FAST_CHASE_POLL_SECS    = 5
 
 # ─────────────────────────────────────────────────────────────────────────
 # Shared per-user fast-chase coordinator
@@ -453,15 +461,15 @@ def _fast_chase_lock(sess, slot_idx: int) -> asyncio.Lock:
 # (used everywhere else — collision avoidance between ads, retry nudges)
 # because that gap is sized to keep ads safely apart, not to decide
 # "was this worth an early post". BTC/ETH move in much smaller increments
-# than a $3/₦5,000 swing most 10-second windows, so using the same gap
+# than a $1/₦1,500 swing most 10-second windows, so using the same gap
 # here meant fast-chase rarely found a move big enough to act on. Only
 # applies inside _try_fast_chase — the scheduled cycle and multi-ad
 # collision logic are untouched.
 _FAST_CHASE_GAP_OVERRIDE = {
-    ("NGN", "BTC"): Decimal("5000"),
-    ("NGN", "ETH"): Decimal("5000"),
-    ("USD", "BTC"): Decimal("3"),
-    ("USD", "ETH"): Decimal("3"),
+    ("NGN", "BTC"): Decimal("1500"),
+    ("NGN", "ETH"): Decimal("1500"),
+    ("USD", "BTC"): Decimal("1"),
+    ("USD", "ETH"): Decimal("1"),
 }
 
 def _fast_chase_gap(currency_id: str, token_id: str, reference_price=None) -> Decimal:
