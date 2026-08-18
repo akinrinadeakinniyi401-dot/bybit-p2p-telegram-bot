@@ -235,6 +235,43 @@ def _touch_last_fast_modify(sess, slot_idx: int):
     store[slot_idx] = asyncio.get_event_loop().time()
 
 
+async def _resync_price_from_bybit(ad_id: str, creds: dict, sess, slot_idx: int, fallback_price, tag: str):
+    """
+    A 90043 rejection ("price differs from your existing ad by less than
+    0%") only tells us the price we just tried was too close to what's
+    live — it does NOT confirm our guess IS what's live. The old recovery
+    here just assumed the rejected submission was now the real price and
+    wrote it straight into the tracked state. At the old $3/₦5,000 gaps
+    that assumption was usually close enough not to matter; at tighter
+    thresholds a wrong guess drifts the tracked price away from Bybit's
+    actual value, and every later decision compounds the error — this is
+    exactly what produced the Ad 2/Ad 3 stall in production logs (endless
+    90043s, never an accepted modify, while Ad 1 kept succeeding).
+
+    So instead of guessing, ask Bybit directly via get_ad_details — one
+    extra read call, only on the rejection path (never on every poll),
+    cheap insurance against that whole class of bug. Falls back to the
+    old guess only if the lookup itself fails, so a transient API error
+    doesn't leave the tracked price stale forever.
+    """
+    try:
+        details = await asyncio.get_event_loop().run_in_executor(
+            _ad_executor, partial(get_ad_details, ad_id, creds=creds)
+        )
+        if details.get("retCode", details.get("ret_code", -1)) == 0:
+            real_price = details.get("result", {}).get("price")
+            if real_price not in (None, ""):
+                real_price = Decimal(str(real_price))
+                _set_ad_current_price(sess, slot_idx, real_price)
+                logger.info(f"{tag} confirmed real live price from Bybit directly: {real_price}")
+                return real_price
+    except Exception as e:
+        logger.warning(f"{tag} get_ad_details lookup failed during 90043 resync — {e}")
+    _set_ad_current_price(sess, slot_idx, fallback_price)
+    logger.warning(f"{tag} get_ad_details lookup unavailable — falling back to guess-sync at {fallback_price}")
+    return fallback_price
+
+
 def _set_ad_current_price(sess, slot_idx: int, price):
     slot_idx = _valid_slot(sess, slot_idx)
     if slot_idx == -1:
@@ -4069,11 +4106,18 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                 elif code == 90043 and _can_modify_slot(sess, slot_idx):
                     # Self-duplicate — this ad's own new price rounds to
                     # what's already live (can happen if the market barely
-                    # moved since the last successful post). Reactive, single
-                    # nudge by the real gap; see the note in
-                    # _resolve_price_collision for why this is handled here
-                    # instead of preventatively.
-                    nudged = (submit_price - gap).quantize(_quant, rounding=ROUND_HALF_UP)
+                    # moved since the last successful post). Nudge by the
+                    # REAL minimum gap Bybit actually enforces (get_min_price_gap
+                    # — $5/₦7,000, confirmed by manual testing), NOT `gap`
+                    # (the $1/₦1,500 fast-chase reaction threshold used just
+                    # above). Those answer different questions — "was this
+                    # market move worth trying" vs "how far do I actually
+                    # have to move to stop looking like a duplicate to
+                    # Bybit" — and nudging by the tiny reaction threshold
+                    # here was just retrying a value barely different from
+                    # the one that already got rejected.
+                    real_gap = get_min_price_gap(currency, token, submit_price)
+                    nudged = (submit_price - real_gap).quantize(_quant, rounding=ROUND_HALF_UP)
                     logger.info(f"{tag} modify got 90043 (self-duplicate) — retrying at {nudged}")
                     _record_modify_slot(sess, slot_idx)
                     nudge_result = await asyncio.get_event_loop().run_in_executor(
@@ -4088,6 +4132,8 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                             f"{nudge_result.get('retCode', nudge_result.get('ret_code', -1))} "
                             f"msg={nudge_result.get('retMsg', nudge_result.get('ret_msg',''))!r}"
                         )
+                        if nudge_result.get("retCode", nudge_result.get("ret_code", -1)) == 90043:
+                            await _resync_price_from_bybit(s["ad_id"], creds, sess, slot_idx, nudged, tag)
                 else:
                     logger.warning(
                         f"{tag} modify rejected — code={code} "
@@ -4187,19 +4233,17 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                         posted_price = resolved_ceiling
                         logger.info(f"{tag} pending ceiling post accepted — new ad price {posted_price}")
                     elif retry_code == 90043:
-                        # Bybit is telling us, literally, that this price
-                        # "differs from your existing ad by less than 0%" —
-                        # i.e. it's ALREADY live. Our tracked cur_p disagreed
+                        # Bybit says this price "differs from your existing
+                        # ad by less than 0%" — our tracked cur_p disagreed
                         # (that's WHY we thought this was worth posting), so
-                        # cur_p had fallen out of sync with reality — most
-                        # likely an earlier attempt actually succeeded on
-                        # Bybit's side but wasn't recorded here (a timeout or
-                        # ambiguous response). Trust Bybit's own statement and
-                        # sync our state to it now, rather than leaving cur_p
-                        # stale and retrying this exact same doomed post every
-                        # cycle from now on.
-                        _set_ad_current_price(sess, slot_idx, resolved_ceiling)
-                        logger.info(f"{tag} ceiling retry got 90043 — Bybit confirms {resolved_ceiling} is already live, syncing tracked price to match")
+                        # it's fallen out of sync with reality. But the
+                        # rejection alone doesn't PROVE resolved_ceiling is
+                        # what's actually live — ask Bybit directly instead
+                        # of guessing (see _resync_price_from_bybit; this is
+                        # the exact spot that produced the Ad 2/Ad 3 stall —
+                        # repeated 90043s while the tracked price silently
+                        # drifted from a chain of unconfirmed guesses).
+                        await _resync_price_from_bybit(s["ad_id"], creds, sess, slot_idx, resolved_ceiling, tag)
                     else:
                         # Still couldn't post it (budget/collision/transient) —
                         # remember it so the next check retries directly again.
@@ -4269,18 +4313,28 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                                     logger.info(f"{tag} boundary post accepted — new ad price {posted_price}")
                                 elif retry_code == 90043 and _can_modify_slot(sess, slot_idx):
                                     # Discovered boundary matches what's live after all —
-                                    # nudge once. Still gated by the same "is it actually
-                                    # an improvement" check so this can't sneak in a
-                                    # downgrade either.
-                                    nudged = (post_candidate - gap).quantize(_quant, rounding=ROUND_HALF_UP)
+                                    # nudge once, using the REAL minimum gap Bybit
+                                    # enforces (get_min_price_gap — $5/₦7,000), not
+                                    # `gap` (the $1/₦1,500 fast-chase reaction
+                                    # threshold) — same distinction as the
+                                    # plain-floating branch above. Still gated by
+                                    # the same "is it actually an improvement"
+                                    # check so this can't sneak in a downgrade.
+                                    real_gap = get_min_price_gap(currency, token, post_candidate)
+                                    nudged = (post_candidate - real_gap).quantize(_quant, rounding=ROUND_HALF_UP)
                                     if nudged - cur_p >= gap:
                                         _record_modify_slot(sess, slot_idx)
                                         nudge_result = await asyncio.get_event_loop().run_in_executor(
                                             _ad_executor, modify_ad, s["ad_id"], str(nudged), ad_data, creds
                                         )
-                                        if nudge_result.get("retCode", nudge_result.get("ret_code", -1)) == 0:
+                                        nudge_code = nudge_result.get("retCode", nudge_result.get("ret_code", -1))
+                                        if nudge_code == 0:
                                             posted_price = nudged
                                             logger.info(f"{tag} nudged post accepted — new ad price {posted_price}")
+                                        else:
+                                            logger.warning(f"{tag} nudged post also rejected — code={nudge_code}")
+                                            if nudge_code == 90043:
+                                                await _resync_price_from_bybit(s["ad_id"], creds, sess, slot_idx, nudged, tag)
                                 else:
                                     # Discovered a real improvement but couldn't post it
                                     # right now (out of budget, or a transient rejection).
