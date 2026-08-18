@@ -119,11 +119,17 @@ def currency_needs_ref(currency_id: str) -> bool:
 # close together. So instead of forcing distinct floats, the bot keeps
 # each ad's actual price at least this far apart, in the currency's own
 # units, adjusting automatically (see _resolve_price_collision in bot.py).
-# ₦5,000 default for NGN is a safety margin above the ₦4,465.23 gap a user
-# confirmed Bybit already accepts — tune per currency here if needed.
+# ₦7,000 / $5 confirmed via manual testing against Bybit directly (Aug
+# 2026) — the old ₦5,000/$3 gap is no longer accepted between two ads on
+# the same pair. With 3 ads on the same pair, Ad 2 sits gap below Ad 1,
+# and Ad 3's own collision check then finds it's still too close to Ad 2's
+# already-adjusted price and gets pushed a further gap below THAT — so
+# Ad 3 naturally lands at 2x gap below Ad 1 (₦14,000 / $10) without any
+# separate per-rank table, purely from _resolve_price_collision's
+# cascading single-pass resolution in bot.py.
 MIN_PRICE_GAP = {
-    "NGN": Decimal("5000"),
-    "USD": Decimal("3"),
+    "NGN": Decimal("7000"),
+    "USD": Decimal("5"),
     "GHS": Decimal("50"),
     "GBP": Decimal("50"),
     "EUR": Decimal("50"),
