@@ -203,6 +203,26 @@ def _set_pending_ceiling(sess, slot_idx: int, value):
         sess.pending_ceiling_by_slot = store
     store[slot_idx] = value
 
+def _last_ceiling_attempt(sess, slot_idx: int):
+    """The raw (pre-collision) ceiling value THIS slot last actually acted
+    on — attempted a post against, whether it succeeded, got nudged, or
+    was rejected. Used to tell "the raw ceiling genuinely moved higher
+    since last time" apart from "my own posted price sits below the raw
+    ceiling because collision-avoidance deliberately nudged it down" —
+    the two look identical if you only compare last_known vs cur_p, which
+    is what caused the endless-identical-repost bug: an ad nudged $10-17
+    below the true ceiling for collision reasons would see that same
+    static gap as "room to catch up" on EVERY poll forever, re-triggering
+    a retry that just re-posts the exact same number again and again."""
+    return getattr(sess, "last_ceiling_attempt_by_slot", {}).get(slot_idx)
+
+def _set_last_ceiling_attempt(sess, slot_idx: int, value):
+    store = getattr(sess, "last_ceiling_attempt_by_slot", None)
+    if store is None:
+        store = {}
+        sess.last_ceiling_attempt_by_slot = store
+    store[slot_idx] = value
+
 # ─────────────────────────────────────────────────────────────────────────
 # Cycle-restart-on-fast-chase (floating mode only)
 # ─────────────────────────────────────────────────────────────────────────
@@ -272,7 +292,7 @@ async def _resync_price_from_bybit(ad_id: str, creds: dict, sess, slot_idx: int,
     return fallback_price
 
 
-def _set_ad_current_price(sess, slot_idx: int, price):
+def _set_ad_current_price(sess, slot_idx: int, price, collision_adjusted: bool = False):
     slot_idx = _valid_slot(sess, slot_idx)
     if slot_idx == -1:
         sess.current_price = price
@@ -286,9 +306,21 @@ def _set_ad_current_price(sess, slot_idx: int, price):
     # against a stale number that no longer reflects what's actually live
     # on Bybit. Every confirmed price change, from ANY source, is new
     # information about reality and resets this baseline for that slot.
-    # Any earlier "pending" unposted discovery for this slot is superseded
-    # by this fresh confirmation too.
-    _set_ceiling_ref(sess, slot_idx, price)
+    #
+    # EXCEPTION — collision_adjusted=True: this price was deliberately
+    # nudged BELOW the real known ceiling to stay clear of a senior ad
+    # (Ad 2 under Ad 1, Ad 3 under Ad 1/2), so `price` here is NOT a fresh
+    # statement about where the true ceiling is — it's a intentionally
+    # lower number. Overwriting ceiling_ref down to it was the actual bug
+    # behind Ad 2/Ad 3 endlessly re-posting the exact same price every
+    # poll: next poll would see (true ceiling we just threw away) minus
+    # (the nudged price we kept) as if it were fresh room to catch up,
+    # when it was really just the static collision gap, forever re-
+    # triggering a retry that resolves to the same number every time.
+    # Leave the real discovered ceiling in place instead so future polls
+    # only re-trigger when it genuinely rises further.
+    if not collision_adjusted:
+        _set_ceiling_ref(sess, slot_idx, price)
     _set_pending_ceiling(sess, slot_idx, None)
 
 def _ad_slot_label(slot_idx: int) -> str:
@@ -589,6 +621,24 @@ def _resolve_price_collision(sess, slot_idx: int, currency_id: str, token_id: st
     conflicts = []   # list of (price, label, required_gap)
     for i in range(-1, len(sess.extra_ad_slots)):
         if i == slot_idx:
+            continue
+        # SENIORITY: only ever defer to a slot that's senior to this one —
+        # Ad 1 (-1) is senior to Ad 2 (0) and Ad 3 (1); Ad 2 is senior to
+        # Ad 3. Slot indices already sort this way (-1 < 0 < 1), so a plain
+        # i < slot_idx check IS the seniority check. Without this, Ad 1
+        # could get pushed DOWN below Ad 2/3's price — backwards, since
+        # Ad 1 is supposed to be free to hold the top of the market and
+        # everyone else steps around IT, never the other way.
+        if i > slot_idx:
+            continue
+        # ACTIVE ONLY: a slot that isn't actually running can still have
+        # cached ad_data + a stale current_price sitting in session state
+        # (e.g. it was configured once, then stopped, or never fully
+        # removed) — that's not a live competing ad, it's leftover memory.
+        # Treating it as a real conflict is exactly what caused "Ad 3"
+        # collisions to show up for users who only ever had Ad 1 and Ad 2
+        # actually running.
+        if not _ad_running(sess, i):
             continue
         other_ad_data = _ad_data_of(sess, i)
         if not other_ad_data:
@@ -4206,17 +4256,41 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                 if pending_ceiling is not None and pending_ceiling - cur_p >= gap:
                     actionable_ceiling = pending_ceiling
                 elif last_known is not None and last_known - cur_p >= gap:
-                    actionable_ceiling = last_known
-                    logger.info(
-                        f"{tag} chase-ceiling | live price {cur_p} has room to catch up to the last "
-                        f"confirmed ceiling {last_known} (diff={last_known - cur_p} >= {gap}) — "
-                        f"retrying it directly instead of waiting on fresh spot movement"
-                    )
+                    _prior_attempt = _last_ceiling_attempt(sess, slot_idx)
+                    if _prior_attempt is not None and last_known <= _prior_attempt:
+                        # Already tried this exact raw ceiling before. With
+                        # _set_ad_current_price now leaving ceiling_ref alone
+                        # on a collision-adjusted post, last_known correctly
+                        # keeps holding the TRUE higher ceiling instead of
+                        # getting dragged down to this ad's own nudged
+                        # price — but that means last_known - cur_p is now
+                        # PERMANENTLY >= gap for any ad sitting below a
+                        # senior sibling by design, not just when the market
+                        # actually moves. Without this check that reads as
+                        # "fresh room to catch up" on every single poll
+                        # forever, endlessly re-posting the exact same
+                        # number — which is exactly the repeated-identical-
+                        # price bug seen in production. Only act again once
+                        # the raw ceiling itself has genuinely risen past
+                        # what we already tried.
+                        logger.info(
+                            f"{tag} chase-ceiling | {last_known - cur_p} below known ceiling {last_known}, "
+                            f"but that's this ad's own collision-avoidance gap (already tried {last_known}) "
+                            f"— not fresh movement, skipping until it rises further"
+                        )
+                    else:
+                        actionable_ceiling = last_known
+                        logger.info(
+                            f"{tag} chase-ceiling | live price {cur_p} has room to catch up to the last "
+                            f"confirmed ceiling {last_known} (diff={last_known - cur_p} >= {gap}) — "
+                            f"retrying it directly instead of waiting on fresh spot movement"
+                        )
 
                 if actionable_ceiling is not None:
                     if not _can_modify_slot(sess, slot_idx):
                         logger.info(f"{tag} skipped — have a known unposted ceiling {actionable_ceiling} but no budget yet")
                         return
+                    _set_last_ceiling_attempt(sess, slot_idx, actionable_ceiling)
                     # Same collision guard the scheduled cycle uses — with fast-
                     # chase now running on Ad 2/3 too, two ads on the same pair
                     # could otherwise land on the same discovered ceiling at
@@ -4302,6 +4376,7 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                                 # ad's live price even though it clears the gap
                                 # against THIS ad's own last price.
                                 natural_before_collision = candidate
+                                _set_last_ceiling_attempt(sess, slot_idx, candidate)
                                 post_candidate, collided_with = _resolve_price_collision(sess, slot_idx, currency, token, candidate)
                                 _record_modify_slot(sess, slot_idx)
                                 retry_result = await asyncio.get_event_loop().run_in_executor(
@@ -4354,7 +4429,7 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                         logger.warning(f"{tag} probe returned an unexpected code={last_code} msg={last_msg!r}")
 
             if posted_price is not None:
-                _set_ad_current_price(sess, slot_idx, posted_price)
+                _set_ad_current_price(sess, slot_idx, posted_price, collision_adjusted=bool(collided_with))
                 # A real, confirmed modify just happened for this slot — this
                 # is what Bybit itself would restart its own 5-min countdown
                 # on. Mirror that by restarting this slot's own scheduled-
