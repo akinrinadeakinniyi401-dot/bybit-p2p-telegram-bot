@@ -423,6 +423,24 @@ async def _fast_chase_coordinator(bot, chat_id):
         while True:
             any_running = False
             for slot_idx in (-1, 0, 1):
+                # Only ever look at a slot index that actually exists.
+                # _ad_running/_ad_settings/_ad_data_of all route through
+                # _valid_slot(), which — for a DIFFERENT, legitimate reason
+                # (gracefully handling a stale UI reference to a slot that
+                # was just removed) — silently CLAMPS an out-of-range index
+                # back down to -1 (Ad 1) rather than signalling "doesn't
+                # exist". That's fine for a one-off UI lookup, but here it
+                # meant a user with only Ad 1 + Ad 2 running still had
+                # slot_idx=1 ("Ad 3") checked every tick, silently aliased
+                # to Ad 1's own settings/ad_id/running-flag — so the
+                # coordinator ran a SECOND, fully independent fast-chase
+                # process against Ad 1's own physical ad, mislabeled "Ad 3",
+                # each treating the other as a sibling to dodge. That's what
+                # was crashing Ad 1's price against itself. A slot index
+                # only really exists if it's -1 (always) or strictly less
+                # than how many extra slots this user has actually added.
+                if slot_idx != -1 and slot_idx >= len(sess.extra_ad_slots):
+                    continue
                 if not _ad_running(sess, slot_idx):
                     continue
                 any_running = True
