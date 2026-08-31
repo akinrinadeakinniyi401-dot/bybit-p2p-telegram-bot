@@ -39,14 +39,15 @@ BASE_URL = "https://api.bybit.com"
 # IPs (Bybit caps the whitelist at 100 entries; Render's shared ranges are
 # ~500+ possible IPs — no combination of "which ones to list" solves that
 # math). The fix is routing Bybit traffic through ONE small box you
-# control with its own fixed IP (e.g. a $3.50/mo Vultr instance running a
+# control with its own fixed IP (e.g. a small Vultr instance running a
 # lightweight forward proxy) — Bybit only ever sees THAT IP, forever,
 # regardless of what Render's IP does.
 #
 # Set BYBIT_PROXY_URL as an env var once that box exists, e.g.:
 #   BYBIT_PROXY_URL=http://youruser:yourpass@203.0.113.5:8888
-# Every request below then routes through it automatically. Leave it unset
-# and nothing changes — this is a complete no-op until configured.
+# Every authenticated request below then routes through it automatically.
+# Leave it unset and nothing changes — this is a complete no-op until
+# configured.
 _BYBIT_PROXY_URL = os.getenv("BYBIT_PROXY_URL", "").strip()
 PROXIES = {"http": _BYBIT_PROXY_URL, "https": _BYBIT_PROXY_URL} if _BYBIT_PROXY_URL else None
 
