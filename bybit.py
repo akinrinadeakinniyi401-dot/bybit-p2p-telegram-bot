@@ -22,12 +22,33 @@ import requests
 import json
 import logging
 import uuid
+import os
 from decimal import Decimal
 from config import BYBIT_ACCOUNTS
 
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://api.bybit.com"
+
+# ─────────────────────────────────────────────────────────────────────────
+# Fixed-IP relay (optional)
+# ─────────────────────────────────────────────────────────────────────────
+# Render (and most PaaS platforms) don't give you a static outbound IP on
+# the base plan — egress comes from a shared, rotating pool, which breaks
+# Bybit's IP whitelist every time it rotates. The fix isn't listing more
+# IPs (Bybit caps the whitelist at 100 entries; Render's shared ranges are
+# ~500+ possible IPs — no combination of "which ones to list" solves that
+# math). The fix is routing Bybit traffic through ONE small box you
+# control with its own fixed IP (e.g. a $3.50/mo Vultr instance running a
+# lightweight forward proxy) — Bybit only ever sees THAT IP, forever,
+# regardless of what Render's IP does.
+#
+# Set BYBIT_PROXY_URL as an env var once that box exists, e.g.:
+#   BYBIT_PROXY_URL=http://youruser:yourpass@203.0.113.5:8888
+# Every request below then routes through it automatically. Leave it unset
+# and nothing changes — this is a complete no-op until configured.
+_BYBIT_PROXY_URL = os.getenv("BYBIT_PROXY_URL", "").strip()
+PROXIES = {"http": _BYBIT_PROXY_URL, "https": _BYBIT_PROXY_URL} if _BYBIT_PROXY_URL else None
 
 # ─────────────────────────────────────────
 # Active env account index (admin switching)
@@ -304,7 +325,7 @@ def _post(endpoint: str, body: dict, creds: dict | None = None) -> dict:
     payload = json.dumps(body, separators=(',', ':'))
     headers = _get_headers(api_key, api_secret, payload)
     try:
-        response = requests.post(url, headers=headers, data=payload, timeout=10)
+        response = requests.post(url, headers=headers, data=payload, timeout=10, proxies=PROXIES)
         return parse_response(response, f" [{endpoint.split('/')[-1]}]")
     except requests.exceptions.Timeout:
         return {"retCode": -1, "retMsg": "Request timed out"}
@@ -320,7 +341,7 @@ def _get_auth(endpoint: str, params: dict | None = None,
     url     = BASE_URL + endpoint
     headers = _get_headers(api_key, api_secret, "")
     try:
-        response = requests.get(url, headers=headers, params=params, timeout=10)
+        response = requests.get(url, headers=headers, params=params, timeout=10, proxies=PROXIES)
         return parse_response(response, f" [{endpoint.split('/')[-1]}]")
     except Exception as e:
         logger.error(f"[Bybit] GET {endpoint} error: {e}")
@@ -401,7 +422,7 @@ def get_my_ads(creds: dict | None = None) -> dict:
     headers = _get_headers(api_key, api_secret, "{}")
     try:
         return parse_response(
-            requests.post(url, headers=headers, data="{}", timeout=10),
+            requests.post(url, headers=headers, data="{}", timeout=10, proxies=PROXIES),
             " [personal/list]"
         )
     except Exception as e:
