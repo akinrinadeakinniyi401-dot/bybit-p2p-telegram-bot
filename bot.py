@@ -4636,9 +4636,21 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                 # the user wait a full scheduled interval (e.g. 5 more
                 # minutes) before trying again, leaving the ad stuck at a
                 # stale price that whole time unless fast-chase happened to
-                # pick it back up. Now it waits out the budget and posts
-                # the SAME already-computed price for this cycle the moment
+                # pick it back up. Now it waits out the budget and falls
+                # through to the SAME unconditional post below the moment
                 # it frees, instead of abandoning the cycle entirely.
+                #
+                # IMPORTANT: this block only WAITS — it must never itself
+                # post or set ret_code. The actual post (and ret_code
+                # assignment) lives once, unconditionally, right after this
+                # whole if-block, so both "had to wait" and "budget was
+                # already free" paths converge on exactly the same call.
+                # An earlier version of this fix nested the post INSIDE
+                # this branch instead, which meant the common case (budget
+                # already free, no wait needed) skipped the post entirely
+                # and left ret_code completely unset for the rest of the
+                # cycle — an UnboundLocalError crash on every single cycle
+                # that didn't need to wait.
                 logger.info(f"[{label}] Cycle {cycle} waiting for modify budget to free up for user {chat_id} (retry-until-success, not skipping the cycle)")
                 _budget_wait_notified = False
                 while not _can_modify_slot(sess, slot_idx, need=2 if chase_ceiling else 1):
@@ -4654,12 +4666,13 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                             parse_mode="HTML")
                         _budget_wait_notified = True
                     await asyncio.sleep(5)
-                _record_modify_slot(sess, slot_idx)   # this ad's own budget, shared with its own fast-chase checks
-                result   = await asyncio.get_event_loop().run_in_executor(
-                    _ad_executor, modify_ad, s["ad_id"], submit_str, ad_data, creds
-                )
-                ret_code = result.get("retCode", result.get("ret_code",-1))
-                ret_msg  = result.get("retMsg",  result.get("ret_msg","Unknown"))
+
+            _record_modify_slot(sess, slot_idx)   # this ad's own budget, shared with its own fast-chase checks
+            result   = await asyncio.get_event_loop().run_in_executor(
+                _ad_executor, modify_ad, s["ad_id"], submit_str, ad_data, creds
+            )
+            ret_code = result.get("retCode", result.get("ret_code",-1))
+            ret_msg  = result.get("retMsg",  result.get("ret_msg","Unknown"))
 
             if ret_code == 912120022:
                 # Out-of-range — Bybit tells us its own max/min. The FIRST
