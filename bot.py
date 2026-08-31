@@ -555,8 +555,8 @@ def _fast_chase_lock(sess, slot_idx: int) -> asyncio.Lock:
 _FAST_CHASE_GAP_OVERRIDE = {
     ("NGN", "BTC"): Decimal("1500"),
     ("NGN", "ETH"): Decimal("1500"),
-    ("USD", "BTC"): Decimal("1"),
-    ("USD", "ETH"): Decimal("1"),
+    ("USD", "BTC"): Decimal("0.5"),
+    ("USD", "ETH"): Decimal("0.5"),
 }
 
 def _fast_chase_gap(currency_id: str, token_id: str, reference_price=None) -> Decimal:
@@ -4627,16 +4627,33 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                 submit_price, submit_str = new_p, new_p_str
 
             if not _can_modify_slot(sess, slot_idx, need=2 if chase_ceiling else 1):
-                # SAFETY NET: previously this only checked/tracked budget for
-                # Ad 1 — Ad 2/3 cycles fired completely ungated. Now every ad
-                # slot has its own independent budget (Bybit enforces its
-                # 10-per-5-minutes limit per ad_id, not per user), so this
-                # applies uniformly. _BUDGET_COOLDOWN is a sentinel
-                # _handle_ad_cycle_failure treats as a soft skip, never as a
-                # real failure, so it can never trip the 2-in-a-row auto-stop.
-                ret_code, ret_msg = _BUDGET_COOLDOWN, "Internal modify budget exhausted this window"
-                logger.warning(f"[{label}] Cycle {cycle} skipped for user {chat_id} — {ret_msg}, protecting Bybit's real rate limit")
-            else:
+                # RETRY-UNTIL-SUCCESS: the modify budget is a ROLLING 300s
+                # window (40 edits/5min, shared with this ad's own fast-
+                # chase) — "no budget right now" almost always clears up
+                # within seconds as the oldest edit in the window ages out,
+                # confirmed by the fact "Update Now" still works fine mid-
+                # wait. Previously this gave up on the WHOLE cycle and made
+                # the user wait a full scheduled interval (e.g. 5 more
+                # minutes) before trying again, leaving the ad stuck at a
+                # stale price that whole time unless fast-chase happened to
+                # pick it back up. Now it waits out the budget and posts
+                # the SAME already-computed price for this cycle the moment
+                # it frees, instead of abandoning the cycle entirely.
+                logger.info(f"[{label}] Cycle {cycle} waiting for modify budget to free up for user {chat_id} (retry-until-success, not skipping the cycle)")
+                _budget_wait_notified = False
+                while not _can_modify_slot(sess, slot_idx, need=2 if chase_ceiling else 1):
+                    if not _ad_running(sess, slot_idx):
+                        return
+                    if not _budget_wait_notified:
+                        await bot.send_message(chat_id=chat_id,
+                            text=(
+                                f"⏳ {prefix}<b>Cycle {cycle}</b> <code>{datetime.now().strftime('%H:%M:%S')}</code>\n"
+                                f"Protecting Bybit's rate limit (too many recent edits) — retrying "
+                                f"automatically as budget frees up, not waiting for the next full interval."
+                            ),
+                            parse_mode="HTML")
+                        _budget_wait_notified = True
+                    await asyncio.sleep(5)
                 _record_modify_slot(sess, slot_idx)   # this ad's own budget, shared with its own fast-chase checks
                 result   = await asyncio.get_event_loop().run_in_executor(
                     _ad_executor, modify_ad, s["ad_id"], submit_str, ad_data, creds
