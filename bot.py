@@ -346,13 +346,15 @@ def _reset_ad_failures(sess, slot_idx: int):
 # ─────────────────────────────────────────
 # Fast-chase modify budget (Ad 1, single-ad, floating mode only)
 # Bybit's own DOCUMENTED limit is "a single advertisement can be modified
-# no more than 10 times within 5 minutes." This is set to 20 — above that
-# documented limit — by explicit request. This constant no longer acts as
-# real protection against Bybit's own rate limiting: calls beyond whatever
+# no more than 10 times within 5 minutes." This is set to 60 — above that
+# documented limit — by explicit request (raised 10 → 20 → 40 → 60 over
+# time, each time by request, with no observed real Bybit-side rate-limit
+# rejection at the previous value). This constant no longer acts as real
+# protection against Bybit's own rate limiting: calls beyond whatever
 # Bybit actually enforces will simply get rejected by Bybit itself (handled
 # as an ordinary failure, same as any other rejection). It still exists so
 # every part of the codebase shares one consistent, adjustable number.
-_FAST_CHASE_BUDGET       = 40
+_FAST_CHASE_BUDGET       = 60
 _FAST_CHASE_WINDOW_SECS  = 300
 
 # Sentinel ret_code used ONLY internally when a scheduled cycle skips its
