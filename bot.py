@@ -293,23 +293,38 @@ def _set_ceiling_behind_since(sess, slot_idx: int, value):
         sess.ceiling_behind_since_by_slot = store
     store[slot_idx] = value
 
-def _update_ceiling_behind_state(sess, slot_idx: int, currency: str, token: str, tag: str):
-    """Call on every fast-chase poll for a chase-ceiling ad. USD only for
-    now, by explicit request — NGN keeps the previous restart-on-every-
-    touch behavior untouched. No-op (returns silently) for any other
-    currency, or if there's no known ceiling yet to measure against."""
-    if currency.upper() != "USD":
+def _update_ceiling_behind_state(sess, slot_idx: int, currency: str, token: str, tag: str, raw_ceiling):
+    """Call ONLY at the moment a probe/retry has just handed us GROUND
+    TRUTH about Bybit's real current boundary for this pair — raw_ceiling,
+    BEFORE this ad's own collision offset is applied. USD only for now, by
+    explicit request — NGN keeps the previous restart-on-every-touch
+    behavior untouched.
+
+    Deliberately does NOT use _ceiling_ref/last_known as the reference,
+    even though that looks like the obvious candidate — for a SENIOR ad
+    (no collision offset), _set_ad_current_price resets ceiling_ref to
+    match that ad's own current_price on every successful post, by design,
+    for a different reason (keeping fast-chase's own reference accurate).
+    That means ceiling_ref is essentially a mirror of the ad's own price
+    for a senior ad — comparing it to current_price would almost always
+    show ~$0 drift no matter how far behind the real market the ad has
+    actually fallen, which is exactly why Ad 1 never triggered "$5 behind"
+    in production and went offline with zero warning. raw_ceiling here
+    comes directly from whatever a probe/retry just discovered THIS poll —
+    genuine, uncontaminated ground truth — not a stored reference that can
+    get silently overwritten to agree with the ad's own price.
+    """
+    if currency.upper() != "USD" or raw_ceiling is None:
         return
-    last_known = _ceiling_ref(sess, slot_idx)
-    cur_p      = _ad_current_price(sess, slot_idx)
-    if last_known is None or cur_p is None:
+    cur_p = _ad_current_price(sess, slot_idx)
+    if cur_p is None:
         return
     # Dry run only — _resolve_price_collision has no side effects, it just
-    # tells us what THIS slot's price should be right now if we resolved
-    # a post off the current raw ceiling, correctly accounting for this
-    # ad's own senior/junior offset (so a junior ad deliberately sitting
-    # $9/$18 below the raw ceiling isn't mistaken for "$9/$18 behind").
-    target, _ = _resolve_price_collision(sess, slot_idx, currency, token, last_known)
+    # tells us what THIS slot's price should be right now given this fresh
+    # raw ceiling, correctly accounting for this ad's own senior/junior
+    # offset (so a junior ad deliberately sitting $9/$18 below the raw
+    # ceiling isn't mistaken for "$9/$18 behind").
+    target, _ = _resolve_price_collision(sess, slot_idx, currency, token, raw_ceiling)
     drift = target - cur_p
     was_behind = _ceiling_behind_since(sess, slot_idx) is not None
     now_behind = drift >= _CEILING_BEHIND_THRESHOLD
@@ -4211,12 +4226,6 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
             # from the already-adjusted price (see message block below).
             natural_before_collision = None
 
-            if chase_ceiling:
-                # Runs unconditionally, every poll, regardless of what
-                # happens below (including the various early returns) — see
-                # _update_ceiling_behind_state's docstring. USD only for now.
-                _update_ceiling_behind_state(sess, slot_idx, currency, token, tag)
-
             if not chase_ceiling:
                 # Plain floating mode: the formula number is the real candidate.
                 diff = new_p - cur_p
@@ -4398,6 +4407,7 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                         )
 
                 if actionable_ceiling is not None:
+                    _update_ceiling_behind_state(sess, slot_idx, currency, token, tag, actionable_ceiling)
                     if not _can_modify_slot(sess, slot_idx):
                         logger.info(f"{tag} skipped — have a known unposted ceiling {actionable_ceiling} but no budget yet")
                         return
@@ -4540,6 +4550,12 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                             # regardless of what happens with the follow-up post.
                             _set_ceiling_ref(sess, slot_idx, candidate)
                             logger.info(f"{tag} discovered boundary={candidate} vs current={cur_p} threshold={gap}")
+                            # GROUND TRUTH moment for the $5-behind timer state
+                            # (see _update_ceiling_behind_state's docstring for
+                            # why this can't use ceiling_ref/last_known instead
+                            # for a senior ad) — this fires whether or not the
+                            # gap below actually ends up worth posting.
+                            _update_ceiling_behind_state(sess, slot_idx, currency, token, tag, candidate)
                             if candidate - cur_p >= gap and _can_modify_slot(sess, slot_idx):
                                 # Same collision guard as above — with 2+ ads on
                                 # the same pair fast-chasing independently, the
