@@ -4174,36 +4174,55 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                     posted_price = submit_price
                     logger.info(f"{tag} modify accepted — new ad price {posted_price}")
                 elif code == 90043 and _can_modify_slot(sess, slot_idx):
-                    # Self-duplicate — this ad's own new price rounds to
-                    # what's already live (can happen if the market barely
-                    # moved since the last successful post). Nudge by the
-                    # REAL minimum gap Bybit actually enforces (get_min_price_gap
-                    # — $5/₦7,000, confirmed by manual testing), NOT `gap`
-                    # (the $1/₦1,500 fast-chase reaction threshold used just
-                    # above). Those answer different questions — "was this
-                    # market move worth trying" vs "how far do I actually
-                    # have to move to stop looking like a duplicate to
-                    # Bybit" — and nudging by the tiny reaction threshold
-                    # here was just retrying a value barely different from
-                    # the one that already got rejected.
-                    real_gap = get_min_price_gap(currency, token, submit_price)
-                    nudged = (submit_price - real_gap).quantize(_quant, rounding=ROUND_HALF_UP)
-                    logger.info(f"{tag} modify got 90043 (self-duplicate) — retrying at {nudged}")
-                    _record_modify_slot(sess, slot_idx)
-                    nudge_result = await asyncio.get_event_loop().run_in_executor(
-                        _ad_executor, modify_ad, s["ad_id"], str(nudged), ad_data, creds
-                    )
-                    if nudge_result.get("retCode", nudge_result.get("ret_code", -1)) == 0:
-                        posted_price = nudged
-                        logger.info(f"{tag} nudged modify accepted — new ad price {posted_price}")
+                    if collided_with:
+                        # This price was ALREADY pushed down to sit correctly
+                        # below a senior ad (the $5/₦7,000 — or $10/₦14,000 for
+                        # Ad 3 — spacing that's confirmed to work against
+                        # Bybit's own real minimum). That offset IS the
+                        # intended gap. Applying a SECOND, independent
+                        # real_gap nudge on top of it here would double-
+                        # deduct — Ad 2 landing $10 below Ad 1 instead of the
+                        # intended $5, which is exactly the bug this guards
+                        # against. If even the correctly-spaced price still
+                        # looks like a duplicate to Bybit, the tracked price
+                        # is just stale — resync directly instead of
+                        # squeezing further.
+                        logger.info(f"{tag} collision-adjusted price also hit 90043 — resyncing instead of stacking a second nudge")
+                        await _resync_price_from_bybit(s["ad_id"], creds, sess, slot_idx, submit_price, tag)
                     else:
-                        logger.warning(
-                            f"{tag} nudged modify also rejected — code="
-                            f"{nudge_result.get('retCode', nudge_result.get('ret_code', -1))} "
-                            f"msg={nudge_result.get('retMsg', nudge_result.get('ret_msg',''))!r}"
+                        # Self-duplicate — this ad's own new price rounds to
+                        # what's already live (can happen if the market barely
+                        # moved since the last successful post). Nudge by the
+                        # REAL minimum gap Bybit actually enforces (get_min_price_gap
+                        # — $5/₦7,000, confirmed by manual testing), NOT `gap`
+                        # (the $0.50/₦1,500 fast-chase reaction threshold used
+                        # just above). Those answer different questions — "was
+                        # this market move worth trying" vs "how far do I
+                        # actually have to move to stop looking like a
+                        # duplicate to Bybit" — and nudging by the tiny
+                        # reaction threshold here was just retrying a value
+                        # barely different from the one that already got
+                        # rejected. Only reached when collided_with is empty
+                        # (no senior ad involved), so there's no risk of
+                        # stacking this on top of a collision offset.
+                        real_gap = get_min_price_gap(currency, token, submit_price)
+                        nudged = (submit_price - real_gap).quantize(_quant, rounding=ROUND_HALF_UP)
+                        logger.info(f"{tag} modify got 90043 (self-duplicate) — retrying at {nudged}")
+                        _record_modify_slot(sess, slot_idx)
+                        nudge_result = await asyncio.get_event_loop().run_in_executor(
+                            _ad_executor, modify_ad, s["ad_id"], str(nudged), ad_data, creds
                         )
-                        if nudge_result.get("retCode", nudge_result.get("ret_code", -1)) == 90043:
-                            await _resync_price_from_bybit(s["ad_id"], creds, sess, slot_idx, nudged, tag)
+                        if nudge_result.get("retCode", nudge_result.get("ret_code", -1)) == 0:
+                            posted_price = nudged
+                            logger.info(f"{tag} nudged modify accepted — new ad price {posted_price}")
+                        else:
+                            logger.warning(
+                                f"{tag} nudged modify also rejected — code="
+                                f"{nudge_result.get('retCode', nudge_result.get('ret_code', -1))} "
+                                f"msg={nudge_result.get('retMsg', nudge_result.get('ret_msg',''))!r}"
+                            )
+                            if nudge_result.get("retCode", nudge_result.get("ret_code", -1)) == 90043:
+                                await _resync_price_from_bybit(s["ad_id"], creds, sess, slot_idx, nudged, tag)
                 else:
                     logger.warning(
                         f"{tag} modify rejected — code={code} "
@@ -4375,9 +4394,50 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                     logger.info(f"{tag} probe result code={last_code} msg={last_msg!r}")
 
                     if last_code == 0:
-                        # Extremely unlikely — the 5x probe was accepted outright.
-                        posted_price = probe_price
-                        _set_ceiling_ref(sess, slot_idx, probe_price)
+                        # Extremely unlikely — the 5x probe was accepted
+                        # outright instead of triggering the out-of-range
+                        # rejection it's designed to guarantee. A 5x-inflated
+                        # number is NEVER a real, usable price under any
+                        # circumstance — it exists purely to be rejected.
+                        # Leaving it live actually mispriced real ads on
+                        # Bybit in production (confirmed: an ad stuck at
+                        # ~5x its real value, permanently, since fast-chase
+                        # then compares future spot prices against this
+                        # nonsense number and never finds room to act
+                        # again). Correct it back to the real target
+                        # immediately instead of accepting it.
+                        logger.warning(f"{tag} 5x probe price {probe_price} was UNEXPECTEDLY accepted — correcting immediately to the real target {new_p}, never leaving an inflated price live")
+                        if _can_modify_slot(sess, slot_idx):
+                            _record_modify_slot(sess, slot_idx)
+                            correction = await asyncio.get_event_loop().run_in_executor(
+                                _ad_executor, modify_ad, s["ad_id"], str(new_p), ad_data, creds
+                            )
+                            if correction.get("retCode", correction.get("ret_code", -1)) == 0:
+                                posted_price = new_p
+                                logger.info(f"{tag} corrected back to real target {new_p} after unexpected probe acceptance")
+                            else:
+                                # Correction failed too — do NOT record the
+                                # inflated price as current either way, and
+                                # do NOT claim a successful post. Loudly flag
+                                # it so a human checks Bybit directly rather
+                                # than silently leaving a wrong live price.
+                                await bot.send_message(chat_id=chat_id,
+                                    text=(
+                                        f"🚨 <b>{_ad_slot_label(slot_idx)}</b>\n"
+                                        f"Fast-chase's ceiling probe was unexpectedly accepted at <code>{probe_price}</code> "
+                                        f"and the automatic correction back to <code>{new_p}</code> ALSO failed. "
+                                        f"This ad may be live on Bybit at the wrong price right now — please check it manually."
+                                    ),
+                                    parse_mode="HTML")
+                        else:
+                            await bot.send_message(chat_id=chat_id,
+                                text=(
+                                    f"🚨 <b>{_ad_slot_label(slot_idx)}</b>\n"
+                                    f"Fast-chase's ceiling probe was unexpectedly accepted at <code>{probe_price}</code> "
+                                    f"but there's no modify budget left to correct it this instant. "
+                                    f"This ad is live on Bybit at the wrong price right now — please check it manually."
+                                ),
+                                parse_mode="HTML")
                     elif last_code == 912120022:
                         min_str, max_str = _extract_bybit_bounds(last_msg)
                         bound_str = max_str if max_str else min_str
@@ -4407,29 +4467,48 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                                     posted_price = post_candidate
                                     logger.info(f"{tag} boundary post accepted — new ad price {posted_price}")
                                 elif retry_code == 90043 and _can_modify_slot(sess, slot_idx):
-                                    # Discovered boundary matches what's live after all —
-                                    # nudge once, using the REAL minimum gap Bybit
-                                    # enforces (get_min_price_gap — $5/₦7,000), not
-                                    # `gap` (the $1/₦1,500 fast-chase reaction
-                                    # threshold) — same distinction as the
-                                    # plain-floating branch above. Still gated by
-                                    # the same "is it actually an improvement"
-                                    # check so this can't sneak in a downgrade.
-                                    real_gap = get_min_price_gap(currency, token, post_candidate)
-                                    nudged = (post_candidate - real_gap).quantize(_quant, rounding=ROUND_HALF_UP)
-                                    if nudged - cur_p >= gap:
-                                        _record_modify_slot(sess, slot_idx)
-                                        nudge_result = await asyncio.get_event_loop().run_in_executor(
-                                            _ad_executor, modify_ad, s["ad_id"], str(nudged), ad_data, creds
-                                        )
-                                        nudge_code = nudge_result.get("retCode", nudge_result.get("ret_code", -1))
-                                        if nudge_code == 0:
-                                            posted_price = nudged
-                                            logger.info(f"{tag} nudged post accepted — new ad price {posted_price}")
-                                        else:
-                                            logger.warning(f"{tag} nudged post also rejected — code={nudge_code}")
-                                            if nudge_code == 90043:
-                                                await _resync_price_from_bybit(s["ad_id"], creds, sess, slot_idx, nudged, tag)
+                                    if collided_with:
+                                        # This candidate was ALREADY pushed down to sit
+                                        # correctly below a senior ad — that offset IS
+                                        # the intended, Bybit-tested $5/₦7,000 (or
+                                        # $10/₦14,000 for Ad 3) spacing. A second,
+                                        # independent real_gap nudge on top of it here
+                                        # is exactly what compounded Ad 2's spacing
+                                        # into $10 below Ad 1 instead of the intended
+                                        # $5 — confirmed in production logs. If even
+                                        # the correctly-spaced candidate still looks
+                                        # like a duplicate to Bybit, the tracked price
+                                        # is just stale — resync instead of squeezing
+                                        # further.
+                                        logger.info(f"{tag} collision-adjusted boundary also hit 90043 — resyncing instead of stacking a second nudge")
+                                        await _resync_price_from_bybit(s["ad_id"], creds, sess, slot_idx, post_candidate, tag)
+                                    else:
+                                        # Discovered boundary matches what's live after all —
+                                        # nudge once, using the REAL minimum gap Bybit
+                                        # enforces (get_min_price_gap — $5/₦7,000), not
+                                        # `gap` (the $0.50/₦1,500 fast-chase reaction
+                                        # threshold) — same distinction as the
+                                        # plain-floating branch above. Still gated by
+                                        # the same "is it actually an improvement"
+                                        # check so this can't sneak in a downgrade.
+                                        # Only reached when collided_with is empty (no
+                                        # senior ad involved), so no risk of stacking
+                                        # this on top of a collision offset.
+                                        real_gap = get_min_price_gap(currency, token, post_candidate)
+                                        nudged = (post_candidate - real_gap).quantize(_quant, rounding=ROUND_HALF_UP)
+                                        if nudged - cur_p >= gap:
+                                            _record_modify_slot(sess, slot_idx)
+                                            nudge_result = await asyncio.get_event_loop().run_in_executor(
+                                                _ad_executor, modify_ad, s["ad_id"], str(nudged), ad_data, creds
+                                            )
+                                            nudge_code = nudge_result.get("retCode", nudge_result.get("ret_code", -1))
+                                            if nudge_code == 0:
+                                                posted_price = nudged
+                                                logger.info(f"{tag} nudged post accepted — new ad price {posted_price}")
+                                            else:
+                                                logger.warning(f"{tag} nudged post also rejected — code={nudge_code}")
+                                                if nudge_code == 90043:
+                                                    await _resync_price_from_bybit(s["ad_id"], creds, sess, slot_idx, nudged, tag)
                                 else:
                                     # Discovered a real improvement but couldn't post it
                                     # right now (out of budget, or a transient rejection).
@@ -4876,23 +4955,61 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                         return
 
             elif ret_code == 0:
-                _reset_ad_failures(sess, slot_idx)
-                _set_ad_current_price(sess, slot_idx, submit_price)
                 if chase_ceiling:
                     # Extremely unlikely — the probe price (5x the formula
                     # number) was accepted outright instead of triggering an
-                    # out-of-range rejection. Flag it clearly rather than
-                    # silently leaving the ad listed at that price, since this
-                    # means Bybit's real ceiling for this ad is currently even
-                    # higher than expected.
-                    await bot.send_message(chat_id=chat_id,
-                        text=(
-                            f"⚠️ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n"
-                            f"🏔 Live-ceiling probe was accepted directly at <code>{submit_str}</code> — "
-                            f"Bybit's real max right now is at or above this. Double-check this ad on Bybit."
-                        ),
-                        parse_mode="HTML")
+                    # out-of-range rejection. A 5x-inflated number is NEVER a
+                    # real, usable price — it exists purely to guarantee a
+                    # rejection so the true boundary can be read from
+                    # Bybit's error message. Leaving it live actually
+                    # mispriced real ads on Bybit in production, and
+                    # permanently broke fast-chase for that ad afterward
+                    # (it compares future spot prices against this nonsense
+                    # number and never finds room to act again). Correct it
+                    # back to the real target immediately instead of just
+                    # flagging it and moving on.
+                    logger.warning(f"[{label}] Cycle {cycle} probe price {submit_price} was UNEXPECTEDLY accepted for user {chat_id} — correcting immediately, never leaving a 5x-inflated price live")
+                    if _can_modify_slot(sess, slot_idx):
+                        _record_modify_slot(sess, slot_idx)
+                        correction_result = await asyncio.get_event_loop().run_in_executor(
+                            _ad_executor, modify_ad, s["ad_id"], new_p_str, ad_data, creds
+                        )
+                        correction_code = correction_result.get("retCode", correction_result.get("ret_code", -1))
+                        if correction_code == 0:
+                            _reset_ad_failures(sess, slot_idx)
+                            _set_ad_current_price(sess, slot_idx, new_p)
+                            await bot.send_message(chat_id=chat_id,
+                                text=(
+                                    f"⚠️ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n"
+                                    f"🏔 Live-ceiling probe was unexpectedly accepted at <code>{submit_str}</code> — "
+                                    f"corrected automatically back to <code>{new_p_str}</code>."
+                                ),
+                                parse_mode="HTML")
+                        else:
+                            # Correction itself failed — do NOT record the
+                            # inflated price as current either way. Flag it
+                            # loudly so a human checks Bybit directly.
+                            await bot.send_message(chat_id=chat_id,
+                                text=(
+                                    f"🚨 {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n"
+                                    f"Live-ceiling probe was unexpectedly accepted at <code>{submit_str}</code> and "
+                                    f"the automatic correction back to <code>{new_p_str}</code> ALSO failed "
+                                    f"(code={correction_code}). This ad may be live on Bybit at the wrong price "
+                                    f"right now — please check it manually."
+                                ),
+                                parse_mode="HTML")
+                    else:
+                        await bot.send_message(chat_id=chat_id,
+                            text=(
+                                f"🚨 {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n"
+                                f"Live-ceiling probe was unexpectedly accepted at <code>{submit_str}</code> but there's "
+                                f"no modify budget left to correct it this instant — it will self-correct on the very "
+                                f"next available modify. This ad is live on Bybit at the wrong price right now."
+                            ),
+                            parse_mode="HTML")
                 else:
+                    _reset_ad_failures(sess, slot_idx)
+                    _set_ad_current_price(sess, slot_idx, submit_price)
                     await bot.send_message(chat_id=chat_id,
                         text=f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n💲 <code>{submit_str}</code> ({mode.upper()})",
                         parse_mode="HTML")
