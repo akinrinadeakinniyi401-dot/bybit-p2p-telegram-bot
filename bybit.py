@@ -150,8 +150,8 @@ def currency_needs_ref(currency_id: str) -> bool:
 # separate per-rank table, purely from _resolve_price_collision's
 # cascading single-pass resolution in bot.py.
 MIN_PRICE_GAP = {
-    "NGN": Decimal("7000"),
-    "USD": Decimal("5"),
+    "NGN": Decimal("12600"),
+    "USD": Decimal("9"),
     "GHS": Decimal("50"),
     "GBP": Decimal("50"),
     "EUR": Decimal("50"),
