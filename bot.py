@@ -223,6 +223,29 @@ def _set_last_ceiling_attempt(sess, slot_idx: int, value):
         sess.last_ceiling_attempt_by_slot = store
     store[slot_idx] = value
 
+def _required_fresh_move(sess, slot_idx: int, currency: str, token: str, reference_price, fallback_gap):
+    """How much the underlying raw ceiling needs to have moved past what
+    this slot already probed/resolved a post from before it's worth
+    trying again — matched to THIS ad's own real spacing requirement
+    instead of one flat number shared by every slot:
+      - Senior-most ad (nothing to defer to, e.g. Ad 1): no extra
+        requirement beyond the normal fast-chase reaction gap
+        (fallback_gap, $0.50/₦1,500) — it can react to any real move.
+      - One ad below it (e.g. Ad 2): needs its own real spacing to have
+        opened up — $9/₦12,600 — before a re-probe can possibly produce
+        a genuinely different final price.
+      - Two ads below (e.g. Ad 3): $18/₦25,200.
+    A flat number was wrong in both directions: too loose for Ad 1
+    (which doesn't need this extra gate at all) and too tight for
+    Ad 2/Ad 3, whose own required spacing is bigger than any single flat
+    guess — confirmed in production by repeated wasted probe-and-repost
+    cycles for a price that could never have been different once you
+    account for the ad's own $9/$18 offset.
+    """
+    resolved, _ = _resolve_price_collision(sess, slot_idx, currency, token, reference_price)
+    own_gap = reference_price - resolved
+    return own_gap if own_gap > 0 else fallback_gap
+
 # ─────────────────────────────────────────────────────────────────────────
 # Cycle-restart-on-fast-chase (floating mode only)
 # ─────────────────────────────────────────────────────────────────────────
@@ -253,87 +276,6 @@ def _touch_last_fast_modify(sess, slot_idx: int):
         store = {}
         sess.last_fast_modify_ts_by_slot = store
     store[slot_idx] = asyncio.get_event_loop().time()
-
-
-# ─────────────────────────────────────────────────────────────────────────
-# "Behind ceiling by $5" state machine (USD only, by explicit request)
-# ─────────────────────────────────────────────────────────────────────────
-# Refinement on top of the cycle-restart-on-fast-chase feature above.
-# Bybit doesn't actually start its own countdown-to-offline the instant an
-# ad is a single cent under its 130% max — by observed behavior, it only
-# starts once the ad has fallen at least $5 behind. Restarting our OWN
-# scheduled-cycle timer on every single fast-chase touch (the previous
-# behavior) was more conservative than that: it treated even a $0.50
-# catch-up as a reason to push the next scheduled cycle a full interval
-# out, when Bybit's real countdown wouldn't have even started yet.
-#
-# This tracks, per slot, whether the ad is CURRENTLY behind its own
-# resolved target (this ad's own price, accounting for its own collision
-# offset if it's a junior ad) by $5 or more — mirroring exactly the
-# condition the user identified as when Bybit's real countdown begins.
-# While NOT behind, the scheduled-cycle timer stays paused (never
-# advances) — there's no real urgency, same as Bybit's own countdown
-# not running yet. The moment it becomes $5+ behind, the timer starts
-# counting from THAT instant. If fast-chase catches it back up before the
-# interval completes, the timer pauses again — exactly mirroring Bybit
-# resetting its own countdown on a successful modify — and the same
-# detection applies fresh the next time a $5 gap opens up.
-_CEILING_BEHIND_THRESHOLD = Decimal("5")
-
-def _ceiling_behind_since(sess, slot_idx: int):
-    """Loop-clock timestamp of when this slot most recently fell $5+
-    behind its own resolved ceiling target, or None if it's currently
-    within $5 (timer paused)."""
-    return getattr(sess, "ceiling_behind_since_by_slot", {}).get(slot_idx)
-
-def _set_ceiling_behind_since(sess, slot_idx: int, value):
-    store = getattr(sess, "ceiling_behind_since_by_slot", None)
-    if store is None:
-        store = {}
-        sess.ceiling_behind_since_by_slot = store
-    store[slot_idx] = value
-
-def _update_ceiling_behind_state(sess, slot_idx: int, currency: str, token: str, tag: str, raw_ceiling):
-    """Call ONLY at the moment a probe/retry has just handed us GROUND
-    TRUTH about Bybit's real current boundary for this pair — raw_ceiling,
-    BEFORE this ad's own collision offset is applied. USD only for now, by
-    explicit request — NGN keeps the previous restart-on-every-touch
-    behavior untouched.
-
-    Deliberately does NOT use _ceiling_ref/last_known as the reference,
-    even though that looks like the obvious candidate — for a SENIOR ad
-    (no collision offset), _set_ad_current_price resets ceiling_ref to
-    match that ad's own current_price on every successful post, by design,
-    for a different reason (keeping fast-chase's own reference accurate).
-    That means ceiling_ref is essentially a mirror of the ad's own price
-    for a senior ad — comparing it to current_price would almost always
-    show ~$0 drift no matter how far behind the real market the ad has
-    actually fallen, which is exactly why Ad 1 never triggered "$5 behind"
-    in production and went offline with zero warning. raw_ceiling here
-    comes directly from whatever a probe/retry just discovered THIS poll —
-    genuine, uncontaminated ground truth — not a stored reference that can
-    get silently overwritten to agree with the ad's own price.
-    """
-    if currency.upper() != "USD" or raw_ceiling is None:
-        return
-    cur_p = _ad_current_price(sess, slot_idx)
-    if cur_p is None:
-        return
-    # Dry run only — _resolve_price_collision has no side effects, it just
-    # tells us what THIS slot's price should be right now given this fresh
-    # raw ceiling, correctly accounting for this ad's own senior/junior
-    # offset (so a junior ad deliberately sitting $9/$18 below the raw
-    # ceiling isn't mistaken for "$9/$18 behind").
-    target, _ = _resolve_price_collision(sess, slot_idx, currency, token, raw_ceiling)
-    drift = target - cur_p
-    was_behind = _ceiling_behind_since(sess, slot_idx) is not None
-    now_behind = drift >= _CEILING_BEHIND_THRESHOLD
-    if now_behind and not was_behind:
-        _set_ceiling_behind_since(sess, slot_idx, asyncio.get_event_loop().time())
-        logger.info(f"{tag} fell {drift} behind its own ceiling target (>= {_CEILING_BEHIND_THRESHOLD}) — cycle timer starts counting now")
-    elif not now_behind and was_behind:
-        _set_ceiling_behind_since(sess, slot_idx, None)
-        logger.info(f"{tag} back within {drift} of its own ceiling target — cycle timer paused again")
 
 
 async def _resync_price_from_bybit(ad_id: str, creds: dict, sess, slot_idx: int, fallback_price, tag: str):
@@ -4377,8 +4319,9 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                     actionable_ceiling = pending_ceiling
                 elif last_known is not None and last_known - cur_p >= gap:
                     _prior_attempt = _last_ceiling_attempt(sess, slot_idx)
-                    if _prior_attempt is not None and last_known <= _prior_attempt:
-                        # Already tried this exact raw ceiling before. With
+                    _required = _required_fresh_move(sess, slot_idx, currency, token, last_known, gap)
+                    if _prior_attempt is not None and last_known - _prior_attempt < _required:
+                        # Already tried this raw ceiling recently. With
                         # _set_ad_current_price now leaving ceiling_ref alone
                         # on a collision-adjusted post, last_known correctly
                         # keeps holding the TRUE higher ceiling instead of
@@ -4386,17 +4329,16 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                         # price — but that means last_known - cur_p is now
                         # PERMANENTLY >= gap for any ad sitting below a
                         # senior sibling by design, not just when the market
-                        # actually moves. Without this check that reads as
-                        # "fresh room to catch up" on every single poll
-                        # forever, endlessly re-posting the exact same
-                        # number — which is exactly the repeated-identical-
-                        # price bug seen in production. Only act again once
-                        # the raw ceiling itself has genuinely risen past
-                        # what we already tried.
+                        # actually moves. Gating on "any improvement at all"
+                        # wasn't enough either — ordinary tick jitter clears
+                        # that easily. Only act again once the raw ceiling
+                        # has risen past what we already tried by THIS ad's
+                        # own real spacing requirement ($9/$18, or the tiny
+                        # reaction gap for the senior-most ad).
                         logger.info(
                             f"{tag} chase-ceiling | {last_known - cur_p} below known ceiling {last_known}, "
                             f"but that's this ad's own collision-avoidance gap (already tried {last_known}) "
-                            f"— not fresh movement, skipping until it rises further"
+                            f"— not fresh movement (need {_required} more), skipping until it rises further"
                         )
                     else:
                         actionable_ceiling = last_known
@@ -4407,7 +4349,6 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                         )
 
                 if actionable_ceiling is not None:
-                    _update_ceiling_behind_state(sess, slot_idx, currency, token, tag, actionable_ceiling)
                     if not _can_modify_slot(sess, slot_idx):
                         logger.info(f"{tag} skipped — have a known unposted ceiling {actionable_ceiling} but no budget yet")
                         return
@@ -4459,26 +4400,28 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                             )
                             return
                         _prior_attempt = _last_ceiling_attempt(sess, slot_idx)
-                        if _prior_attempt is not None and new_p - _prior_attempt < _CEILING_BEHIND_THRESHOLD:
-                            # We already ran a full probe off essentially this
-                            # same underlying ceiling recently. Gating this on
-                            # `gap` ($0.50) wasn't enough — ordinary BTC tick
-                            # jitter between one 5-second poll and the next
-                            # routinely exceeds $0.50-$1.50 on its own, with
-                            # the REAL account-wide ceiling not having moved
-                            # at all, which is exactly what let 2-3 wasted
-                            # probe-and-repost cycles through in a row for
-                            # the identical final price (confirmed in
-                            # production logs). Reusing the same $5 bar as
-                            # the behind-ceiling timer — a meaningful, real
-                            # move, not tick noise — before spending another
-                            # 2-call probe on a ceiling that almost
-                            # certainly hasn't actually changed.
-                            logger.info(
-                                f"{tag} skipped — still within {_CEILING_BEHIND_THRESHOLD} of the ceiling we already probed and "
-                                f"resolved a post from ({_prior_attempt}), not fresh enough for another probe"
-                            )
-                            return
+                        if _prior_attempt is not None:
+                            _required = _required_fresh_move(sess, slot_idx, currency, token, new_p, gap)
+                            if new_p - _prior_attempt < _required:
+                                # We already ran a full probe off essentially this
+                                # same underlying ceiling recently. Gated on THIS
+                                # ad's own real spacing requirement, not one flat
+                                # number for every slot — ordinary BTC tick jitter
+                                # between polls routinely exceeds a few dollars on
+                                # its own, with the REAL account-wide ceiling not
+                                # having moved at all, which is exactly what let
+                                # 2-3 wasted probe-and-repost cycles through in a
+                                # row for the identical final price (confirmed in
+                                # production logs). A one-gap-junior (Ad 2) needs
+                                # its own $9/₦12,600 of real movement before a
+                                # re-probe could possibly land somewhere different;
+                                # a two-gap-junior (Ad 3) needs $18/₦25,200; the
+                                # senior-most ad needs none of this extra gating.
+                                logger.info(
+                                    f"{tag} skipped — still within {_required} of the ceiling we already probed and "
+                                    f"resolved a post from ({_prior_attempt}), not fresh enough for another probe"
+                                )
+                                return
                     if not _can_modify_slot(sess, slot_idx, need=2):
                         logger.info(f"{tag} skipped — chase-ceiling needs 2 free budget slots, don't have them")
                         return
@@ -4552,12 +4495,6 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                             # regardless of what happens with the follow-up post.
                             _set_ceiling_ref(sess, slot_idx, candidate)
                             logger.info(f"{tag} discovered boundary={candidate} vs current={cur_p} threshold={gap}")
-                            # GROUND TRUTH moment for the $5-behind timer state
-                            # (see _update_ceiling_behind_state's docstring for
-                            # why this can't use ceiling_ref/last_known instead
-                            # for a senior ad) — this fires whether or not the
-                            # gap below actually ends up worth posting.
-                            _update_ceiling_behind_state(sess, slot_idx, currency, token, tag, candidate)
                             if candidate - cur_p >= gap and _can_modify_slot(sess, slot_idx):
                                 # Same collision guard as above — with 2+ ads on
                                 # the same pair fast-chasing independently, the
@@ -5133,93 +5070,34 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
             # waits for the next scheduled cycle, scheduled off the
             # monotonic clock so a slow iteration can only ever delay
             # itself, never stack up and stall later checks.
+            #
+            # ── Cycle-restart-on-fast-chase (floating mode only) ───────────
+            # Bybit resets its own 5-min countdown-to-offline on THIS ad
+            # every time it's actually modified — including a fast-chase
+            # post that lands between scheduled cycles, not just this
+            # loop's own scheduled posts. So while waiting, watch this
+            # slot's last-fast-modify timestamp: every time fast-chase
+            # posts a real update here, push wait_until out a full fresh
+            # interval from that moment, exactly mirroring what Bybit's
+            # own countdown just did. No cap — if the market keeps moving
+            # every few seconds, this keeps restarting indefinitely, same
+            # as Bybit's real countdown would. Fixed-mode ads never touch
+            # last_fast_modify_ts_by_slot (fast-chase skips them entirely),
+            # so this is a no-op for them and behaves exactly as before.
             loop_clock = asyncio.get_event_loop()
-            _is_usd_chase = mode == "floating" and chase_ceiling and ad_data.get("currencyId","").upper() == "USD"
-
-            if _is_usd_chase:
-                # RESET on re-entry: the scheduled cycle just made a modify
-                # attempt (success or fail) — mirror Bybit resetting its OWN
-                # countdown on any modify, same reasoning as the older
-                # cycle-restart-on-fast-chase feature. Without this, a STALE
-                # behind_since from before this cycle even ran (fast-chase
-                # sets it, the scheduled cycle never clears it) meant
-                # wait_until = behind_since + interval was often ALREADY in
-                # the past the instant it was computed below — breaking the
-                # wait loop on its very first check with zero sleep, and
-                # the outer cycle loop firing an entire new cycle instantly.
-                # Repeated with no delay at all, that's a runaway rapid-fire
-                # loop hammering Bybit multiple times per SECOND instead of
-                # waiting — confirmed in production logs. Fast-chase will
-                # naturally re-detect and re-set a FRESH, current timestamp
-                # on its very next poll if the ad is still genuinely behind.
-                _set_ceiling_behind_since(sess, slot_idx, None)
-                # ── "Behind ceiling by $5" EARLY trigger, with a safety-net MAX ──
-                # Refinement on cycle-restart-on-fast-chase, by explicit
-                # request: mirrors Bybit's OBSERVED real behavior — Bybit
-                # doesn't start its own countdown-to-offline the instant an
-                # ad is a cent under its 130% max, only once it's fallen $5+
-                # behind. See _update_ceiling_behind_state (called every
-                # fast-chase poll) for how "behind" is detected.
-                #
-                # IMPORTANT — why this ISN'T purely conditional on "behind"
-                # anymore: "behind" can only ever be DETECTED when a probe
-                # fires, and a probe only fires when spot has risen ABOVE
-                # the known ceiling. If spot instead FALLS — the ad ends up
-                # sitting ABOVE the market — no probe ever runs, "behind"
-                # never gets set, and a purely-conditional timer would never
-                # fire again AT ALL, no matter how long the ad sat stale.
-                # Confirmed in production: two ads went untouched well past
-                # their own 5-minute and 2-minute intervals during a falling
-                # market, with the scheduled cycle never once re-firing.
-                # So: max_wait_until is an unconditional ceiling, set once
-                # up front, that guarantees a cycle fires within `interval`
-                # of reaching this point NO MATTER WHAT — restoring the
-                # original reliability guarantee. The $5-behind detection
-                # layers on top of that and can only pull the next cycle
-                # EARLIER than max_wait_until, never later, and never
-                # replace the guarantee outright.
-                max_wait_until = loop_clock.time() + interval * 60
-                wait_until = max_wait_until
-                while _ad_running(sess, slot_idx):
-                    behind_since = _ceiling_behind_since(sess, slot_idx)
-                    _target = min(behind_since + interval * 60, max_wait_until) if behind_since is not None else max_wait_until
-                    if _target != wait_until:
-                        wait_until = _target
-                        if behind_since is not None:
-                            logger.info(
-                                f"[{label}] Fell $5+ behind its ceiling for user {chat_id} — cycle timer "
-                                f"now counting, next scheduled cycle in ~{interval}min unless it catches back up"
-                            )
-                    if loop_clock.time() >= wait_until:
-                        break
-                    await asyncio.sleep(1)
-            else:
-                # ── Cycle-restart-on-fast-chase (NGN / fixed / non-max floating) ──
-                # Bybit resets its own 5-min countdown-to-offline on THIS ad
-                # every time it's actually modified — including a fast-chase
-                # post that lands between scheduled cycles, not just this
-                # loop's own scheduled posts. So while waiting, watch this
-                # slot's last-fast-modify timestamp: every time fast-chase
-                # posts a real update here, push wait_until out a full fresh
-                # interval from that moment, exactly mirroring what Bybit's
-                # own countdown just did. No cap — if the market keeps moving
-                # every few seconds, this keeps restarting indefinitely, same
-                # as Bybit's real countdown would. Fixed-mode ads never touch
-                # last_fast_modify_ts_by_slot (fast-chase skips them entirely),
-                # so this is a no-op for them and behaves exactly as before.
-                wait_until = loop_clock.time() + interval * 60
-                _seen_fast_modify_ts = _last_fast_modify_ts(sess, slot_idx) if mode == "floating" else None
-                while _ad_running(sess, slot_idx) and loop_clock.time() < wait_until:
-                    await asyncio.sleep(1)
-                    if mode == "floating":
-                        _fc_ts = _last_fast_modify_ts(sess, slot_idx)
-                        if _fc_ts is not None and _fc_ts != _seen_fast_modify_ts:
-                            _seen_fast_modify_ts = _fc_ts
-                            wait_until = _fc_ts + interval * 60
-                            logger.info(
-                                f"[{label}] Fast-chase modified price during wait for user {chat_id} — "
-                                f"cycle timer restarted, next scheduled cycle now ~{interval}min from that post"
-                            )
+            wait_until = loop_clock.time() + interval * 60
+            _seen_fast_modify_ts = _last_fast_modify_ts(sess, slot_idx) if mode == "floating" else None
+            while _ad_running(sess, slot_idx) and loop_clock.time() < wait_until:
+                await asyncio.sleep(1)
+                if mode == "floating":
+                    _fc_ts = _last_fast_modify_ts(sess, slot_idx)
+                    if _fc_ts is not None and _fc_ts != _seen_fast_modify_ts:
+                        _seen_fast_modify_ts = _fc_ts
+                        wait_until = _fc_ts + interval * 60
+                        logger.info(
+                            f"[{label}] Fast-chase modified price during wait for user {chat_id} — "
+                            f"cycle timer restarted, next scheduled cycle now ~{interval}min from that post"
+                        )
         except asyncio.CancelledError:
             logger.info(f"[{label}] Auto-update task cancelled for user {chat_id}")
             raise
