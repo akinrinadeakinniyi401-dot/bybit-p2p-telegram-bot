@@ -4319,6 +4319,25 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                     actionable_ceiling = pending_ceiling
                 elif last_known is not None and last_known - cur_p >= gap:
                     _prior_attempt = _last_ceiling_attempt(sess, slot_idx)
+                    if _prior_attempt is not None and _prior_attempt > last_known:
+                        # STALE HIGH-WATER MARK — _last_ceiling_attempt only
+                        # ever gets written when we act on a discovery, so it
+                        # can end up recording a HIGHER historical peak than
+                        # the CURRENT last_known if the real ceiling has since
+                        # legitimately dropped (a market dip, or a corrective
+                        # post landing lower) — last_known correctly tracks
+                        # that drop, but this high-water mark doesn't. Left
+                        # unclamped, the gate below compares fresh movement
+                        # against that stale, artificially-high peak forever,
+                        # permanently refusing to probe again until the
+                        # market claws all the way back past a number that's
+                        # no longer the real ceiling — confirmed in
+                        # production: an ad stuck skipping for minutes while
+                        # sitting genuinely far below its OWN current,
+                        # legitimate last_known. Once last_known itself has
+                        # moved past the old high-water mark, that mark is
+                        # simply irrelevant history — drop it.
+                        _prior_attempt = None
                     _required = _required_fresh_move(sess, slot_idx, currency, token, last_known, gap)
                     if _prior_attempt is not None and last_known - _prior_attempt < _required:
                         # Already tried this raw ceiling recently. With
@@ -4400,6 +4419,22 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                             )
                             return
                         _prior_attempt = _last_ceiling_attempt(sess, slot_idx)
+                        if _prior_attempt is not None and _prior_attempt > last_known:
+                            # STALE HIGH-WATER MARK — same issue as the
+                            # actionable_ceiling branch above: this can hold
+                            # a HIGHER historical peak than the CURRENT
+                            # last_known if the real ceiling has since
+                            # legitimately dropped. Confirmed as the exact
+                            # cause of an ad sitting stuck for minutes,
+                            # perpetually "not fresh enough", while genuinely
+                            # $20-30+ behind its own current last_known —
+                            # new_p was being compared against an old peak
+                            # (from before a market dip) that was HIGHER
+                            # than new_p itself, so no amount of real
+                            # movement could ever clear it. Once last_known
+                            # itself has moved past the old high-water mark,
+                            # that mark is irrelevant history — drop it.
+                            _prior_attempt = None
                         if _prior_attempt is not None:
                             _required = _required_fresh_move(sess, slot_idx, currency, token, new_p, gap)
                             if new_p - _prior_attempt < _required:
