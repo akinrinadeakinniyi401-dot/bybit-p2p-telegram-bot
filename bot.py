@@ -4459,21 +4459,23 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                             )
                             return
                         _prior_attempt = _last_ceiling_attempt(sess, slot_idx)
-                        if _prior_attempt is not None and new_p - _prior_attempt < gap:
+                        if _prior_attempt is not None and new_p - _prior_attempt < _CEILING_BEHIND_THRESHOLD:
                             # We already ran a full probe off essentially this
-                            # same underlying ceiling recently — normal spot
-                            # jitter can tick new_p a few cents above
-                            # last_known on almost every poll even when the
-                            # SENIOR ad (whatever this ad is collision-
-                            # adjusted against) genuinely hasn't moved, which
-                            # was triggering a full 2-call probe-and-repost
-                            # cycle over and over for the exact same final
-                            # collision-adjusted price — wasted budget with
-                            # nothing new to show for it. Only worth a fresh
-                            # probe once the underlying price has moved a
-                            # full gap past what we already resolved.
+                            # same underlying ceiling recently. Gating this on
+                            # `gap` ($0.50) wasn't enough — ordinary BTC tick
+                            # jitter between one 5-second poll and the next
+                            # routinely exceeds $0.50-$1.50 on its own, with
+                            # the REAL account-wide ceiling not having moved
+                            # at all, which is exactly what let 2-3 wasted
+                            # probe-and-repost cycles through in a row for
+                            # the identical final price (confirmed in
+                            # production logs). Reusing the same $5 bar as
+                            # the behind-ceiling timer — a meaningful, real
+                            # move, not tick noise — before spending another
+                            # 2-call probe on a ceiling that almost
+                            # certainly hasn't actually changed.
                             logger.info(
-                                f"{tag} skipped — still within {gap} of the ceiling we already probed and "
+                                f"{tag} skipped — still within {_CEILING_BEHIND_THRESHOLD} of the ceiling we already probed and "
                                 f"resolved a post from ({_prior_attempt}), not fresh enough for another probe"
                             )
                             return
@@ -5151,38 +5153,44 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                 # naturally re-detect and re-set a FRESH, current timestamp
                 # on its very next poll if the ad is still genuinely behind.
                 _set_ceiling_behind_since(sess, slot_idx, None)
-                # ── "Behind ceiling by $5" timer (USD chase-ceiling only) ──
+                # ── "Behind ceiling by $5" EARLY trigger, with a safety-net MAX ──
                 # Refinement on cycle-restart-on-fast-chase, by explicit
                 # request: mirrors Bybit's OBSERVED real behavior — Bybit
                 # doesn't start its own countdown-to-offline the instant an
                 # ad is a cent under its 130% max, only once it's fallen $5+
-                # behind. Restarting on every touch (the old logic, still
-                # used for NGN/fixed/non-max below) was more conservative
-                # than that: a $0.50 catch-up was enough to push the next
-                # cycle a full interval out, when Bybit's real countdown
-                # wouldn't have even started yet. See
-                # _update_ceiling_behind_state (called every fast-chase
-                # poll) for how "behind" is detected. While NOT behind, this
-                # stays paused indefinitely — no cap, since there's
-                # genuinely no urgency, same as Bybit's own countdown not
-                # running. The moment fast-chase catches it back up, the
-                # pause resumes — mirroring Bybit resetting its own
-                # countdown on a successful modify — ready to start counting
-                # fresh the next time a $5 gap opens.
-                wait_until = None
+                # behind. See _update_ceiling_behind_state (called every
+                # fast-chase poll) for how "behind" is detected.
+                #
+                # IMPORTANT — why this ISN'T purely conditional on "behind"
+                # anymore: "behind" can only ever be DETECTED when a probe
+                # fires, and a probe only fires when spot has risen ABOVE
+                # the known ceiling. If spot instead FALLS — the ad ends up
+                # sitting ABOVE the market — no probe ever runs, "behind"
+                # never gets set, and a purely-conditional timer would never
+                # fire again AT ALL, no matter how long the ad sat stale.
+                # Confirmed in production: two ads went untouched well past
+                # their own 5-minute and 2-minute intervals during a falling
+                # market, with the scheduled cycle never once re-firing.
+                # So: max_wait_until is an unconditional ceiling, set once
+                # up front, that guarantees a cycle fires within `interval`
+                # of reaching this point NO MATTER WHAT — restoring the
+                # original reliability guarantee. The $5-behind detection
+                # layers on top of that and can only pull the next cycle
+                # EARLIER than max_wait_until, never later, and never
+                # replace the guarantee outright.
+                max_wait_until = loop_clock.time() + interval * 60
+                wait_until = max_wait_until
                 while _ad_running(sess, slot_idx):
                     behind_since = _ceiling_behind_since(sess, slot_idx)
-                    if behind_since is None:
-                        wait_until = None
-                    else:
-                        _new_target = behind_since + interval * 60
-                        if wait_until != _new_target:
-                            wait_until = _new_target
+                    _target = min(behind_since + interval * 60, max_wait_until) if behind_since is not None else max_wait_until
+                    if _target != wait_until:
+                        wait_until = _target
+                        if behind_since is not None:
                             logger.info(
                                 f"[{label}] Fell $5+ behind its ceiling for user {chat_id} — cycle timer "
                                 f"now counting, next scheduled cycle in ~{interval}min unless it catches back up"
                             )
-                    if wait_until is not None and loop_clock.time() >= wait_until:
+                    if loop_clock.time() >= wait_until:
                         break
                     await asyncio.sleep(1)
             else:
