@@ -220,6 +220,34 @@ def load_settings(user_id: int) -> dict:
 
 
 # ─────────────────────────────────────────
+# Extra ad slot persistence (Ad 2 / Ad 3)
+# Mirrors save_settings()/load_settings() above, which only ever covered
+# the original single-ad (Ad 1) fields. Multi-ad slots had NO persistence
+# at all before this — they lived only in the in-memory SessionState, so
+# every redeploy silently deleted Ad 2/Ad 3's configuration outright
+# (float %, interval, mode, ad_id — everything), with no way to recover
+# it. Stored as a plain list of each slot's settings dict, in order,
+# under "p2p_extra_slots" in the same user JSON file.
+# ─────────────────────────────────────────
+def save_extra_slots(user_id: int, slots_settings: list):
+    """Persist Ad 2/Ad 3's settings (ad_id, mode, float_pct, interval,
+    local_usdt_ref, etc.) — one dict per extra slot, in list order."""
+    with _lock:
+        user = _read_json(_user_path(user_id))
+        if not user:
+            return
+        user["p2p_extra_slots"] = slots_settings
+        _write_json(_user_path(user_id), user)
+
+def load_extra_slots(user_id: int) -> list:
+    """Load Ad 2/Ad 3's persisted settings. Returns [] if none saved."""
+    user = get_user(user_id)
+    if not user:
+        return []
+    return user.get("p2p_extra_slots", [])
+
+
+# ─────────────────────────────────────────
 # API key management
 # ─────────────────────────────────────────
 def save_api(user_id: int, key: str, value: str):
