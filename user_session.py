@@ -12,6 +12,8 @@ from datetime import datetime
 from decimal import Decimal
 from threading import Lock
 
+import db
+
 logger = logging.getLogger(__name__)
 
 _lock = Lock()
@@ -380,18 +382,61 @@ def get_session(user_id: int) -> SessionState:
 
     NOTE: The stale/auto-reset check has been intentionally removed.
     Resetting is handled exclusively by _session_auto_reset_loop in bot.py,
-    which runs on a clean 1-hour schedule and sends the user a notification.
+    which runs on a clean schedule and sends the user a notification.
     Having reset logic here caused a race condition: any button click after
-    the 1-hour reset could re-trigger reset_p2p() silently, killing active
+    the scheduled reset could re-trigger reset_p2p() silently, killing active
     features (order monitor, chat monitor etc.) with no warning.
+
+    SAFETY-NET RESTORE: a redeploy restarts the whole process, so this
+    in-memory _sessions dict starts completely empty — every user's live
+    Ad 1/2/3 configuration (ad_id, bybit_uid, mode, float_pct, interval)
+    would otherwise be gone with no way to recover it, even though it's
+    genuinely saved on disk (see db.save_settings/save_extra_slots).
+    bot.py ALSO has its own, richer restore (_load_settings_from_disk,
+    with slot-keyed backfill logic) but that one only runs from a
+    specific handler — if a user's first interaction after a redeploy is
+    anything else, their session would stay blank until they happen to
+    hit that exact handler, and worse, a stray write in the meantime
+    could overwrite the good saved data with blanks. Restoring here
+    instead, the moment a session is first created, closes that gap
+    completely regardless of entry point. This is a deliberately MINIMAL
+    raw restore (just copy the saved dicts in) — bot.py's richer logic
+    still runs on top of this later and refines things further.
     """
     with _lock:
         s = _sessions.get(user_id)
         if s is None:
             s = SessionState(user_id)
             _sessions[user_id] = s
+            _restore_persisted_settings(s)
             logger.info(f"[Session] Created for user {user_id}")
         return s
+
+
+def _restore_persisted_settings(sess: "SessionState"):
+    """Best-effort raw restore of persisted P2P settings — Ad 1's fields
+    plus any Ad 2/Ad 3 extra slots — called once, right when a session is
+    (re)created. Never raises: a persistence hiccup here should never
+    block a user from getting a session at all."""
+    try:
+        saved = db.load_settings(sess.user_id)
+        if saved:
+            sess.settings.update(saved)
+        saved_extra = db.load_extra_slots(sess.user_id)
+        restored_extra = 0
+        for extra_settings in saved_extra:
+            if not extra_settings:
+                continue
+            slot = sess.add_ad_slot()
+            slot["settings"].update(extra_settings)
+            restored_extra += 1
+        if saved or restored_extra:
+            logger.info(
+                f"[Session] Restored persisted settings for user {sess.user_id} "
+                f"(Ad 1: {'yes' if saved else 'no'}, extra slots: {restored_extra})"
+            )
+    except Exception as e:
+        logger.error(f"[Session] Failed to restore persisted settings for user {sess.user_id}: {e}")
 
 
 def clear_session(user_id: int):
