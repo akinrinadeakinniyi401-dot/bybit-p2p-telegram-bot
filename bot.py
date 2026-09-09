@@ -736,8 +736,12 @@ def _settings(uid: int) -> dict:
     return get_session(uid).settings
 
 def _save_settings(uid: int):
-    """Persist the user's current session settings to disk."""
-    db.save_settings(uid, get_session(uid).settings)
+    """Persist the user's current session settings to disk — Ad 1's fields
+    AND any extra ad slots (Ad 2/Ad 3), so a redeploy doesn't silently
+    delete multi-ad configuration that was never being saved before."""
+    sess = get_session(uid)
+    db.save_settings(uid, sess.settings)
+    db.save_extra_slots(uid, [slot["settings"] for slot in sess.extra_ad_slots])
 
 def _load_settings_from_disk(uid: int):
     """Load persisted settings from disk into the user's session on first access.
@@ -786,6 +790,25 @@ def _load_settings_from_disk(uid: int):
                      f"bybit_uid={sess.settings.get('bybit_uid')!r} "
                      f"ad_id_1={sess.settings.get('ad_id_1')!r} bybit_uid_1={sess.settings.get('bybit_uid_1')!r} "
                      f"mode={sess.settings.get('mode')!r} slot={active_slot_str}")
+
+    # ── Restore Ad 2 / Ad 3 (extra ad slots) ──
+    # These previously had NO persistence at all (see save_extra_slots'
+    # docstring in db.py) — a redeploy deleted Ad 2/Ad 3's configuration
+    # outright, with nothing to recover. Idempotent: only ever CREATES a
+    # slot here if it doesn't already exist in this session, so calling
+    # this repeatedly (e.g. every time the menu loads) never duplicates
+    # or overwrites a slot the user is actively editing right now.
+    saved_extra = db.load_extra_slots(uid)
+    if saved_extra:
+        sess = get_session(uid)
+        for i, extra_settings in enumerate(saved_extra):
+            if not extra_settings:
+                continue
+            while len(sess.extra_ad_slots) <= i:
+                sess.add_ad_slot()
+            if not sess.extra_ad_slots[i]["settings"].get("ad_id"):
+                sess.extra_ad_slots[i]["settings"].update(extra_settings)
+        logger.debug(f"[Settings] Restored {len(saved_extra)} extra ad slot(s) for user={uid}")
 
 SELLER_WARN_MSG = (
     "Dear seller, your average release time is too long, I can't proceed with the payment. "
@@ -6046,7 +6069,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             f"⏱ Window resets in <b>{hrs_left}h {mins_left}m</b>\n\n"
             f"<i>Coin quantities only (not fiat) — total volume you've bought "
             f"across all accepted/auto-paid buy orders in this window. "
-            f"Not affected by the hourly session reset.</i>",
+            f"Not affected by the scheduled session reset.</i>",
             InlineKeyboardMarkup(back_section("section_autopay"))
         )
 
@@ -6390,8 +6413,8 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         if slot_idx == -1:
             slot_str = _get_user_slot_str(tuser.id)
             sess.settings[f"mode_{slot_str}"] = new_mode
-            _save_settings(tuser.id)
             next_hint = f"\n\n_{next_setup_hint(tuser.id)}_"
+        _save_settings(tuser.id)   # persists Ad 1 AND any extra slots, regardless of which was just edited
         note = " (takes effect next cycle)" if _ad_running(sess, slot_idx) else ""
         await edit_menu(query,
             f"🔀 <b>{_ad_slot_label(slot_idx)} switched to {new_mode.upper()}{note}</b>{next_hint}",
@@ -7332,6 +7355,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             return
         sess.add_ad_slot()
         sess.editing_slot = len(sess.extra_ad_slots) - 1   # jump straight to editing the new one
+        _save_settings(tuser.id)
         await edit_menu(query,
             f"✅ <b>{_ad_slot_label(sess.editing_slot)} added!</b>\n\n"
             "Set its Ad ID, fetch its details, then choose a mode — "
@@ -7350,6 +7374,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         label = _ad_slot_label(slot_idx)
         sess.remove_ad_slot(slot_idx)
         sess.editing_slot = -1   # back to Ad 1
+        _save_settings(tuser.id)
         await edit_menu(query,
             f"🗑 <b>{label} removed.</b>\n\n" + ads_section_text(tuser.id),
             ads_section_keyboard(tuser.id)
@@ -7808,11 +7833,12 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.info(f"[AdID] Saved ad_id for user={uid} slot={slot_str} ad_id={text.strip()!r}")
             label = f"Account {slot_str}"
         else:
-            # Ads 2/3 are ephemeral (in-memory only), like the rest of the
-            # per-user session state — no disk persistence needed here.
+            # Ad 2/Ad 3's ad_id — now persisted too (see _save_settings),
+            # not ephemeral in-memory-only as before.
             s = _ad_settings(sess, slot_idx)
             s["ad_id"] = text.strip()
             _ad_data_of(sess, slot_idx).clear()
+            _save_settings(uid)
             logger.info(f"[AdID] Saved ad_id for user={uid} {_ad_slot_label(slot_idx)} ad_id={text.strip()!r}")
             label = _ad_slot_label(slot_idx)
         _state["action"] = None
@@ -7865,7 +7891,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if slot_idx == -1:
                 slot_str = _get_user_slot_str(uid)
                 sess.settings[f"increment_{slot_str}"] = text
-                _save_settings(uid)
+            _save_settings(uid)
             _state["action"] = None
             hint = next_setup_hint(uid) if slot_idx == -1 else ""
             await reply_with_back(f"✅ <b>{_ad_slot_label(slot_idx)} increment saved!</b>\n\n<code>+{_esc(text)}</code> per cycle\n\n<i>{_esc(hint)}</i>")
@@ -7887,7 +7913,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if slot_idx == -1:
             slot_str = _get_user_slot_str(uid)
             sess.settings[f"float_pct_{slot_str}"] = text
-            _save_settings(uid)
+        _save_settings(uid)
         _state["action"] = None
         hint = next_setup_hint(uid) if slot_idx == -1 else ""
         await reply_with_back(
@@ -7925,7 +7951,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if slot_idx == -1:
             slot_str = _get_user_slot_str(uid)
             sess.settings[f"interval_{slot_str}"] = val
-            _save_settings(uid)
+        _save_settings(uid)
         _state["action"] = None
         hint = next_setup_hint(uid) if slot_idx == -1 else ""
         await reply_with_back(f"✅ <b>{_ad_slot_label(slot_idx)} interval saved!</b>\n\nEvery <code>{_esc(str(val))}</code> min\n\n<i>{_esc(hint)}</i>")
@@ -8405,7 +8431,7 @@ def _reset_user_session(sess) -> bool:
 
 async def _session_auto_reset_loop(bot=None):
     """
-    Runs every 60 minutes (1 hour).
+    Runs every 120 minutes (2 hours).
     For every user with ANY active feature (order monitor, chat monitor,
     auto-pay, sell msg, buyer protection, name match) it:
       1. Fully resets their session — same as pressing the Reset Session button.
@@ -8414,8 +8440,8 @@ async def _session_auto_reset_loop(bot=None):
     """
     global _next_session_reset_ts
     while True:
-        _next_session_reset_ts = datetime.now().timestamp() + 3600
-        await asyncio.sleep(3600)   # every 60 minutes
+        _next_session_reset_ts = datetime.now().timestamp() + 7200
+        await asyncio.sleep(7200)   # every 120 minutes
         try:
             MAX_IDS  = 500
             notified = 0
@@ -8447,7 +8473,7 @@ async def _session_auto_reset_loop(bot=None):
                             chat_id=_sess.user_id,
                             text=(
                                 "🔄 Scheduled System Reset\n\n"
-                                "The bot performs an automatic reset every hour to maintain "
+                                "The bot performs an automatic reset every 2 hours to maintain "
                                 "optimal performance and prevent API rate-limit issues.\n\n"
                                 "Your running features have been stopped. This includes:\n"
                                 "• AD Price Bot (all active ads)\n"
@@ -8883,7 +8909,7 @@ def start_bot():
             await asyncio.get_event_loop().run_in_executor(None, load_scammers)
         asyncio.create_task(_preload_scammers())
 
-        # Auto-reset stale sessions every 60 minutes + notify active users
+        # Auto-reset stale sessions every 2 hours + notify active users
         asyncio.create_task(_session_auto_reset_loop(app.bot))
 
         # Auto-clear old DB sessions every 12h
