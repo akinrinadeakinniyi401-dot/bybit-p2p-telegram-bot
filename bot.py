@@ -5820,7 +5820,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         )
         for admin_id in list(_admin_chat_ids):
             try:
-                await bot.send_message(chat_id=admin_id, text=admin_text, parse_mode="HTML")
+                await context.bot.send_message(chat_id=admin_id, text=admin_text, parse_mode="HTML")
             except Exception as e:
                 logger.warning(f"[PermanentIP] Failed to notify admin {admin_id}: {e}")
         await edit_menu(query,
