@@ -364,6 +364,84 @@ def check_and_auto_downgrade(user_id: int) -> bool:
 
 
 # ─────────────────────────────────────────
+# Permanent IP approval
+# ─────────────────────────────────────────
+# Tracks per-user, admin-gated approval to route that user's Bybit traffic
+# through the fixed-IP relay instead of Render's shared, rotating IP (see
+# bybit.py's _resolve_proxies — this is a strict per-user opt-in, never a
+# blanket default). Deliberately tied to the user's Pro plan expiry AT THE
+# MOMENT OF APPROVAL, never re-synced afterward — so a user who let their
+# plan lapse and quietly stopped paying can't keep working through it
+# indefinitely just because they whitelisted it on Bybit once. If they
+# later renew without requesting fresh approval, access stays expired.
+def request_permanent_ip(user_id: int) -> dict:
+    """Mark a pending Permanent IP request. Safe to call again while
+    already pending/expired/rejected — just resets to pending."""
+    with _lock:
+        user = get_user(user_id)
+        if not user:
+            return {}
+        user["permanent_ip_status"]       = "pending"
+        user["permanent_ip_requested_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        _write_json(_user_path(user_id), user)
+        logger.info(f"[DB] Permanent IP requested by user {user_id}")
+        return user
+
+def approve_permanent_ip(user_id: int) -> dict | None:
+    """Approve a pending Permanent IP request. Expiry is set to EXACTLY
+    match this user's CURRENT plan_expires — None (no expiry) if they're
+    on a lifetime Pro plan, matching it exactly either way. Returns None
+    and changes nothing if the user isn't currently an active Pro — there
+    is no valid plan expiry to peg this to."""
+    with _lock:
+        user = get_user(user_id)
+        if not user or not is_pro(user_id):
+            return None
+        user["permanent_ip_status"]  = "approved"
+        user["permanent_ip_expires"] = user.get("plan_expires")
+        _write_json(_user_path(user_id), user)
+        logger.info(
+            f"[DB] Permanent IP approved for user {user_id}, "
+            f"expires {user['permanent_ip_expires'] or 'lifetime (matches Pro plan)'}"
+        )
+        return user
+
+def reject_permanent_ip(user_id: int) -> dict:
+    with _lock:
+        user = get_user(user_id)
+        if not user:
+            return {}
+        user["permanent_ip_status"]  = "rejected"
+        user["permanent_ip_expires"] = None
+        _write_json(_user_path(user_id), user)
+        logger.info(f"[DB] Permanent IP request rejected for user {user_id}")
+        return user
+
+def permanent_ip_status(user_id: int) -> dict:
+    """Returns {"status": "none"|"pending"|"approved"|"rejected"|"expired",
+    "expires": str|None}. "expired" is computed live here — approved but
+    past its own expiry — WITHOUT touching the user's actual Pro plan
+    status, since this is a separate, narrower access flag layered on
+    top of it, not the plan itself."""
+    user = get_user(user_id)
+    if not user:
+        return {"status": "none", "expires": None}
+    status  = user.get("permanent_ip_status", "none")
+    expires = user.get("permanent_ip_expires")
+    if status == "approved" and expires:
+        try:
+            if datetime.strptime(expires, "%Y-%m-%d %H:%M:%S") <= datetime.now():
+                return {"status": "expired", "expires": expires}
+        except Exception:
+            pass
+    return {"status": status, "expires": expires}
+
+def is_permanent_ip_active(user_id: int) -> bool:
+    """True only while approved AND (lifetime or not yet expired)."""
+    return permanent_ip_status(user_id)["status"] == "approved"
+
+
+# ─────────────────────────────────────────
 # Upgrade requests
 # ─────────────────────────────────────────
 def request_upgrade(user_id: int, username: str, display_name: str, contact: str = ""):
