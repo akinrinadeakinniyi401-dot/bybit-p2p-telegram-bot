@@ -49,7 +49,7 @@ BASE_URL = "https://api.bybit.com"
 # Leave it unset and nothing changes — this is a complete no-op until
 # configured.
 _BYBIT_PROXY_URL = os.getenv("BYBIT_PROXY_URL", "").strip()
-PROXIES = {"http": _BYBIT_PROXY_URL, "https": _BYBIT_PROXY_URL} if _BYBIT_PROXY_URL else None
+BYBIT_PROXY_URL  = _BYBIT_PROXY_URL   # public alias — bot.py reads this to build a per-user proxy_url
 
 # ─────────────────────────────────────────
 # Active env account index (admin switching)
@@ -319,6 +319,19 @@ def parse_response(response, label=""):
         return {"retCode": -1, "retMsg": f"JSON error: {e}"}
 
 
+def _resolve_proxies(creds: dict | None):
+    """Per-call proxy override, for the Permanent IP feature. Deliberately
+    has NO blanket fallback — this only ever activates when the caller's
+    creds dict explicitly carries a "proxy_url" (set by bot.py's
+    get_user_creds, based on THAT specific user's Permanent IP approval
+    status, which is itself gated behind admin approval and tied to their
+    Pro plan expiry). Every other call — which is to say, the vast
+    majority of users — goes direct, exactly as it always has."""
+    if creds and creds.get("proxy_url"):
+        return {"http": creds["proxy_url"], "https": creds["proxy_url"]}
+    return None
+
+
 def _post(endpoint: str, body: dict, creds: dict | None = None) -> dict:
     """All authenticated POST calls go through here. Creds resolved per-call."""
     api_key, api_secret = _resolve_creds(creds)
@@ -326,7 +339,7 @@ def _post(endpoint: str, body: dict, creds: dict | None = None) -> dict:
     payload = json.dumps(body, separators=(',', ':'))
     headers = _get_headers(api_key, api_secret, payload)
     try:
-        response = requests.post(url, headers=headers, data=payload, timeout=10, proxies=PROXIES)
+        response = requests.post(url, headers=headers, data=payload, timeout=10, proxies=_resolve_proxies(creds))
         return parse_response(response, f" [{endpoint.split('/')[-1]}]")
     except requests.exceptions.Timeout:
         return {"retCode": -1, "retMsg": "Request timed out"}
@@ -342,7 +355,7 @@ def _get_auth(endpoint: str, params: dict | None = None,
     url     = BASE_URL + endpoint
     headers = _get_headers(api_key, api_secret, "")
     try:
-        response = requests.get(url, headers=headers, params=params, timeout=10, proxies=PROXIES)
+        response = requests.get(url, headers=headers, params=params, timeout=10, proxies=_resolve_proxies(creds))
         return parse_response(response, f" [{endpoint.split('/')[-1]}]")
     except Exception as e:
         logger.error(f"[Bybit] GET {endpoint} error: {e}")
@@ -423,7 +436,7 @@ def get_my_ads(creds: dict | None = None) -> dict:
     headers = _get_headers(api_key, api_secret, "{}")
     try:
         return parse_response(
-            requests.post(url, headers=headers, data="{}", timeout=10, proxies=PROXIES),
+            requests.post(url, headers=headers, data="{}", timeout=10, proxies=_resolve_proxies(creds)),
             " [personal/list]"
         )
     except Exception as e:
