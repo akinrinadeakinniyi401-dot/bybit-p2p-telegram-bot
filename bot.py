@@ -910,9 +910,20 @@ def get_user_creds(user_id: int, slot: int | None = None) -> dict | None:
 
     key    = db.get_api(user_id, f"bybit_key_{slot_str}")
     secret = db.get_api(user_id, f"bybit_secret_{slot_str}")
+
+    # Permanent IP — strictly opt-in, per user, admin-approved and tied to
+    # their Pro plan expiry (see db.py). Attached here so EVERY existing
+    # Bybit call site (ad price bot, order monitor, everything) picks it
+    # up automatically via bybit.py's _resolve_proxies, with no other
+    # code needing to know this feature exists.
+    proxy_url = bybit.BYBIT_PROXY_URL if (bybit.BYBIT_PROXY_URL and db.is_permanent_ip_active(user_id)) else None
+
     if key and secret:
         logger.debug(f"[Creds] User {user_id} slot {slot_str} — DB key found")
-        return {"key": key, "secret": secret}
+        creds = {"key": key, "secret": secret}
+        if proxy_url:
+            creds["proxy_url"] = proxy_url
+        return creds
 
     # No DB key for this user/slot
     if is_admin(user_id):
@@ -922,7 +933,10 @@ def get_user_creds(user_id: int, slot: int | None = None) -> dict | None:
 
     # Non-admin: return sentinel (empty strings) — callers show "No API set" error
     logger.info(f"[Creds] User {user_id} slot {slot_str} — NO API KEY SAVED")
-    return {"key": "", "secret": ""}
+    creds = {"key": "", "secret": ""}
+    if proxy_url:
+        creds["proxy_url"] = proxy_url
+    return creds
 
 
 # ─────────────────────────────────────────
@@ -3179,6 +3193,31 @@ async def order_monitor_loop(bot, chat_id):
                 if rc == 10010 or (rc != 0 and "IP" in str(msg).upper()):
                     if not _ip_error_notified:
                         _ip_error_notified = True
+                        # If this user previously had Permanent IP access that's
+                        # since expired or been rejected, the generic "add this
+                        # IP" message is actively misleading — they may have
+                        # already replaced Render's ranges with the Permanent
+                        # IP on Bybit's side, so Render's IP genuinely isn't
+                        # whitelisted for them anymore. Point them back to
+                        # requesting approval instead of a whitelist step that
+                        # doesn't reflect their actual setup.
+                        _pip_status = db.permanent_ip_status(chat_id)["status"]
+                        if _pip_status in ("expired", "rejected"):
+                            await bot.send_message(
+                                chat_id=chat_id,
+                                text=(
+                                    "🔒 <b>Permanent IP Access Required</b>\n\n"
+                                    f"Your API key for Account {_get_user_slot_str(chat_id)} isn't reachable "
+                                    "on Render's IP right now, and your Permanent IP access has "
+                                    f"{'expired' if _pip_status == 'expired' else 'been declined'}.\n\n"
+                                    "👉 Request approval for this Permanent IP from admin before continuing "
+                                    "(see 🌍 Get My IP in the main menu).\n\n"
+                                    "⚠️ Order monitor has been <b>paused</b> to prevent error spam."
+                                ),
+                                parse_mode="HTML"
+                            )
+                            sess.order_monitor_running = False
+                            break
                         ip = await _get_current_ip()
                         await bot.send_message(
                             chat_id=chat_id,
@@ -5726,10 +5765,69 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             f"🌍 <b>Public IP Address</b>\n\n<code>{ip}</code>\n\n"
             "👉 Add this to your Bybit API whitelist if it changed."
         ) if ip else "❌ Could not fetch IP. Try again."
+
+        kb_rows = list(back_main())
+        # ── Permanent IP block ──
+        # A fixed, non-rotating IP (see bybit.BYBIT_PROXY_URL) — unlike the
+        # address above, which is Render's shared, rotating IP and can
+        # change on its own. Access is strictly per-user and admin-gated,
+        # tied to that user's Pro plan expiry — see db.py's
+        # request/approve/reject_permanent_ip.
+        if bybit.BYBIT_PROXY_URL:
+            permanent_ip_host = bybit.BYBIT_PROXY_URL.split("@")[-1].split(":")[0]
+            pip = db.permanent_ip_status(tuser.id)
+            if pip["status"] == "approved":
+                exp_str = f"until <code>{pip['expires']}</code>" if pip["expires"] else "for the lifetime of your Pro plan"
+                txt += (
+                    f"\n\n🔒 <b>Permanent IP</b>\n<code>{permanent_ip_host}</code>\n\n"
+                    f"✅ Approved and active {exp_str}."
+                )
+            elif pip["status"] == "pending":
+                txt += (
+                    f"\n\n🔒 <b>Permanent IP</b>\n<code>{permanent_ip_host}</code>\n\n"
+                    f"⏳ Your request is pending admin approval."
+                )
+            else:
+                # "none", "rejected", or "expired"
+                note = ""
+                if pip["status"] == "rejected":
+                    note = "\n\n⚠️ A previous request was declined."
+                elif pip["status"] == "expired":
+                    note = "\n\n⚠️ A previous approval has expired."
+                txt += (
+                    f"\n\n🔒 <b>Permanent IP</b>\n<code>{permanent_ip_host}</code>\n\n"
+                    f"It's a permanent IP — it won't work without admin approval. "
+                    f"Request approval below.{note}"
+                )
+                kb_rows = [[InlineKeyboardButton("🔒 Request Permanent IP Approval", callback_data="request_permanent_ip")]] + kb_rows
+
         try:
-            await query.edit_message_caption(caption=txt, reply_markup=InlineKeyboardMarkup(back_main()), parse_mode="HTML")
+            await query.edit_message_caption(caption=txt, reply_markup=InlineKeyboardMarkup(kb_rows), parse_mode="HTML")
         except Exception:
-            await query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(back_main()), parse_mode="HTML")
+            await query.edit_message_text(txt, reply_markup=InlineKeyboardMarkup(kb_rows), parse_mode="HTML")
+
+    # ── 🔒 Request Permanent IP Approval ──
+    elif data == "request_permanent_ip":
+        db.request_permanent_ip(tuser.id)
+        uname = f"@{tuser.username}" if tuser.username else "(no username)"
+        badge = sub.plan_badge(tuser.id)
+        admin_text = (
+            f"🔒 <b>Permanent IP requested</b>\n\n"
+            f"User: <code>{tuser.id}</code> {uname}\n"
+            f"Plan: {badge}\n\n"
+            f"✅ Approve: <code>/approveip {tuser.id}</code>\n"
+            f"❌ Reject: <code>/rejectip {tuser.id}</code>"
+        )
+        for admin_id in list(_admin_chat_ids):
+            try:
+                await bot.send_message(chat_id=admin_id, text=admin_text, parse_mode="HTML")
+            except Exception as e:
+                logger.warning(f"[PermanentIP] Failed to notify admin {admin_id}: {e}")
+        await edit_menu(query,
+            "🔒 <b>Request sent</b>\n\nYour Permanent IP request has been sent to the admin — "
+            "you'll be notified here once it's reviewed.",
+            InlineKeyboardMarkup(back_main())
+        )
 
     # ── 🔑 Switch Account ──
     elif data.startswith("switch_account_"):
@@ -8720,6 +8818,75 @@ async def check_name_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
 
 # ─────────────────────────────────────────
+# 🔒 /approveip, /rejectip — Admin approval for Permanent IP requests
+# ─────────────────────────────────────────
+async def cmd_approveip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("❌ Admin only.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /approveip <user_id>")
+        return
+    try:
+        target_uid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Invalid user ID.")
+        return
+    if not sub.is_pro(target_uid):
+        await update.message.reply_text(
+            f"❌ User <code>{target_uid}</code> isn't currently on an active Pro plan — "
+            f"nothing to tie the Permanent IP expiry to. Approval NOT applied.",
+            parse_mode="HTML"
+        )
+        return
+    updated = db.approve_permanent_ip(target_uid)
+    if not updated:
+        await update.message.reply_text(f"❌ Could not approve user <code>{target_uid}</code>.", parse_mode="HTML")
+        return
+    exp = updated.get("permanent_ip_expires")
+    exp_str = f"until {exp}" if exp else "for the lifetime of their Pro plan"
+    await update.message.reply_text(
+        f"✅ Permanent IP approved for user <code>{target_uid}</code>, active {exp_str}.",
+        parse_mode="HTML"
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=target_uid,
+            text=(
+                f"✅ <b>Permanent IP Approved</b>\n\n"
+                f"Your Permanent IP access is now active {exp_str}.\n\n"
+                f"Check ⬆️ Get My IP in the main menu for the address to whitelist on Bybit."
+            ),
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.warning(f"[PermanentIP] Failed to notify user {target_uid} of approval: {e}")
+
+async def cmd_rejectip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("❌ Admin only.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /rejectip <user_id>")
+        return
+    try:
+        target_uid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Invalid user ID.")
+        return
+    db.reject_permanent_ip(target_uid)
+    await update.message.reply_text(f"❌ Permanent IP request rejected for user <code>{target_uid}</code>.", parse_mode="HTML")
+    try:
+        await context.bot.send_message(
+            chat_id=target_uid,
+            text="❌ <b>Permanent IP Request Declined</b>\n\nContact the admin for details.",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.warning(f"[PermanentIP] Failed to notify user {target_uid} of rejection: {e}")
+
+
+# ─────────────────────────────────────────
 # 📊 /userdata — Admin export (overrides admin_commands import)
 # Includes total_buy_orders + total_sell_orders from DB and live session.
 # ─────────────────────────────────────────
@@ -8870,6 +9037,8 @@ def start_bot():
     application.add_handler(CommandHandler("referrals",     cmd_referrals))
     application.add_handler(CommandHandler("withdrawals",      cmd_withdrawals))
     application.add_handler(CommandHandler("approvewithdraw",  cmd_approvewithdraw))
+    application.add_handler(CommandHandler("approveip", cmd_approveip))
+    application.add_handler(CommandHandler("rejectip",  cmd_rejectip))
     application.add_handler(CommandHandler("rejectwithdraw",   cmd_rejectwithdraw))
     application.add_handler(CommandHandler("broadcast",        broadcast_command))
 
