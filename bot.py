@@ -174,6 +174,65 @@ def _set_ad_task(sess, slot_idx: int, task):
     else:
         sess.extra_ad_slots[slot_idx]["task"] = task
 
+def _ip_error_already_notified(sess, slot_idx: int) -> bool:
+    return getattr(sess, "ip_error_notified_by_slot", {}).get(slot_idx, False)
+
+def _set_ip_error_notified(sess, slot_idx: int, val: bool):
+    store = getattr(sess, "ip_error_notified_by_slot", None)
+    if store is None:
+        store = {}
+        sess.ip_error_notified_by_slot = store
+    store[slot_idx] = val
+
+async def _handle_ad_ip_error(bot, chat_id: int, sess, slot_idx: int, ret_code, ret_msg) -> bool:
+    """Detects Bybit's "Unmatched IP" rejection (10010) for the ad price
+    bot — fast-chase and the scheduled cycle both hit this identically
+    whenever the account's IP genuinely isn't whitelisted for this call,
+    whether that's because it was never whitelisted, or because a
+    Permanent IP approval just expired/got rejected and Render's IP was
+    never re-added. Previously this was either silent (fast-chase just
+    logged a warning and moved on) or simply never checked at all (the
+    scheduled cycle kept retrying every interval forever with no
+    detection whatsoever) — this brings both in line with order monitor's
+    existing, working pattern: ONE notification, then stop this slot
+    until the user manually restarts it, rather than silently burning
+    budget/cycles against an IP problem that won't resolve itself.
+    Returns True if this WAS an IP error (caller should stop processing
+    immediately) — False otherwise (do nothing, not this kind of error).
+    """
+    if ret_code != 10010 and "IP" not in str(ret_msg).upper():
+        return False
+    if _ip_error_already_notified(sess, slot_idx):
+        _set_ad_running(sess, slot_idx, False)
+        return True
+    _set_ip_error_notified(sess, slot_idx, True)
+    label = _ad_slot_label(slot_idx)
+    pip_status = db.permanent_ip_status(chat_id)["status"]
+    if pip_status in ("expired", "rejected"):
+        text = (
+            f"🔒 <b>{label} — Permanent IP Access Required</b>\n\n"
+            f"Bybit rejected this request as an unmatched IP, and your Permanent IP access has "
+            f"{'expired' if pip_status == 'expired' else 'been declined'}.\n\n"
+            "👉 Request approval for this Permanent IP from admin before continuing "
+            "(see 🌍 Get My IP in the main menu).\n\n"
+            f"⚠️ {label} has been <b>stopped</b> to avoid wasting requests. Restart it after this is resolved."
+        )
+    else:
+        ip = await _get_current_ip()
+        text = (
+            f"🚫 <b>{label} — Bybit IP Whitelist Error (10010)</b>\n\n"
+            f"Your API key isn't whitelisted for this server's IP.\n\n"
+            f"👉 Add <code>{_esc(ip)}</code> to your Bybit API key's IP whitelist:\n"
+            "Bybit → Account → API Management → Edit Key → Bind IP\n\n"
+            f"⚠️ {label} has been <b>stopped</b> to avoid wasting requests. Restart it after whitelisting the IP."
+        )
+    try:
+        await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+    except Exception as e:
+        logger.warning(f"[IPError] Failed to notify user {chat_id} for {label}: {e}")
+    _set_ad_running(sess, slot_idx, False)
+    return True
+
 def _ad_current_price(sess, slot_idx: int) -> Decimal:
     slot_idx = _valid_slot(sess, slot_idx)
     return sess.current_price if slot_idx == -1 else sess.extra_ad_slots[slot_idx]["current_price"]
@@ -364,6 +423,11 @@ def _reset_ad_failures(sess, slot_idx: int):
         sess.consecutive_failures = 0
     else:
         sess.extra_ad_slots[slot_idx]["consecutive_failures"] = 0
+    # A successful post or a manual (re)start both mean whatever IP issue
+    # existed before is either resolved or the user is trying again —
+    # either way, a FUTURE ip error deserves a fresh notification, not
+    # permanent silence from a stale flag set the last time this happened.
+    _set_ip_error_notified(sess, slot_idx, False)
 
 
 # ─────────────────────────────────────────
@@ -4255,6 +4319,8 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                     _ad_executor, modify_ad, s["ad_id"], str(submit_price), ad_data, creds
                 )
                 code = result.get("retCode", result.get("ret_code", -1))
+                if await _handle_ad_ip_error(bot, chat_id, sess, slot_idx, code, result.get("retMsg", result.get("ret_msg", ""))):
+                    return
                 if code == 0:
                     posted_price = submit_price
                     logger.info(f"{tag} modify accepted — new ad price {posted_price}")
@@ -4535,6 +4601,8 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                     last_code = result.get("retCode", result.get("ret_code", -1))
                     last_msg  = result.get("retMsg",  result.get("ret_msg","Unknown"))
                     logger.info(f"{tag} probe result code={last_code} msg={last_msg!r}")
+                    if await _handle_ad_ip_error(bot, chat_id, sess, slot_idx, last_code, last_msg):
+                        return
 
                     if last_code == 0:
                         # Extremely unlikely — the 5x probe was accepted
@@ -4897,6 +4965,8 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
             )
             ret_code = result.get("retCode", result.get("ret_code",-1))
             ret_msg  = result.get("retMsg",  result.get("ret_msg","Unknown"))
+            if await _handle_ad_ip_error(bot, chat_id, sess, slot_idx, ret_code, ret_msg):
+                return
 
             if ret_code == 912120022:
                 # Out-of-range — Bybit tells us its own max/min. The FIRST
