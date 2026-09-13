@@ -405,6 +405,22 @@ def _set_ad_current_price(sess, slot_idx: int, price, collision_adjusted: bool =
         _set_ceiling_ref(sess, slot_idx, price)
     _set_pending_ceiling(sess, slot_idx, None)
 
+def _market_ads_query_side(ad_data: dict) -> str:
+    """Which 'side' value to pass to /v5/p2p/item/online when looking for
+    ads that actually compete with this one. Confirmed empirically:
+    querying the SAME side value as the ad's own type returns unrelated
+    results (a flat, unrealistic price shared by many different real
+    merchants, nothing matching manual browsing of the market). Flipping
+    it — querying the OPPOSITE side from what the ad itself is — is what
+    actually lines up with what a user manually browsing the market sees.
+    Implemented as a flip of the ad's own side rather than a hardcoded
+    literal "1", so this stays correct if Ad Copy is ever used on a
+    Sell-type ad too, not just the Buy-type ads this was tested against.
+    """
+    own_side = str(ad_data.get("side", "0")).strip()
+    return "0" if own_side == "1" else "1"
+
+
 def _ad_slot_label(slot_idx: int) -> str:
     return "Ad 1" if slot_idx == -1 else f"Ad {slot_idx + 2}"
 
@@ -4883,7 +4899,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                 _market = await asyncio.get_event_loop().run_in_executor(
                     _ad_executor, get_market_ads,
                     ad_data.get("tokenId",""), ad_data.get("currencyId",""),
-                    ad_data.get("side", "0"), 1, _range_n + len(_own_ad_ids) + 5, creds
+                    _market_ads_query_side(ad_data), 1, _range_n + len(_own_ad_ids) + 5, creds
                 )
                 _items = (_market.get("result") or {}).get("items", []) if isinstance(_market, dict) else []
                 logger.info(
@@ -6689,7 +6705,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
     # ── 🔝 Ad Copy Range ──
     # ── 🔍 View Market Ads List (diagnostic) ──
-    elif data == "view_market_ads":
+    elif data == "view_market_ads" or data.startswith("view_market_ads_"):
         sess = _s(tuser.id)
         slot_idx = sess.editing_slot
         s = _ad_settings(sess, slot_idx)
@@ -6697,13 +6713,23 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         if not ad_data:
             await query.answer("Fetch ad details first.", show_alert=True)
             return
-        creds = get_user_creds(tuser.id, slot=_get_user_slot(tuser.id))
+        # Params encoded directly in callback_data (view_market_ads_s{side}_n{size})
+        # — stateless, so no session storage needed just for a diagnostic view.
+        side_override, size_n = None, 10
+        if data.startswith("view_market_ads_"):
+            for part in data[len("view_market_ads_"):].split("_"):
+                if part.startswith("s"):
+                    side_override = part[1:]
+                elif part.startswith("n"):
+                    try: size_n = int(part[1:])
+                    except ValueError: pass
         want_token    = ad_data.get("tokenId","")
         want_currency = ad_data.get("currencyId","")
-        want_side     = ad_data.get("side", "0")
+        want_side     = side_override if side_override is not None else _market_ads_query_side(ad_data)
+        creds = get_user_creds(tuser.id, slot=_get_user_slot(tuser.id))
         await query.answer("Fetching live market ads...")
         market = await asyncio.get_event_loop().run_in_executor(
-            _ad_executor, get_market_ads, want_token, want_currency, want_side, 1, 20, creds
+            _ad_executor, get_market_ads, want_token, want_currency, want_side, 1, max(size_n, 10), creds
         )
         items = (market.get("result") or {}).get("items", []) if isinstance(market, dict) else []
         own_ids = {
@@ -6712,23 +6738,37 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             if (_ad_settings(sess, i) or {}).get("ad_id")
         }
         lines = [
-            f"🔍 <b>Live Market Ads — Raw Request</b>\n",
-            f"Requested: tokenId=<code>{_esc(want_token)}</code> currencyId=<code>{_esc(want_currency)}</code> side=<code>{_esc(str(want_side))}</code>\n",
-            f"retCode={market.get('retCode', market.get('ret_code','?'))} — {market.get('retMsg', market.get('ret_msg',''))}\n" if isinstance(market, dict) else "",
+            f"🔍 <b>Live Market Ads</b>",
+            f"<code>{_esc(want_token)}/{_esc(want_currency)}</code> · side=<code>{_esc(str(want_side))}</code> "
+            f"(your ad's own side is <code>{_esc(str(ad_data.get('side','?')))}</code>)",
+            "",
         ]
         if not items:
             lines.append("No items returned.")
-        for i, it in enumerate(items[:20], 1):
-            mark = " 🔸(YOUR AD)" if str(it.get("id","")) in own_ids else ""
+        for i, it in enumerate(items[:size_n], 1):
+            mark = " 🔸YOURS" if str(it.get("id","")) in own_ids else ""
+            nick = it.get("nickName","?")
+            if len(nick) > 18:
+                nick = nick[:17] + "…"
             lines.append(
-                f"{i}. <code>{_esc(str(it.get('price','?')))}</code> — {_esc(it.get('tokenId',''))}/{_esc(it.get('currencyId',''))} "
-                f"— {_esc(it.get('nickName','?'))} {'🟢' if it.get('isOnline') else '⚪'} "
-                f"(side={_esc(str(it.get('side','?')))}, min-max {_esc(str(it.get('minAmount','?')))}-{_esc(str(it.get('maxAmount','?')))}){mark}"
+                f"<b>{i}.</b> <code>{_esc(str(it.get('price','?')))}</code>{mark}\n"
+                f"    {_esc(nick)} {'🟢' if it.get('isOnline') else '⚪'} · "
+                f"{_esc(str(it.get('minAmount','?')))}-{_esc(str(it.get('maxAmount','?')))}"
             )
         txt = "\n".join(lines)
         if len(txt) > 3900:
             txt = txt[:3900] + "\n…(truncated)"
-        await edit_menu(query, txt, InlineKeyboardMarkup(back_section("section_ads")))
+        rows = [
+            [
+                InlineKeyboardButton(("✅ " if want_side == "0" else "") + "Side 0", callback_data=f"view_market_ads_s0_n{size_n}"),
+                InlineKeyboardButton(("✅ " if want_side == "1" else "") + "Side 1", callback_data=f"view_market_ads_s1_n{size_n}"),
+            ],
+            [
+                InlineKeyboardButton(("✅ " if size_n == 10 else "") + "Top 10", callback_data=f"view_market_ads_s{want_side}_n10"),
+                InlineKeyboardButton(("✅ " if size_n == 20 else "") + "Top 20", callback_data=f"view_market_ads_s{want_side}_n20"),
+            ],
+        ] + back_section("section_ads")
+        await edit_menu(query, txt, InlineKeyboardMarkup(rows))
 
     elif data == "set_ad_copy_range":
         sess = _s(tuser.id)
