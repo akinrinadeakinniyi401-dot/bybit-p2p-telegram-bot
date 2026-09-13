@@ -421,8 +421,8 @@ def _pick_ad_copy_price(competing: list):
     the window, to guard against a single outlier sitting at #1. That
     "clustering" behaviour is intentionally removed — it could copy a
     different ad than the one actually in position #1 on the real page,
-    which no longer matches what the market shows. Copy Range (Top 1-5 /
-    Top 1-10) still controls how deep to look ONLY for the purpose of
+    which no longer matches what the market shows. Copy Range (1-10 /
+    1-20) still controls how deep to look ONLY for the purpose of
     skipping past your own ad(s); it no longer affects price selection.
 
     Returns (chosen_price_str, chosen_item) or (None, None) if the
@@ -436,18 +436,45 @@ def _pick_ad_copy_price(competing: list):
 
 def _market_ads_query_side(ad_data: dict) -> str:
     """Which 'side' value to pass to /v5/p2p/item/online when looking for
-    ads that actually compete with this one. Confirmed empirically:
-    querying the SAME side value as the ad's own type returns unrelated
-    results (a flat, unrealistic price shared by many different real
-    merchants, nothing matching manual browsing of the market). Flipping
-    it — querying the OPPOSITE side from what the ad itself is — is what
-    actually lines up with what a user manually browsing the market sees.
-    Implemented as a flip of the ad's own side rather than a hardcoded
-    literal "1", so this stays correct if Ad Copy is ever used on a
-    Sell-type ad too, not just the Buy-type ads this was tested against.
+    ads that actually compete with this one.
+
+    REVERTED from the earlier "flip" logic. Live test (2026-09-13) showed
+    querying the FLIPPED side returned a stale, wrong-looking cluster of
+    prices (e.g. Adi_Melo at 0.800 when the live site showed ~0.98) —
+    the flip was not correct in production despite the earlier note
+    claiming it was confirmed empirically. Per Bybit's own docs, "side"
+    on /v5/p2p/item/online is just 0=buy / 1=sell for the ads being
+    RETURNED, with no reference to "your own ad" at all — so the ads
+    that actually compete with yours are simply the ones posted with the
+    SAME side value as your own ad. No flipping.
     """
-    own_side = str(ad_data.get("side", "0")).strip()
-    return "0" if own_side == "1" else "1"
+    return str(ad_data.get("side", "0")).strip()
+
+
+def _ad_copy_range_n(s: dict) -> int:
+    """How many page-1 positions deep to look — ONLY to skip past your
+    own ad id(s), never to change which price gets picked (that's always
+    strictly position #1 of whatever remains after skipping your own
+    ads — see _pick_ad_copy_price). Two choices: 1-10 or 1-20.
+
+    Stored setting values are "top10" / "top20". Old saved values from
+    before this change ("top5" / "top10") are migrated in place so
+    existing users don't silently keep the old, narrower depth:
+    legacy "top5" (was depth 5)  → depth 10 (new first option)
+    legacy "top10" (was depth 10) → depth 20 (new second option)
+    """
+    v = s.get("ad_copy_range", "top10")
+    if v == "top20":
+        return 20
+    if v == "top10":
+        return 10
+    if v == "top5":       # legacy value
+        return 10
+    return 10             # unknown/legacy fallback
+
+
+def _ad_copy_range_label(v: str) -> str:
+    return "1 - 20" if v in ("top20",) else "1 - 10"
 
 
 def _ad_slot_label(slot_idx: int) -> str:
@@ -1208,8 +1235,8 @@ def ads_section_keyboard(uid: int = 0):
     if mode == "fixed":
         rows.append([InlineKeyboardButton("➕ Set Increment", callback_data="set_increment")])
     elif mode == "ad_copy":
-        _range = s.get("ad_copy_range", "top5")
-        _range_label = "Top 1-5" if _range == "top5" else "Top 1-10"
+        _range = s.get("ad_copy_range", "top10")
+        _range_label = _ad_copy_range_label(_range)
         rows.append([InlineKeyboardButton(f"🔝 Copy Range: {_range_label}", callback_data="set_ad_copy_range")])
         rows.append([InlineKeyboardButton("🔍 View Market Ads List", callback_data="view_market_ads")])
     else:
@@ -4917,7 +4944,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                 # but mirroring the real current top-of-market price can.
                 _quant = Decimal("0.0001")
                 chase_ceiling = False   # not applicable — this mode never probes for a ceiling
-                _range_n = 10 if s.get("ad_copy_range") == "top10" else 5
+                _range_n = _ad_copy_range_n(s)
                 _own_ad_ids = {
                     (_ad_settings(sess, i) or {}).get("ad_id","")
                     for i in range(-1, sess.total_ad_slots() - 1)
@@ -6822,28 +6849,31 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         sess = _s(tuser.id)
         slot_idx = sess.editing_slot
         s = _ad_settings(sess, slot_idx)
-        cur = s.get("ad_copy_range", "top5")
+        cur = "top20" if s.get("ad_copy_range") == "top20" else "top10"  # legacy "top5"/"top10" both normalize to "top10" here
         rows = [
-            [InlineKeyboardButton(("✅ " if cur == "top5"  else "") + "Top 1 - 5",  callback_data="ad_copy_range_top5")],
-            [InlineKeyboardButton(("✅ " if cur == "top10" else "") + "Top 1 - 10", callback_data="ad_copy_range_top10")],
+            [InlineKeyboardButton(("✅ " if cur == "top10" else "") + "1 - 10", callback_data="ad_copy_range_top10")],
+            [InlineKeyboardButton(("✅ " if cur == "top20" else "") + "1 - 20", callback_data="ad_copy_range_top20")],
         ] + back_section("section_ads")
         await edit_menu(query,
             f"🔝 <b>{_ad_slot_label(slot_idx)} — Ad Copy Range</b>\n\n"
-            "How deep into the live market listing to look when picking the highest "
-            "non-self price to copy.",
+            "How deep into the live market listing (page 1) to look ONLY for the "
+            "purpose of skipping past your own ad(s). The price copied is always "
+            "whatever ad sits at position #1 once your own ads are skipped — this "
+            "setting never picks a 'highest' price, just how far it's allowed to "
+            "look for the first non-self ad.",
             InlineKeyboardMarkup(rows)
         )
 
-    elif data in ("ad_copy_range_top5", "ad_copy_range_top10"):
+    elif data in ("ad_copy_range_top10", "ad_copy_range_top20"):
         sess = _s(tuser.id)
         slot_idx = sess.editing_slot
         s = _ad_settings(sess, slot_idx)
-        s["ad_copy_range"] = "top5" if data.endswith("top5") else "top10"
+        s["ad_copy_range"] = "top20" if data.endswith("top20") else "top10"
         _save_settings(tuser.id)
         note = " (takes effect next cycle)" if _ad_running(sess, slot_idx) else ""
         await edit_menu(query,
             f"🔝 <b>{_ad_slot_label(slot_idx)} Ad Copy range set to "
-            f"{'Top 1 - 5' if s['ad_copy_range']=='top5' else 'Top 1 - 10'}{note}</b>",
+            f"{_ad_copy_range_label(s['ad_copy_range'])}{note}</b>",
             InlineKeyboardMarkup(back_section("section_ads"))
         )
 
