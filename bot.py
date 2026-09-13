@@ -1166,6 +1166,7 @@ def ads_section_keyboard(uid: int = 0):
         _range = s.get("ad_copy_range", "top5")
         _range_label = "Top 1-5" if _range == "top5" else "Top 1-10"
         rows.append([InlineKeyboardButton(f"🔝 Copy Range: {_range_label}", callback_data="set_ad_copy_range")])
+        rows.append([InlineKeyboardButton("🔍 View Market Ads List", callback_data="view_market_ads")])
     else:
         rows.append([InlineKeyboardButton("📊 Set Float %",   callback_data="set_float_pct")])
         _cur = ad_data.get("currencyId","").upper()
@@ -6687,6 +6688,48 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         )
 
     # ── 🔝 Ad Copy Range ──
+    # ── 🔍 View Market Ads List (diagnostic) ──
+    elif data == "view_market_ads":
+        sess = _s(tuser.id)
+        slot_idx = sess.editing_slot
+        s = _ad_settings(sess, slot_idx)
+        ad_data = _ad_data_of(sess, slot_idx)
+        if not ad_data:
+            await query.answer("Fetch ad details first.", show_alert=True)
+            return
+        creds = get_user_creds(tuser.id, slot=_get_user_slot(tuser.id))
+        want_token    = ad_data.get("tokenId","")
+        want_currency = ad_data.get("currencyId","")
+        want_side     = ad_data.get("side", "0")
+        await query.answer("Fetching live market ads...")
+        market = await asyncio.get_event_loop().run_in_executor(
+            _ad_executor, get_market_ads, want_token, want_currency, want_side, 1, 20, creds
+        )
+        items = (market.get("result") or {}).get("items", []) if isinstance(market, dict) else []
+        own_ids = {
+            (_ad_settings(sess, i) or {}).get("ad_id","")
+            for i in range(-1, sess.total_ad_slots() - 1)
+            if (_ad_settings(sess, i) or {}).get("ad_id")
+        }
+        lines = [
+            f"🔍 <b>Live Market Ads — Raw Request</b>\n",
+            f"Requested: tokenId=<code>{_esc(want_token)}</code> currencyId=<code>{_esc(want_currency)}</code> side=<code>{_esc(str(want_side))}</code>\n",
+            f"retCode={market.get('retCode', market.get('ret_code','?'))} — {market.get('retMsg', market.get('ret_msg',''))}\n" if isinstance(market, dict) else "",
+        ]
+        if not items:
+            lines.append("No items returned.")
+        for i, it in enumerate(items[:20], 1):
+            mark = " 🔸(YOUR AD)" if str(it.get("id","")) in own_ids else ""
+            lines.append(
+                f"{i}. <code>{_esc(str(it.get('price','?')))}</code> — {_esc(it.get('tokenId',''))}/{_esc(it.get('currencyId',''))} "
+                f"— {_esc(it.get('nickName','?'))} {'🟢' if it.get('isOnline') else '⚪'} "
+                f"(side={_esc(str(it.get('side','?')))}, min-max {_esc(str(it.get('minAmount','?')))}-{_esc(str(it.get('maxAmount','?')))}){mark}"
+            )
+        txt = "\n".join(lines)
+        if len(txt) > 3900:
+            txt = txt[:3900] + "\n…(truncated)"
+        await edit_menu(query, txt, InlineKeyboardMarkup(back_section("section_ads")))
+
     elif data == "set_ad_copy_range":
         sess = _s(tuser.id)
         slot_idx = sess.editing_slot
