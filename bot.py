@@ -451,6 +451,33 @@ def _market_ads_query_side(ad_data: dict) -> str:
     return str(ad_data.get("side", "0")).strip()
 
 
+async def _fetch_market_ads_up_to(token: str, currency: str, side: str,
+                                   total: int, creds) -> list:
+    """Fetch up to `total` market ads for the "View Market Ads List"
+    diagnostic, paging in chunks of 100 (Bybit's per-page cap) and
+    concatenating in the SAME order Bybit returns them (page 1's order is
+    the live "price highest to lowest" ordering — never re-sort here).
+    Stops early if a page comes back short (no more ads available).
+    """
+    items: list = []
+    page = 1
+    PAGE_CAP = 100
+    while len(items) < total:
+        remaining  = total - len(items)
+        fetch_size = min(PAGE_CAP, max(remaining, 10))
+        resp = await asyncio.get_event_loop().run_in_executor(
+            _ad_executor, get_market_ads, token, currency, side, page, fetch_size, creds
+        )
+        page_items = (resp.get("result") or {}).get("items", []) if isinstance(resp, dict) else []
+        if not page_items:
+            break
+        items.extend(page_items)
+        if len(page_items) < fetch_size:
+            break  # Bybit ran out of ads before filling the page
+        page += 1
+    return items[:total]
+
+
 def _ad_copy_range_n(s: dict) -> int:
     """How many page-1 positions deep to look — ONLY to skip past your
     own ad id(s), never to change which price gets picked (that's always
@@ -6783,16 +6810,24 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         if not ad_data:
             await query.answer("Fetch ad details first.", show_alert=True)
             return
-        # Params encoded directly in callback_data (view_market_ads_s{side}_n{size}_t{token})
-        # — stateless, so no session storage needed just for a diagnostic view.
-        side_override, size_n, token_override = None, 10, None
+        # Params encoded directly in callback_data
+        # (view_market_ads_s{side}_r{start}-{end}_t{token}) — stateless,
+        # so no session storage needed just for a diagnostic view.
+        # Range windows go up to 300 now (was capped at 100): 1-50, 50-100,
+        # 100-150, 150-200, 200-250, 250-300 — same window set for both
+        # BTC and USDT.
+        RANGE_OPTIONS = [(1, 50), (50, 100), (100, 150), (150, 200), (200, 250), (250, 300)]
+        side_override, start_n, end_n, token_override = None, 1, 50, None
         if data.startswith("view_market_ads_"):
             for part in data[len("view_market_ads_"):].split("_"):
                 if part.startswith("s"):
                     side_override = part[1:]
-                elif part.startswith("n"):
-                    try: size_n = int(part[1:])
-                    except ValueError: pass
+                elif part.startswith("r"):
+                    try:
+                        a, b = part[1:].split("-")
+                        start_n, end_n = int(a), int(b)
+                    except (ValueError, IndexError):
+                        pass
                 elif part.startswith("t"):
                     token_override = part[1:]
         want_token    = token_override if token_override is not None else ad_data.get("tokenId","")
@@ -6800,10 +6835,8 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         want_side     = side_override if side_override is not None else _market_ads_query_side(ad_data)
         creds = get_user_creds(tuser.id, slot=_get_user_slot(tuser.id))
         await query.answer("Fetching live market ads...")
-        market = await asyncio.get_event_loop().run_in_executor(
-            _ad_executor, get_market_ads, want_token, want_currency, want_side, 1, max(size_n, 10), creds
-        )
-        items = (market.get("result") or {}).get("items", []) if isinstance(market, dict) else []
+        items = await _fetch_market_ads_up_to(want_token, want_currency, want_side, end_n, creds)
+        window = items[start_n - 1:end_n]   # the ranked positions this button actually shows
         own_ids = {
             (_ad_settings(sess, i) or {}).get("ad_id","")
             for i in range(-1, sess.total_ad_slots() - 1)
@@ -6811,24 +6844,26 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         }
         # Same filtering AND selection the live cycle actually uses — so
         # this view shows exactly what would get copied, not just a raw
-        # unfiltered dump.
+        # unfiltered dump. "Would copy" is always evaluated over the full
+        # fetched list (rank 1 downward), independent of which window the
+        # buttons are currently showing.
         _competing = [
             it for it in items
             if str(it.get("id","")) not in own_ids
             and it.get("tokenId","").upper()    == want_token.upper()
             and it.get("currencyId","").upper() == want_currency.upper()
-        ][:size_n]
+        ]
         _chosen_price, _chosen_item = _pick_ad_copy_price(_competing)
         header_lines = [
             f"🔍 <b>Live Market Ads</b>",
             f"<code>{_esc(want_token)}/{_esc(want_currency)}</code> · side=<code>{_esc(str(want_side))}</code> "
             f"(your ad's own side is <code>{_esc(str(ad_data.get('side','?')))}</code>)",
-            f"👉 Would copy: <code>{_esc(str(_chosen_price))}</code>" if _chosen_price else "⚠️ No eligible ad in this window.",
-            f"📄 Fetched {len(items)} item(s) from page 1.",
+            f"👉 Would copy: <code>{_esc(str(_chosen_price))}</code>" if _chosen_price else "⚠️ No eligible ad found.",
+            f"📄 Showing ranks {start_n}-{end_n} · {len(items)} item(s) fetched total.",
             "",
         ]
-        if not items:
-            header_lines.append("No items returned.")
+        if not window:
+            header_lines.append("No items in this window.")
         # Build each item as ONE complete, self-contained HTML chunk (never
         # split a tag across the truncation boundary) then only add whole
         # chunks while there's room — this is what was crashing edit_menu:
@@ -6836,7 +6871,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         # count could cut a <code> or <b> tag in half, and Telegram's HTML
         # parser rejects the whole message ("unsupported start tag").
         item_chunks = []
-        for i, it in enumerate(items[:size_n], 1):
+        for i, it in enumerate(window, start_n):
             mark = " 🔸YOURS" if str(it.get("id","")) in own_ids else ""
             if _chosen_item is not None and it.get("id") == _chosen_item.get("id"):
                 mark += " ⭐WOULD COPY"
@@ -6865,15 +6900,15 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         # the message-length limit. Plain text (no HTML) so it's never at
         # risk of the same entity-parsing failure.
         dump_file = None
-        if len(shown_lines) < len(item_chunks) or size_n >= 50:
+        if len(shown_lines) < len(item_chunks) or (end_n - start_n) >= 50:
             import io as _io
             raw_lines = [
                 f"Live Market Ads — {want_token}/{want_currency} · side={want_side} "
                 f"(your ad's own side is {ad_data.get('side','?')})",
-                f"Fetched {len(items)} item(s) from page 1. Requested size={size_n}.",
+                f"Showing ranks {start_n}-{end_n}. {len(items)} item(s) fetched total.",
                 "",
             ]
-            for i, it in enumerate(items[:size_n], 1):
+            for i, it in enumerate(window, start_n):
                 mark = " YOURS" if str(it.get("id","")) in own_ids else ""
                 if _chosen_item is not None and it.get("id") == _chosen_item.get("id"):
                     mark += " <-- WOULD COPY"
@@ -6886,29 +6921,34 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 )
             raw_txt = "\n".join(raw_lines)
             dump_file = _io.BytesIO(raw_txt.encode("utf-8"))
-            dump_file.name = f"market_ads_{want_token}_{want_currency}_s{want_side}_n{size_n}.txt"
+            dump_file.name = f"market_ads_{want_token}_{want_currency}_s{want_side}_r{start_n}-{end_n}.txt"
         rows = [
             [
-                InlineKeyboardButton(("✅ " if want_token.upper() == "USDT" else "") + "USDT", callback_data=f"view_market_ads_s{want_side}_n{size_n}_tUSDT"),
-                InlineKeyboardButton(("✅ " if want_token.upper() == "BTC"  else "") + "BTC",  callback_data=f"view_market_ads_s{want_side}_n{size_n}_tBTC"),
+                InlineKeyboardButton(("✅ " if want_token.upper() == "USDT" else "") + "USDT", callback_data=f"view_market_ads_s{want_side}_r{start_n}-{end_n}_tUSDT"),
+                InlineKeyboardButton(("✅ " if want_token.upper() == "BTC"  else "") + "BTC",  callback_data=f"view_market_ads_s{want_side}_r{start_n}-{end_n}_tBTC"),
             ],
             [
-                InlineKeyboardButton(("✅ " if want_side == "0" else "") + "Side 0", callback_data=f"view_market_ads_s0_n{size_n}_t{want_token}"),
-                InlineKeyboardButton(("✅ " if want_side == "1" else "") + "Side 1", callback_data=f"view_market_ads_s1_n{size_n}_t{want_token}"),
+                InlineKeyboardButton(("✅ " if want_side == "0" else "") + "Side 0", callback_data=f"view_market_ads_s0_r{start_n}-{end_n}_t{want_token}"),
+                InlineKeyboardButton(("✅ " if want_side == "1" else "") + "Side 1", callback_data=f"view_market_ads_s1_r{start_n}-{end_n}_t{want_token}"),
             ],
-            [
-                InlineKeyboardButton(("✅ " if size_n == 10  else "") + "Top 10",  callback_data=f"view_market_ads_s{want_side}_n10_t{want_token}"),
-                InlineKeyboardButton(("✅ " if size_n == 20  else "") + "Top 20",  callback_data=f"view_market_ads_s{want_side}_n20_t{want_token}"),
-                InlineKeyboardButton(("✅ " if size_n == 100 else "") + "Top 100", callback_data=f"view_market_ads_s{want_side}_n100_t{want_token}"),
-            ],
-        ] + back_section("section_ads")
+        ]
+        # Range window buttons — 3 per row, same 6 windows for BTC and USDT.
+        for row_pair in (RANGE_OPTIONS[0:3], RANGE_OPTIONS[3:6]):
+            rows.append([
+                InlineKeyboardButton(
+                    ("✅ " if (a, b) == (start_n, end_n) else "") + f"{a}-{b}",
+                    callback_data=f"view_market_ads_s{want_side}_r{a}-{b}_t{want_token}"
+                )
+                for a, b in row_pair
+            ])
+        rows += back_section("section_ads")
         await edit_menu(query, txt, InlineKeyboardMarkup(rows))
         if dump_file is not None:
             try:
                 await query.message.reply_document(
                     document=dump_file,
                     filename=dump_file.name,
-                    caption=f"📄 Full raw dump — {want_token}/{want_currency} side={want_side}, {len(items)} item(s)."
+                    caption=f"📄 Full raw dump — {want_token}/{want_currency} side={want_side}, ranks {start_n}-{end_n}, {len(items)} item(s) fetched."
                 )
             except Exception as _e:
                 logger.warning(f"[view_market_ads] dump file send failed: {_e}")
