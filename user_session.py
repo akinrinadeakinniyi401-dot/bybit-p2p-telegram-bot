@@ -34,6 +34,10 @@ def _default_settings() -> dict:
         "sender_name":    "",
         "manage_ad_id":   "",
         "post_ad_qty":    "",
+        # "mode" can also be "ad_copy" — USD/USDT only. ad_copy_range is
+        # "top5" or "top10" — how deep into the live market listing to
+        # look when picking the highest non-self price to copy.
+        "ad_copy_range":  "top5",
     }
 
 
