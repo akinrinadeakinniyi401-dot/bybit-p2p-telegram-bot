@@ -437,17 +437,16 @@ def _pick_ad_copy_price(competing: list):
 def _pick_ad_copy_price_windowed(combined: list):
     """Selection rule for the USDT/USD deep-window Ad Copy comparison.
 
-    Given the COMBINED set of market ads pulled from two separate deep
-    windows (ranks 150-200 and ranks 240-250), choose whichever price
-    appears MOST OFTEN across that combined set — a price several
-    independent ads have converged on is treated as a more reliable
-    signal of the "real" market price than whatever sits at position #1,
-    which can be a single outlier or a boosted/stale listing.
+    Given a deep window of market ads (ranks 50-250), choose whichever
+    price appears MOST OFTEN within it — a price several independent ads
+    have converged on is treated as a more reliable signal of the "real"
+    market price than whatever sits at position #1, which can be a single
+    outlier or a boosted/stale listing.
 
     Ties (more than one price sharing the top frequency) are broken by
     whichever of the tied prices appears EARLIEST in `combined` — i.e.
-    window 150-200 takes priority over 240-250, and within a window
-    Bybit's own return order is preserved.
+    Bybit's own return order (closer to rank 50 wins ties over ranks
+    closer to 250).
 
     Returns (chosen_price_str, chosen_item) or (None, None) if the
     combined set is empty.
@@ -4726,7 +4725,17 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                     # nothing about where Bybit's real boundary currently sits),
                     # then decide whether the DISCOVERED boundary is worth
                     # posting — never the probe itself.
-                    probe_price = (new_p * Decimal("5")).quantize(_quant, rounding=ROUND_HALF_UP)
+                    # 50x (not 5x) — confirmed in production that 5x wasn't
+                    # always enough to force Bybit's out-of-range rejection:
+                    # some ads' real accepted price band is wider than a flat
+                    # 5x multiplier assumes, so an inflated-but-not-inflated-
+                    # ENOUGH probe was briefly accepted outright and went
+                    # live at ~5x its real price before the correction below
+                    # caught it. 50x pushes the probe far beyond any
+                    # realistic accepted band so that acceptance case should
+                    # no longer happen at all — the correction logic stays
+                    # in place regardless, as a second layer of defense.
+                    probe_price = (new_p * Decimal("50")).quantize(_quant, rounding=ROUND_HALF_UP)
                     _record_modify_slot(sess, slot_idx)
                     logger.info(f"{tag} chase-ceiling probe — submitting {probe_price}")
                     result = await asyncio.get_event_loop().run_in_executor(
@@ -4739,19 +4748,19 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                         return
 
                     if last_code == 0:
-                        # Extremely unlikely — the 5x probe was accepted
+                        # Extremely unlikely — the 50x probe was accepted
                         # outright instead of triggering the out-of-range
-                        # rejection it's designed to guarantee. A 5x-inflated
+                        # rejection it's designed to guarantee. A 50x-inflated
                         # number is NEVER a real, usable price under any
                         # circumstance — it exists purely to be rejected.
                         # Leaving it live actually mispriced real ads on
                         # Bybit in production (confirmed: an ad stuck at
-                        # ~5x its real value, permanently, since fast-chase
-                        # then compares future spot prices against this
-                        # nonsense number and never finds room to act
+                        # several times its real value, permanently, since
+                        # fast-chase then compares future spot prices against
+                        # this nonsense number and never finds room to act
                         # again). Correct it back to the real target
                         # immediately instead of accepting it.
-                        logger.warning(f"{tag} 5x probe price {probe_price} was UNEXPECTEDLY accepted — correcting immediately to the real target {new_p}, never leaving an inflated price live")
+                        logger.warning(f"{tag} 50x probe price {probe_price} was UNEXPECTEDLY accepted — correcting immediately to the real target {new_p}, never leaving an inflated price live")
                         if _can_modify_slot(sess, slot_idx):
                             _record_modify_slot(sess, slot_idx)
                             correction = await asyncio.get_event_loop().run_in_executor(
@@ -5015,42 +5024,34 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                     # ── USDT/USD deep-window comparison ──
                     # Copy Range (1-10 / 1-20) no longer picks a shallow
                     # page-1 depth for this pair. Both settings now do the
-                    # SAME thing: fetch two much deeper windows — ranks
-                    # 150-200 and ranks 240-250 — compare the prices found
-                    # in both together, and copy whichever single price
-                    # shows up most often across the combined set. A price
-                    # several independent ads have converged on out there
-                    # is treated as the more reliable "real" market price
-                    # than whatever sits at position #1, which can be a
-                    # single outlier or a stale/boosted listing.
-                    _win_a_items = await _fetch_market_ads_up_to(
-                        ad_data.get("tokenId",""), ad_data.get("currencyId",""), _side, 200, creds
-                    )
-                    _win_b_items = await _fetch_market_ads_up_to(
+                    # SAME thing: fetch ONE much deeper window — ranks
+                    # 50-250 — and copy whichever single price shows up
+                    # most often within it. A price several independent
+                    # ads have converged on out there is treated as the
+                    # more reliable "real" market price than whatever sits
+                    # at position #1, which can be a single outlier or a
+                    # stale/boosted listing.
+                    _win_items = await _fetch_market_ads_up_to(
                         ad_data.get("tokenId",""), ad_data.get("currencyId",""), _side, 250, creds
                     )
-                    _window_a = _win_a_items[149:200]   # ranks 150-200
-                    _window_b = _win_b_items[239:250]   # ranks 240-250
+                    _window = _win_items[49:250]   # ranks 50-250
                     logger.info(
-                        f"[{label}] Ad Copy (USDT/USD) fetched {len(_win_a_items)} item(s) up to rank 200 "
-                        f"({len(_window_a)} in ranks 150-200) and {len(_win_b_items)} item(s) up to rank 250 "
-                        f"({len(_window_b)} in ranks 240-250)."
+                        f"[{label}] Ad Copy (USDT/USD) fetched {len(_win_items)} item(s) up to rank 250 "
+                        f"({len(_window)} in ranks 50-250)."
                     )
                     # Same explicit self/token/currency verification as
                     # before — don't trust the API's own filtering blindly.
-                    def _filter_window(_win):
-                        return [
-                            it for it in _win
-                            if str(it.get("id","")) not in _own_ad_ids
-                            and it.get("tokenId","").upper()    == _want_token
-                            and it.get("currencyId","").upper() == _want_currency
-                        ]
-                    _competing = _filter_window(_window_a) + _filter_window(_window_b)
+                    _competing = [
+                        it for it in _window
+                        if str(it.get("id","")) not in _own_ad_ids
+                        and it.get("tokenId","").upper()    == _want_token
+                        and it.get("currencyId","").upper() == _want_currency
+                    ]
                     if not _competing:
                         await bot.send_message(chat_id=chat_id,
                             text=(
                                 f"⚠️ {prefix}<b>Cycle {cycle}</b> — Ad Copy found no other "
-                                f"{_want_currency}/{_want_token} ads in ranks 150-200 or 240-250 "
+                                f"{_want_currency}/{_want_token} ads in ranks 50-250 "
                                 f"of the live market right now. Skipping this cycle."
                             ), parse_mode="HTML")
                         for _ in range(interval * 60):
@@ -5059,12 +5060,11 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                         continue
                     try:
                         _chosen_price, _chosen_item = _pick_ad_copy_price_windowed(_competing)
-                        new_p = Decimal(_chosen_price)
+                        _match_count = sum(1 for it in _competing if str(it.get("price","")) == _chosen_price)
                         logger.info(
-                            f"[{label}] Ad Copy windows 150-200 + 240-250: "
-                            f"{[it.get('price') for it in _competing]} — chose {_chosen_price} "
-                            f"(most common price, {sum(1 for it in _competing if str(it.get('price','')) == _chosen_price)} match(es)) "
-                            f"from {_chosen_item.get('nickName','?')}"
+                            f"[{label}] Ad Copy window 50-250: "
+                            f"{[it.get('price') for it in _competing]} — highest-common price {_chosen_price} "
+                            f"({_match_count} match(es)) from {_chosen_item.get('nickName','?')}"
                         )
                     except Exception:
                         await bot.send_message(chat_id=chat_id,
@@ -5074,6 +5074,42 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                             if not _ad_running(sess, slot_idx): break
                             await asyncio.sleep(1)
                         continue
+
+                    # ── Skip-until-new-highest-common-price gate ──
+                    # Bybit's USDT/USD ranking is first-come-first-served:
+                    # among ads sitting at the identical price, whichever
+                    # posted that price EARLIEST ranks higher. Blindly
+                    # re-submitting the same price every scheduled cycle
+                    # (even though nothing actually changed) resets this
+                    # ad's own "posted at" timestamp for that price and
+                    # pushes it to the BACK of that first-come-first-served
+                    # queue — actively hurting ranking despite the price
+                    # itself being correct. So once a price has been
+                    # copied, do nothing more cycle after cycle until the
+                    # highest-common price this window computes actually
+                    # CHANGES to something new — only then is there a real
+                    # reason to move and it's worth re-claiming a fresh
+                    # "first" position at the new price.
+                    _prev_price = s.get("ad_copy_last_price")
+                    if _prev_price is not None and str(_prev_price) == str(_chosen_price):
+                        logger.info(
+                            f"[{label}] Ad Copy (USDT/USD) highest-common price unchanged "
+                            f"({_chosen_price}) since last copy — skipping edit this cycle "
+                            f"to avoid resetting this ad's first-come-first-served queue position."
+                        )
+                        await bot.send_message(chat_id=chat_id,
+                            text=(
+                                f"⏭ {prefix}<b>Cycle {cycle}</b> — Highest-common price is still "
+                                f"<code>{_esc(str(_chosen_price))}</code> (no change since last copy) — "
+                                f"skipping this edit. USDT/USD ranking is first-come-first-served, so "
+                                f"re-posting an unchanged price would only push {label} to the back of the queue."
+                            ), parse_mode="HTML")
+                        for _ in range(interval * 60):
+                            if not _ad_running(sess, slot_idx): break
+                            await asyncio.sleep(1)
+                        continue
+                    s["ad_copy_last_price"] = str(_chosen_price)
+                    new_p = Decimal(_chosen_price)
                 else:
                     # ── Fallback for any other pair: original shallow
                     # page-1, position-#1 behaviour (unchanged). ──
@@ -5193,8 +5229,14 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
             # then posts exactly that. This makes the ad always track Bybit's
             # true live ceiling every cycle instead of a fixed formula number
             # that can drift from it as the order book moves.
+            # 50x (not 5x) — confirmed in production that 5x wasn't always
+            # enough to force the rejection: some ads' real accepted price
+            # band is wider than a flat 5x assumes, so the probe was briefly
+            # accepted outright at ~5x the real price before the correction
+            # further below caught it. 50x pushes it far beyond any realistic
+            # accepted band.
             if chase_ceiling:
-                probe_price = (new_p * Decimal("5")).quantize(_quant, rounding=ROUND_HALF_UP)
+                probe_price = (new_p * Decimal("50")).quantize(_quant, rounding=ROUND_HALF_UP)
                 submit_price, submit_str = probe_price, str(probe_price)
             else:
                 submit_price, submit_str = new_p, new_p_str
@@ -5450,9 +5492,9 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
 
             elif ret_code == 0:
                 if chase_ceiling:
-                    # Extremely unlikely — the probe price (5x the formula
+                    # Extremely unlikely — the probe price (50x the formula
                     # number) was accepted outright instead of triggering an
-                    # out-of-range rejection. A 5x-inflated number is NEVER a
+                    # out-of-range rejection. A 50x-inflated number is NEVER a
                     # real, usable price — it exists purely to guarantee a
                     # rejection so the true boundary can be read from
                     # Bybit's error message. Leaving it live actually
@@ -5462,7 +5504,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                     # number and never finds room to act again). Correct it
                     # back to the real target immediately instead of just
                     # flagging it and moving on.
-                    logger.warning(f"[{label}] Cycle {cycle} probe price {submit_price} was UNEXPECTEDLY accepted for user {chat_id} — correcting immediately, never leaving a 5x-inflated price live")
+                    logger.warning(f"[{label}] Cycle {cycle} probe price {submit_price} was UNEXPECTEDLY accepted for user {chat_id} — correcting immediately, never leaving a 50x-inflated price live")
                     if _can_modify_slot(sess, slot_idx):
                         _record_modify_slot(sess, slot_idx)
                         correction_result = await asyncio.get_event_loop().run_in_executor(
@@ -6992,35 +7034,8 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             shown_lines.append(chunk)
             used += cost
         if len(shown_lines) < len(item_chunks):
-            shown_lines.append(f"…({len(item_chunks) - len(shown_lines)} more not shown — full list attached as a file below)")
+            shown_lines.append(f"…({len(item_chunks) - len(shown_lines)} more not shown — narrow the range to see them)")
         txt = "\n".join(header_lines + shown_lines)
-        # A raw, plain-text dump of every fetched item — attached whenever
-        # not everything fit inline, so nothing requested is ever lost to
-        # the message-length limit. Plain text (no HTML) so it's never at
-        # risk of the same entity-parsing failure.
-        dump_file = None
-        if len(shown_lines) < len(item_chunks) or (end_n - start_n) >= 50:
-            import io as _io
-            raw_lines = [
-                f"Live Market Ads — {want_token}/{want_currency} · side={want_side} "
-                f"(your ad's own side is {ad_data.get('side','?')})",
-                f"Showing ranks {start_n}-{end_n}. {len(items)} item(s) fetched total.",
-                "",
-            ]
-            for i, it in enumerate(window, start_n):
-                mark = " YOURS" if str(it.get("id","")) in own_ids else ""
-                if _chosen_item is not None and it.get("id") == _chosen_item.get("id"):
-                    mark += " <-- WOULD COPY"
-                raw_lines.append(
-                    f"{i}. price={it.get('price','?')} id={it.get('id','?')} "
-                    f"nick={it.get('nickName','?')} online={it.get('isOnline','?')} "
-                    f"min={it.get('minAmount','?')} max={it.get('maxAmount','?')} "
-                    f"recentOrderNum={it.get('recentOrderNum','?')} "
-                    f"recentExecuteRate={it.get('recentExecuteRate','?')}{mark}"
-                )
-            raw_txt = "\n".join(raw_lines)
-            dump_file = _io.BytesIO(raw_txt.encode("utf-8"))
-            dump_file.name = f"market_ads_{want_token}_{want_currency}_s{want_side}_r{start_n}-{end_n}.txt"
         rows = [
             [
                 InlineKeyboardButton(("✅ " if want_token.upper() == "USDT" else "") + "USDT", callback_data=f"view_market_ads_s{want_side}_r{start_n}-{end_n}_tUSDT"),
@@ -7042,15 +7057,6 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             ])
         rows += back_section("section_ads")
         await edit_menu(query, txt, InlineKeyboardMarkup(rows))
-        if dump_file is not None:
-            try:
-                await query.message.reply_document(
-                    document=dump_file,
-                    filename=dump_file.name,
-                    caption=f"📄 Full raw dump — {want_token}/{want_currency} side={want_side}, ranks {start_n}-{end_n}, {len(items)} item(s) fetched."
-                )
-            except Exception as _e:
-                logger.warning(f"[view_market_ads] dump file send failed: {_e}")
 
     elif data == "set_ad_copy_range":
         sess = _s(tuser.id)
