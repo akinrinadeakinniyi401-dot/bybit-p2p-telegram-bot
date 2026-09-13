@@ -4877,19 +4877,39 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                     for i in range(-1, sess.total_ad_slots() - 1)
                     if (_ad_settings(sess, i) or {}).get("ad_id")
                 }
+                _want_token    = ad_data.get("tokenId","").upper()
+                _want_currency = ad_data.get("currencyId","").upper()
                 _market = await asyncio.get_event_loop().run_in_executor(
                     _ad_executor, get_market_ads,
                     ad_data.get("tokenId",""), ad_data.get("currencyId",""),
                     ad_data.get("side", "0"), 1, _range_n + len(_own_ad_ids) + 5, creds
                 )
                 _items = (_market.get("result") or {}).get("items", []) if isinstance(_market, dict) else []
-                _competing = [it for it in _items if str(it.get("id","")) not in _own_ad_ids][:_range_n]
+                logger.info(
+                    f"[{label}] Ad Copy fetched {len(_items)} item(s) for requested "
+                    f"tokenId={_want_token} currencyId={_want_currency} — "
+                    f"sample: {[(it.get('tokenId'), it.get('currencyId'), it.get('price')) for it in _items[:3]]}"
+                )
+                # EXPLICIT verification — don't trust the API's own filtering
+                # blindly. Confirmed in production: a request for USDT/USD
+                # returned (or was matched against) a USDC price, which got
+                # copied as if it were USDT — a real, meaningful pricing
+                # error since USDC/USD and USDT/USD traded at genuinely
+                # different rates (1.20 vs 1.015). Every candidate must
+                # match the ad's own tokenId AND currencyId exactly before
+                # it's ever eligible to be copied.
+                _competing = [
+                    it for it in _items
+                    if str(it.get("id","")) not in _own_ad_ids
+                    and it.get("tokenId","").upper()    == _want_token
+                    and it.get("currencyId","").upper() == _want_currency
+                ][:_range_n]
                 if not _competing:
                     await bot.send_message(chat_id=chat_id,
                         text=(
-                            f"⚠️ {prefix}<b>Cycle {cycle}</b> — Ad Copy found no other ads to copy "
-                            f"in the top {_range_n} of the live {ad_data.get('currencyId','')}/{ad_data.get('tokenId','')} "
-                            f"market right now. Skipping this cycle."
+                            f"⚠️ {prefix}<b>Cycle {cycle}</b> — Ad Copy found no other "
+                            f"{_want_currency}/{_want_token} ads to copy "
+                            f"in the top {_range_n} of the live market right now. Skipping this cycle."
                         ), parse_mode="HTML")
                     for _ in range(interval * 60):
                         if not _ad_running(sess, slot_idx): break
