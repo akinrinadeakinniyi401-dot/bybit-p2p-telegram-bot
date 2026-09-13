@@ -438,7 +438,7 @@ def _pick_ad_copy_price_windowed(combined: list):
     """Selection rule for the USDT/USD deep-window Ad Copy comparison.
 
     Given the COMBINED set of market ads pulled from two separate deep
-    windows (ranks 150-160 and ranks 240-250), choose whichever price
+    windows (ranks 150-200 and ranks 240-250), choose whichever price
     appears MOST OFTEN across that combined set — a price several
     independent ads have converged on is treated as a more reliable
     signal of the "real" market price than whatever sits at position #1,
@@ -446,7 +446,7 @@ def _pick_ad_copy_price_windowed(combined: list):
 
     Ties (more than one price sharing the top frequency) are broken by
     whichever of the tied prices appears EARLIEST in `combined` — i.e.
-    window 150-160 takes priority over 240-250, and within a window
+    window 150-200 takes priority over 240-250, and within a window
     Bybit's own return order is preserved.
 
     Returns (chosen_price_str, chosen_item) or (None, None) if the
@@ -5016,7 +5016,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                     # Copy Range (1-10 / 1-20) no longer picks a shallow
                     # page-1 depth for this pair. Both settings now do the
                     # SAME thing: fetch two much deeper windows — ranks
-                    # 150-160 and ranks 240-250 — compare the prices found
+                    # 150-200 and ranks 240-250 — compare the prices found
                     # in both together, and copy whichever single price
                     # shows up most often across the combined set. A price
                     # several independent ads have converged on out there
@@ -5024,16 +5024,16 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                     # than whatever sits at position #1, which can be a
                     # single outlier or a stale/boosted listing.
                     _win_a_items = await _fetch_market_ads_up_to(
-                        ad_data.get("tokenId",""), ad_data.get("currencyId",""), _side, 160, creds
+                        ad_data.get("tokenId",""), ad_data.get("currencyId",""), _side, 200, creds
                     )
                     _win_b_items = await _fetch_market_ads_up_to(
                         ad_data.get("tokenId",""), ad_data.get("currencyId",""), _side, 250, creds
                     )
-                    _window_a = _win_a_items[149:160]   # ranks 150-160
+                    _window_a = _win_a_items[149:200]   # ranks 150-200
                     _window_b = _win_b_items[239:250]   # ranks 240-250
                     logger.info(
-                        f"[{label}] Ad Copy (USDT/USD) fetched {len(_win_a_items)} item(s) up to rank 160 "
-                        f"({len(_window_a)} in ranks 150-160) and {len(_win_b_items)} item(s) up to rank 250 "
+                        f"[{label}] Ad Copy (USDT/USD) fetched {len(_win_a_items)} item(s) up to rank 200 "
+                        f"({len(_window_a)} in ranks 150-200) and {len(_win_b_items)} item(s) up to rank 250 "
                         f"({len(_window_b)} in ranks 240-250)."
                     )
                     # Same explicit self/token/currency verification as
@@ -5050,7 +5050,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                         await bot.send_message(chat_id=chat_id,
                             text=(
                                 f"⚠️ {prefix}<b>Cycle {cycle}</b> — Ad Copy found no other "
-                                f"{_want_currency}/{_want_token} ads in ranks 150-160 or 240-250 "
+                                f"{_want_currency}/{_want_token} ads in ranks 150-200 or 240-250 "
                                 f"of the live market right now. Skipping this cycle."
                             ), parse_mode="HTML")
                         for _ in range(interval * 60):
@@ -5061,7 +5061,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                         _chosen_price, _chosen_item = _pick_ad_copy_price_windowed(_competing)
                         new_p = Decimal(_chosen_price)
                         logger.info(
-                            f"[{label}] Ad Copy windows 150-160 + 240-250: "
+                            f"[{label}] Ad Copy windows 150-200 + 240-250: "
                             f"{[it.get('price') for it in _competing]} — chose {_chosen_price} "
                             f"(most common price, {sum(1 for it in _competing if str(it.get('price','')) == _chosen_price)} match(es)) "
                             f"from {_chosen_item.get('nickName','?')}"
