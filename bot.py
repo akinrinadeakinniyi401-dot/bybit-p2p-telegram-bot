@@ -405,6 +405,39 @@ def _set_ad_current_price(sess, slot_idx: int, price, collision_adjusted: bool =
         _set_ceiling_ref(sess, slot_idx, price)
     _set_pending_ceiling(sess, slot_idx, None)
 
+def _pick_ad_copy_price(competing: list):
+    """Selection rule for Ad Copy, within an already-filtered, already-
+    ordered window of candidates (ad #1 through #N on page 1, Bybit's own
+    listing order — never re-sorted by us):
+      - Count how often each price appears in the window.
+      - Copy whichever price is the MOST COMMON (the real cluster) —
+        this is specifically what protects against a single outlier
+        sitting at #1 (confirmed in production: a merchant at 120% of
+        the real rate, with every other real merchant clustered far
+        below it).
+      - If every price in the window is distinct (no repeats at all),
+        there's no cluster to detect — fall back to simply the #1 ad's
+        price, the plain baseline case.
+      - Ties in "most common" are broken by whichever price occurs
+        FIRST (closest to #1) in the original order.
+    Returns (chosen_price_str, chosen_item) or (None, None) if the
+    window is empty.
+    """
+    if not competing:
+        return None, None
+    from collections import Counter
+    prices = [str(it.get("price","")) for it in competing]
+    counts = Counter(prices)
+    best_count = max(counts.values())
+    if best_count == 1:
+        # No repeats anywhere — nothing clusters, use the plain #1 ad.
+        return prices[0], competing[0]
+    for i, p in enumerate(prices):
+        if counts[p] == best_count:
+            return p, competing[i]
+    return prices[0], competing[0]   # unreachable, defensive fallback
+
+
 def _market_ads_query_side(ad_data: dict) -> str:
     """Which 'side' value to pass to /v5/p2p/item/online when looking for
     ads that actually compete with this one. Confirmed empirically:
@@ -4933,7 +4966,13 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                         await asyncio.sleep(1)
                     continue
                 try:
-                    new_p = Decimal(str(_competing[0]["price"]))
+                    _chosen_price, _chosen_item = _pick_ad_copy_price(_competing)
+                    new_p = Decimal(_chosen_price)
+                    logger.info(
+                        f"[{label}] Ad Copy window (top {_range_n}): "
+                        f"{[it.get('price') for it in _competing]} — chose {_chosen_price} "
+                        f"from {_chosen_item.get('nickName','?')}"
+                    )
                 except Exception:
                     await bot.send_message(chat_id=chat_id,
                         text=f"⚠️ {prefix}<b>Cycle {cycle}</b> — Ad Copy got an unreadable price from the market listing. Skipping this cycle.",
@@ -6737,16 +6776,29 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             for i in range(-1, sess.total_ad_slots() - 1)
             if (_ad_settings(sess, i) or {}).get("ad_id")
         }
+        # Same filtering AND selection the live cycle actually uses — so
+        # this view shows exactly what would get copied, not just a raw
+        # unfiltered dump.
+        _competing = [
+            it for it in items
+            if str(it.get("id","")) not in own_ids
+            and it.get("tokenId","").upper()    == want_token.upper()
+            and it.get("currencyId","").upper() == want_currency.upper()
+        ][:size_n]
+        _chosen_price, _chosen_item = _pick_ad_copy_price(_competing)
         lines = [
             f"🔍 <b>Live Market Ads</b>",
             f"<code>{_esc(want_token)}/{_esc(want_currency)}</code> · side=<code>{_esc(str(want_side))}</code> "
             f"(your ad's own side is <code>{_esc(str(ad_data.get('side','?')))}</code>)",
+            f"👉 Would copy: <code>{_esc(str(_chosen_price))}</code>" if _chosen_price else "⚠️ No eligible ad in this window.",
             "",
         ]
         if not items:
             lines.append("No items returned.")
         for i, it in enumerate(items[:size_n], 1):
             mark = " 🔸YOURS" if str(it.get("id","")) in own_ids else ""
+            if _chosen_item is not None and it.get("id") == _chosen_item.get("id"):
+                mark += " ⭐WOULD COPY"
             nick = it.get("nickName","?")
             if len(nick) > 18:
                 nick = nick[:17] + "…"
