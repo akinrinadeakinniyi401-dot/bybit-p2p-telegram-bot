@@ -15,7 +15,7 @@ from telegram.ext import (
 from config import TELEGRAM_TOKEN, ADMIN_IDS
 import bybit
 from bybit import (
-    get_ad_details, get_my_ads, modify_ad,
+    get_ad_details, get_my_ads, modify_ad, get_market_ads,
     get_btc_usdt_price, get_eth_usdt_price, get_token_usdt_price,
     get_max_float_pct, get_min_float_pct, currency_needs_ref,
     get_pending_orders, get_sell_orders, get_incoming_sell_orders, get_order_detail,
@@ -1121,8 +1121,8 @@ def ads_section_keyboard(uid: int = 0):
     s          = _ad_settings(sess, slot_idx) if sess else {}
     ad_data    = _ad_data_of(sess, slot_idx) if sess else {}
     mode       = s.get("mode", "fixed")
-    mode_icon  = "💲" if mode == "fixed" else "📈"
-    mode_label = f"{mode_icon} Mode: {mode.upper()}"
+    mode_icon  = {"fixed": "💲", "floating": "📈", "ad_copy": "🪞"}.get(mode, "💲")
+    mode_label = f"{mode_icon} Mode: {mode.replace('_',' ').upper()}"
     ad_loaded  = bool(ad_data)
     running    = _ad_running(sess, slot_idx) if sess else False
     status     = "🟢 Stop Auto-Update" if running else "▶️ Start Auto-Update"
@@ -1156,12 +1156,16 @@ def ads_section_keyboard(uid: int = 0):
         InlineKeyboardButton("📃 My Ads List",      callback_data="fetch_my_ads"),
     ])
     rows.append([
-        InlineKeyboardButton(mode_label,        callback_data="switch_mode"),
+        InlineKeyboardButton(mode_label,        callback_data="mode_menu"),
         InlineKeyboardButton("⏱ Set Interval", callback_data="set_interval"),
     ])
 
     if mode == "fixed":
         rows.append([InlineKeyboardButton("➕ Set Increment", callback_data="set_increment")])
+    elif mode == "ad_copy":
+        _range = s.get("ad_copy_range", "top5")
+        _range_label = "Top 1-5" if _range == "top5" else "Top 1-10"
+        rows.append([InlineKeyboardButton(f"🔝 Copy Range: {_range_label}", callback_data="set_ad_copy_range")])
     else:
         rows.append([InlineKeyboardButton("📊 Set Float %",   callback_data="set_float_pct")])
         _cur = ad_data.get("currencyId","").upper()
@@ -1254,7 +1258,7 @@ def ads_section_text(uid: int = 0) -> str:
         f"<i>{acct_label}</i>\n\n"
         f"🆔 Ad ID: <code>{ad_id}</code>\n"
         f"👤 UID (Acct {acct_slot}): <code>{bybit_uid}</code>\n"
-        f"🔀 Mode: <code>{mode.upper()}</code> | ⏱ Every <code>{interval}</code> min\n"
+        f"🔀 Mode: <code>{mode.replace('_',' ').upper()}</code> | ⏱ Every <code>{interval}</code> min\n"
         f"{mode_info}\n"
         f"{ad_info}\n"
         f"📈 Session price: <code>{cur}</code> | {status}\n\n"
@@ -4857,6 +4861,50 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                 new_p    = _ad_current_price(sess, slot_idx) + increment
                 _quant   = Decimal("0.00000001")   # unchanged — fixed mode's original precision
                 chase_ceiling = False   # live-ceiling chase only applies to floating mode
+            elif mode == "ad_copy":
+                # USD/USDT only. Doesn't compute a price at all — copies
+                # whatever a real competing ad is CURRENTLY charging,
+                # straight from Bybit's own live market listing. Exists
+                # because this specific market is thin/volatile enough
+                # that Bybit itself reportedly reshuffles ad positions
+                # unpredictably — a formula-based price can't track that,
+                # but mirroring the real current top-of-market price can.
+                _quant = Decimal("0.0001")
+                chase_ceiling = False   # not applicable — this mode never probes for a ceiling
+                _range_n = 10 if s.get("ad_copy_range") == "top10" else 5
+                _own_ad_ids = {
+                    (_ad_settings(sess, i) or {}).get("ad_id","")
+                    for i in range(-1, sess.total_ad_slots() - 1)
+                    if (_ad_settings(sess, i) or {}).get("ad_id")
+                }
+                _market = await asyncio.get_event_loop().run_in_executor(
+                    _ad_executor, get_market_ads,
+                    ad_data.get("tokenId",""), ad_data.get("currencyId",""),
+                    ad_data.get("side", "0"), 1, _range_n + len(_own_ad_ids) + 5, creds
+                )
+                _items = (_market.get("result") or {}).get("items", []) if isinstance(_market, dict) else []
+                _competing = [it for it in _items if str(it.get("id","")) not in _own_ad_ids][:_range_n]
+                if not _competing:
+                    await bot.send_message(chat_id=chat_id,
+                        text=(
+                            f"⚠️ {prefix}<b>Cycle {cycle}</b> — Ad Copy found no other ads to copy "
+                            f"in the top {_range_n} of the live {ad_data.get('currencyId','')}/{ad_data.get('tokenId','')} "
+                            f"market right now. Skipping this cycle."
+                        ), parse_mode="HTML")
+                    for _ in range(interval * 60):
+                        if not _ad_running(sess, slot_idx): break
+                        await asyncio.sleep(1)
+                    continue
+                try:
+                    new_p = Decimal(str(_competing[0]["price"]))
+                except Exception:
+                    await bot.send_message(chat_id=chat_id,
+                        text=f"⚠️ {prefix}<b>Cycle {cycle}</b> — Ad Copy got an unreadable price from the market listing. Skipping this cycle.",
+                        parse_mode="HTML")
+                    for _ in range(interval * 60):
+                        if not _ad_running(sess, slot_idx): break
+                        await asyncio.sleep(1)
+                    continue
             else:
                 try:
                     float_pct = float(s.get("float_pct") or 0)
@@ -5979,7 +6027,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             f"💸 FLW Pay: {'ON' if _s(tuser.id).flw_pay_enabled else 'OFF'}\n"
             f"{bp_s} | {nm_s}\n\n"
             f"🆔 Ad: <code>{_s(tuser.id).settings.get('ad_id') or 'Not set'}</code>\n"
-            f"🔀 Mode: <code>{_s(tuser.id).settings.get('mode','fixed').upper()}</code>\n"
+            f"🔀 Mode: <code>{_s(tuser.id).settings.get('mode','fixed').replace('_',' ').upper()}</code>\n"
             f"⏱ Interval: <code>{_s(tuser.id).settings.get('interval',2)} min</code>\n\n"
             f"BUY seen: <code>{len(_s(tuser.id).seen_order_ids)}</code> | Paid: <code>{len(_s(tuser.id).paid_order_ids)}</code>\n"
             f"SELL seen: <code>{len(_s(tuser.id).seen_sell_ids)}</code> | Released: <code>{len(_s(tuser.id).released_ids)}</code>"
@@ -6571,11 +6619,40 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             )
 
     # ── 🔀 Switch Mode ──
-    elif data == "switch_mode":
+    elif data == "mode_menu":
         sess = _s(tuser.id)
         slot_idx = sess.editing_slot
         s = _ad_settings(sess, slot_idx)
-        new_mode = "floating" if s.get("mode") == "fixed" else "fixed"
+        ad_data = _ad_data_of(sess, slot_idx)
+        cur_mode = s.get("mode", "fixed")
+        is_usdt_usd = ad_data.get("currencyId","").upper() == "USD" and ad_data.get("tokenId","").upper() == "USDT"
+        rows = [
+            [InlineKeyboardButton(("✅ " if cur_mode == "fixed" else "") + "💲 Fixed",    callback_data="set_mode_fixed")],
+            [InlineKeyboardButton(("✅ " if cur_mode == "floating" else "") + "📈 Floating", callback_data="set_mode_floating")],
+        ]
+        if is_usdt_usd:
+            rows.append([InlineKeyboardButton(("✅ " if cur_mode == "ad_copy" else "") + "🪞 Ad Copy", callback_data="set_mode_ad_copy")])
+        rows += back_section("section_ads")
+        txt = (
+            f"🔀 <b>{_ad_slot_label(slot_idx)} — Choose Mode</b>\n\n"
+            "💲 <b>Fixed</b> — increments by a set amount each cycle.\n"
+            "📈 <b>Floating</b> — tracks a % of live spot price.\n"
+        )
+        if is_usdt_usd:
+            txt += "🪞 <b>Ad Copy</b> — copies the top live market ad price directly (USD/USDT only).\n"
+        await edit_menu(query, txt, InlineKeyboardMarkup(rows))
+
+    elif data in ("set_mode_fixed", "set_mode_floating", "set_mode_ad_copy"):
+        sess = _s(tuser.id)
+        slot_idx = sess.editing_slot
+        s = _ad_settings(sess, slot_idx)
+        ad_data = _ad_data_of(sess, slot_idx)
+        new_mode = data[len("set_mode_"):]
+        if new_mode == "ad_copy" and not (
+            ad_data.get("currencyId","").upper() == "USD" and ad_data.get("tokenId","").upper() == "USDT"
+        ):
+            await query.answer("Ad Copy is only available for USD/USDT ads.", show_alert=True)
+            return
         s["mode"] = new_mode
         next_hint = ""
         if slot_idx == -1:
@@ -6585,7 +6662,37 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         _save_settings(tuser.id)   # persists Ad 1 AND any extra slots, regardless of which was just edited
         note = " (takes effect next cycle)" if _ad_running(sess, slot_idx) else ""
         await edit_menu(query,
-            f"🔀 <b>{_ad_slot_label(slot_idx)} switched to {new_mode.upper()}{note}</b>{next_hint}",
+            f"🔀 <b>{_ad_slot_label(slot_idx)} switched to {new_mode.replace('_',' ').upper()}{note}</b>{next_hint}",
+            InlineKeyboardMarkup(back_section("section_ads"))
+        )
+
+    # ── 🔝 Ad Copy Range ──
+    elif data == "set_ad_copy_range":
+        sess = _s(tuser.id)
+        slot_idx = sess.editing_slot
+        s = _ad_settings(sess, slot_idx)
+        cur = s.get("ad_copy_range", "top5")
+        rows = [
+            [InlineKeyboardButton(("✅ " if cur == "top5"  else "") + "Top 1 - 5",  callback_data="ad_copy_range_top5")],
+            [InlineKeyboardButton(("✅ " if cur == "top10" else "") + "Top 1 - 10", callback_data="ad_copy_range_top10")],
+        ] + back_section("section_ads")
+        await edit_menu(query,
+            f"🔝 <b>{_ad_slot_label(slot_idx)} — Ad Copy Range</b>\n\n"
+            "How deep into the live market listing to look when picking the highest "
+            "non-self price to copy.",
+            InlineKeyboardMarkup(rows)
+        )
+
+    elif data in ("ad_copy_range_top5", "ad_copy_range_top10"):
+        sess = _s(tuser.id)
+        slot_idx = sess.editing_slot
+        s = _ad_settings(sess, slot_idx)
+        s["ad_copy_range"] = "top5" if data.endswith("top5") else "top10"
+        _save_settings(tuser.id)
+        note = " (takes effect next cycle)" if _ad_running(sess, slot_idx) else ""
+        await edit_menu(query,
+            f"🔝 <b>{_ad_slot_label(slot_idx)} Ad Copy range set to "
+            f"{'Top 1 - 5' if s['ad_copy_range']=='top5' else 'Top 1 - 10'}{note}</b>",
             InlineKeyboardMarkup(back_section("section_ads"))
         )
 
@@ -6779,7 +6886,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             # same fix as the scheduled-cycle staleness bug, applied here too.
             _set_ad_current_price(_s(tuser.id), -1, Decimal(str(price)))
             await edit_menu(query,
-                f"✅ <b>Updated!</b> Price: <code>{price}</code> ({mode.upper()})\n\n_{next_setup_hint(tuser.id)}_",
+                f"✅ <b>Updated!</b> Price: <code>{price}</code> ({mode.replace('_',' ').upper()})\n\n_{next_setup_hint(tuser.id)}_",
                 InlineKeyboardMarkup(back_section("section_ads"))
             )
         else:
@@ -7502,7 +7609,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             task = asyncio.create_task(auto_update_loop(context.bot, chat_id, slot_idx))
             _set_ad_task(sess, slot_idx, task)
             await edit_menu(query,
-                f"🟢 <b>{label} price update started!</b>\n🔀 <code>{mode.upper()}</code> | ⏱ every <code>{interval}</code> min\n\n"
+                f"🟢 <b>{label} price update started!</b>\n🔀 <code>{mode.replace('_',' ').upper()}</code> | ⏱ every <code>{interval}</code> min\n\n"
                 + ads_section_text(tuser.id),
                 ads_section_keyboard(tuser.id)
             )
