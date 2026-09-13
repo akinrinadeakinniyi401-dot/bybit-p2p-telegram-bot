@@ -4952,10 +4952,18 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                 }
                 _want_token    = ad_data.get("tokenId","").upper()
                 _want_currency = ad_data.get("currencyId","").upper()
+                # Fetch a full 100-item page-1 window regardless of the
+                # self-exclusion range setting — gives us more raw data to
+                # look at / potentially filter on later, since Bybit's own
+                # support confirmed the API's page-1 order doesn't match
+                # what's actually visible on the site (server-side hidden
+                # ads + boosted visibility that the API doesn't expose).
+                # _range_n still controls how deep we search for the first
+                # non-self ad — this only widens what we fetch.
                 _market = await asyncio.get_event_loop().run_in_executor(
                     _ad_executor, get_market_ads,
                     ad_data.get("tokenId",""), ad_data.get("currencyId",""),
-                    _market_ads_query_side(ad_data), 1, _range_n + len(_own_ad_ids) + 5, creds
+                    _market_ads_query_side(ad_data), 1, 100, creds
                 )
                 _items = (_market.get("result") or {}).get("items", []) if isinstance(_market, dict) else []
                 logger.info(
@@ -6775,9 +6783,9 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         if not ad_data:
             await query.answer("Fetch ad details first.", show_alert=True)
             return
-        # Params encoded directly in callback_data (view_market_ads_s{side}_n{size})
+        # Params encoded directly in callback_data (view_market_ads_s{side}_n{size}_t{token})
         # — stateless, so no session storage needed just for a diagnostic view.
-        side_override, size_n = None, 10
+        side_override, size_n, token_override = None, 10, None
         if data.startswith("view_market_ads_"):
             for part in data[len("view_market_ads_"):].split("_"):
                 if part.startswith("s"):
@@ -6785,7 +6793,9 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 elif part.startswith("n"):
                     try: size_n = int(part[1:])
                     except ValueError: pass
-        want_token    = ad_data.get("tokenId","")
+                elif part.startswith("t"):
+                    token_override = part[1:]
+        want_token    = token_override if token_override is not None else ad_data.get("tokenId","")
         want_currency = ad_data.get("currencyId","")
         want_side     = side_override if side_override is not None else _market_ads_query_side(ad_data)
         creds = get_user_creds(tuser.id, slot=_get_user_slot(tuser.id))
@@ -6835,12 +6845,17 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             txt = txt[:3900] + "\n…(truncated)"
         rows = [
             [
-                InlineKeyboardButton(("✅ " if want_side == "0" else "") + "Side 0", callback_data=f"view_market_ads_s0_n{size_n}"),
-                InlineKeyboardButton(("✅ " if want_side == "1" else "") + "Side 1", callback_data=f"view_market_ads_s1_n{size_n}"),
+                InlineKeyboardButton(("✅ " if want_token.upper() == "USDT" else "") + "USDT", callback_data=f"view_market_ads_s{want_side}_n{size_n}_tUSDT"),
+                InlineKeyboardButton(("✅ " if want_token.upper() == "BTC"  else "") + "BTC",  callback_data=f"view_market_ads_s{want_side}_n{size_n}_tBTC"),
             ],
             [
-                InlineKeyboardButton(("✅ " if size_n == 10 else "") + "Top 10", callback_data=f"view_market_ads_s{want_side}_n10"),
-                InlineKeyboardButton(("✅ " if size_n == 20 else "") + "Top 20", callback_data=f"view_market_ads_s{want_side}_n20"),
+                InlineKeyboardButton(("✅ " if want_side == "0" else "") + "Side 0", callback_data=f"view_market_ads_s0_n{size_n}_t{want_token}"),
+                InlineKeyboardButton(("✅ " if want_side == "1" else "") + "Side 1", callback_data=f"view_market_ads_s1_n{size_n}_t{want_token}"),
+            ],
+            [
+                InlineKeyboardButton(("✅ " if size_n == 10  else "") + "Top 10",  callback_data=f"view_market_ads_s{want_side}_n10_t{want_token}"),
+                InlineKeyboardButton(("✅ " if size_n == 20  else "") + "Top 20",  callback_data=f"view_market_ads_s{want_side}_n20_t{want_token}"),
+                InlineKeyboardButton(("✅ " if size_n == 100 else "") + "Top 100", callback_data=f"view_market_ads_s{want_side}_n100_t{want_token}"),
             ],
         ] + back_section("section_ads")
         await edit_menu(query, txt, InlineKeyboardMarkup(rows))
