@@ -406,36 +406,32 @@ def _set_ad_current_price(sess, slot_idx: int, price, collision_adjusted: bool =
     _set_pending_ceiling(sess, slot_idx, None)
 
 def _pick_ad_copy_price(competing: list):
-    """Selection rule for Ad Copy, within an already-filtered, already-
-    ordered window of candidates (ad #1 through #N on page 1, Bybit's own
-    listing order — never re-sorted by us):
-      - Count how often each price appears in the window.
-      - Copy whichever price is the MOST COMMON (the real cluster) —
-        this is specifically what protects against a single outlier
-        sitting at #1 (confirmed in production: a merchant at 120% of
-        the real rate, with every other real merchant clustered far
-        below it).
-      - If every price in the window is distinct (no repeats at all),
-        there's no cluster to detect — fall back to simply the #1 ad's
-        price, the plain baseline case.
-      - Ties in "most common" are broken by whichever price occurs
-        FIRST (closest to #1) in the original order.
+    """Selection rule for Ad Copy: within an already-filtered (self-ads
+    removed, wrong token/currency removed), already-ordered window of
+    candidates (Bybit's own page-1 listing order — never re-sorted or
+    re-ranked by us), copy exactly the price of the FIRST ad in that
+    window — i.e. whatever ad sits at position #1 on page 1 once your
+    own ad(s) are excluded. Bybit's /v5/p2p/item/online has no sort
+    parameter at all, so items[] on page 1 already comes back in the
+    exact "price highest to lowest" order a person sees live on the
+    site; the only thing we do on top of that is skip past any of your
+    own ad IDs.
+
+    Previously this picked whichever price was the MOST COMMON across
+    the window, to guard against a single outlier sitting at #1. That
+    "clustering" behaviour is intentionally removed — it could copy a
+    different ad than the one actually in position #1 on the real page,
+    which no longer matches what the market shows. Copy Range (Top 1-5 /
+    Top 1-10) still controls how deep to look ONLY for the purpose of
+    skipping past your own ad(s); it no longer affects price selection.
+
     Returns (chosen_price_str, chosen_item) or (None, None) if the
     window is empty.
     """
     if not competing:
         return None, None
-    from collections import Counter
-    prices = [str(it.get("price","")) for it in competing]
-    counts = Counter(prices)
-    best_count = max(counts.values())
-    if best_count == 1:
-        # No repeats anywhere — nothing clusters, use the plain #1 ad.
-        return prices[0], competing[0]
-    for i, p in enumerate(prices):
-        if counts[p] == best_count:
-            return p, competing[i]
-    return prices[0], competing[0]   # unreachable, defensive fallback
+    top = competing[0]
+    return str(top.get("price", "")), top
 
 
 def _market_ads_query_side(ad_data: dict) -> str:
