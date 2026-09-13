@@ -443,6 +443,40 @@ def get_my_ads(creds: dict | None = None) -> dict:
         return {"error": str(e)}
 
 
+def get_market_ads(token_id: str, currency_id: str, side, page: int = 1, size: int = 10,
+                    creds: dict | None = None) -> dict:
+    """
+    Live public market ad listing (/v5/p2p/item/online) — powers Ad Copy
+    mode. Returns Bybit's own listing, PRE-SORTED with the most
+    competitive ad first (highest price for side=0/buy listings, lowest
+    for side=1/sell — matches what a real user browsing that market tab
+    sees). "side" here must be whatever value the ad being copied FROM
+    itself uses (ad_data["side"]) — Bybit's side parameter is defined
+    from the ad's own perspective, not the market tab's color, so no
+    flipping is needed: pass the user's own ad's side straight through to
+    see directly comparable, competing ads.
+    Authenticated endpoint — needs real API creds despite being "public"
+    market data, per Bybit's own docs.
+    """
+    api_key, api_secret = _resolve_creds(creds)
+    url     = BASE_URL + "/v5/p2p/item/online"
+    body    = {
+        "tokenId": token_id,
+        "currencyId": currency_id,
+        "side": str(side),
+        "page": str(page),
+        "size": str(size),
+    }
+    payload = json.dumps(body, separators=(',', ':'))
+    headers = _get_headers(api_key, api_secret, payload)
+    try:
+        response = requests.post(url, headers=headers, data=payload, timeout=10, proxies=_resolve_proxies(creds))
+        return parse_response(response, " [item/online]")
+    except Exception as e:
+        logger.error(f"[Bybit] get_market_ads error: {e}")
+        return {"error": str(e)}
+
+
 # ─────────────────────────────────────────
 # 📦 Orders
 # ─────────────────────────────────────────
