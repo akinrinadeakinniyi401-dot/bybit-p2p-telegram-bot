@@ -447,14 +447,24 @@ def get_market_ads(token_id: str, currency_id: str, side, page: int = 1, size: i
                     creds: dict | None = None) -> dict:
     """
     Live public market ad listing (/v5/p2p/item/online) — powers Ad Copy
-    mode. Returns Bybit's own listing, PRE-SORTED with the most
-    competitive ad first (highest price for side=0/buy listings, lowest
-    for side=1/sell — matches what a real user browsing that market tab
-    sees). "side" here must be whatever value the ad being copied FROM
-    itself uses (ad_data["side"]) — Bybit's side parameter is defined
-    from the ad's own perspective, not the market tab's color, so no
-    flipping is needed: pass the user's own ad's side straight through to
-    see directly comparable, competing ads.
+    mode and the "View Market Ads List" diagnostic. Per Bybit's own docs,
+    "side" is simply 0=buy / 1=sell for the ads being RETURNED — it says
+    nothing about your own ad. The endpoint takes no sort parameter at
+    all, so whatever order Bybit returns items[] in on page 1 IS its
+    default "price highest to lowest" ordering — the same order a person
+    sees live on the site. Never re-sort or re-rank items[] locally.
+
+    Confirmed empirically (and matches production behaviour): to find
+    ads that actually COMPETE with one of your own ads, you must query
+    the OPPOSITE side value from your own ad's side — i.e. flip it
+    before calling this function (own side 0/buy → query side="1", own
+    side 1/sell → query side="0"). Passing your own ad's side straight
+    through returns a same-type listing that does not match what a
+    person manually browsing the market tab sees. Callers (see
+    bot.py's _market_ads_query_side) are responsible for doing this
+    flip — this function itself must NOT flip again, it just forwards
+    whatever side value it's given straight to Bybit.
+
     Authenticated endpoint — needs real API creds despite being "public"
     market data, per Bybit's own docs.
     """
