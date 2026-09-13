@@ -5021,7 +5021,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                 _side = _market_ads_query_side(ad_data)
 
                 if _want_token == "USDT" and _want_currency == "USD":
-                    # ── USDT/USD deep-window comparison ──
+                    # ── USDT/USD deep-window comparison, cross-checked ──
                     # Copy Range (1-10 / 1-20) no longer picks a shallow
                     # page-1 depth for this pair. Both settings now do the
                     # SAME thing: fetch ONE much deeper window — ranks
@@ -5031,23 +5031,54 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                     # more reliable "real" market price than whatever sits
                     # at position #1, which can be a single outlier or a
                     # stale/boosted listing.
-                    _win_items = await _fetch_market_ads_up_to(
-                        ad_data.get("tokenId",""), ad_data.get("currencyId",""), _side, 250, creds
+                    #
+                    # CROSS-CHECK: a single fetch of that window can
+                    # occasionally come back stale/incomplete from Bybit —
+                    # confirmed in production: the skip-gate below kept
+                    # reporting "unchanged" against an old price for
+                    # several cycles even after the real highest-common
+                    # price had genuinely moved, and only a full bot
+                    # restart picked up the correct new price. So instead
+                    # of trusting one fetch, fetch the SAME window 3
+                    # separate times and only trust a highest-common price
+                    # that's confirmed by at least 2 of those 3 independent
+                    # fetches. Each individual fetch attempt is logged
+                    # internally only — the user is never notified about
+                    # these retries, only about the final confirmed
+                    # decision (skip vs post).
+                    _attempts = []   # [(price_or_None, item_or_None, competing_list), ...]
+                    for _attempt_n in range(1, 4):
+                        _win_items = await _fetch_market_ads_up_to(
+                            ad_data.get("tokenId",""), ad_data.get("currencyId",""), _side, 250, creds
+                        )
+                        _window_n = _win_items[49:250]   # ranks 50-250
+                        _competing_n = [
+                            it for it in _window_n
+                            if str(it.get("id","")) not in _own_ad_ids
+                            and it.get("tokenId","").upper()    == _want_token
+                            and it.get("currencyId","").upper() == _want_currency
+                        ]
+                        if _competing_n:
+                            try:
+                                _price_n, _item_n = _pick_ad_copy_price_windowed(_competing_n)
+                            except Exception:
+                                _price_n, _item_n = None, None
+                        else:
+                            _price_n, _item_n = None, None
+                        logger.info(
+                            f"[{label}] Ad Copy (USDT/USD) cross-check fetch {_attempt_n}/3: "
+                            f"{len(_win_items)} item(s) fetched, {len(_competing_n)} in ranks 50-250 — "
+                            f"highest-common price {_price_n}"
+                        )
+                        _attempts.append((_price_n, _item_n, _competing_n))
+
+                    from collections import Counter as _Counter
+                    _price_votes = _Counter(p for p, _, _ in _attempts if p is not None)
+                    _consensus_price, _consensus_count = (
+                        _price_votes.most_common(1)[0] if _price_votes else (None, 0)
                     )
-                    _window = _win_items[49:250]   # ranks 50-250
-                    logger.info(
-                        f"[{label}] Ad Copy (USDT/USD) fetched {len(_win_items)} item(s) up to rank 250 "
-                        f"({len(_window)} in ranks 50-250)."
-                    )
-                    # Same explicit self/token/currency verification as
-                    # before — don't trust the API's own filtering blindly.
-                    _competing = [
-                        it for it in _window
-                        if str(it.get("id","")) not in _own_ad_ids
-                        and it.get("tokenId","").upper()    == _want_token
-                        and it.get("currencyId","").upper() == _want_currency
-                    ]
-                    if not _competing:
+
+                    if all(not comp for _, _, comp in _attempts):
                         await bot.send_message(chat_id=chat_id,
                             text=(
                                 f"⚠️ {prefix}<b>Cycle {cycle}</b> — Ad Copy found no other "
@@ -5058,22 +5089,34 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                             if not _ad_running(sess, slot_idx): break
                             await asyncio.sleep(1)
                         continue
-                    try:
-                        _chosen_price, _chosen_item = _pick_ad_copy_price_windowed(_competing)
-                        _match_count = sum(1 for it in _competing if str(it.get("price","")) == _chosen_price)
-                        logger.info(
-                            f"[{label}] Ad Copy window 50-250: "
-                            f"{[it.get('price') for it in _competing]} — highest-common price {_chosen_price} "
-                            f"({_match_count} match(es)) from {_chosen_item.get('nickName','?')}"
+
+                    if _consensus_price is None or _consensus_count < 2:
+                        logger.warning(
+                            f"[{label}] Ad Copy (USDT/USD) cross-check INCONCLUSIVE — 3 fetches "
+                            f"disagreed ({[p for p, _, _ in _attempts]}) — no price confirmed by "
+                            f"at least 2/3. Skipping this cycle."
                         )
-                    except Exception:
                         await bot.send_message(chat_id=chat_id,
-                            text=f"⚠️ {prefix}<b>Cycle {cycle}</b> — Ad Copy got an unreadable price from the market listing. Skipping this cycle.",
-                            parse_mode="HTML")
+                            text=(
+                                f"⚠️ {prefix}<b>Cycle {cycle}</b> — Ad Copy's cross-check fetches of the "
+                                f"live market didn't agree on a highest-common price this time. "
+                                f"Skipping this cycle to avoid acting on unreliable data."
+                            ), parse_mode="HTML")
                         for _ in range(interval * 60):
                             if not _ad_running(sess, slot_idx): break
                             await asyncio.sleep(1)
                         continue
+
+                    _chosen_price = _consensus_price
+                    _chosen_item, _competing = next(
+                        (it, comp) for p, it, comp in _attempts if p == _consensus_price
+                    )
+                    _match_count = sum(1 for it in _competing if str(it.get("price","")) == _chosen_price)
+                    logger.info(
+                        f"[{label}] Ad Copy (USDT/USD) cross-check CONFIRMED price {_chosen_price} "
+                        f"({_consensus_count}/3 fetches agreed, {_match_count} ad match(es) in that "
+                        f"fetch's window) from {_chosen_item.get('nickName','?') if _chosen_item else '?'}"
+                    )
 
                     # ── Skip-until-new-highest-common-price gate ──
                     # Bybit's USDT/USD ranking is first-come-first-served:
@@ -5109,7 +5152,16 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                             await asyncio.sleep(1)
                         continue
                     s["ad_copy_last_price"] = str(_chosen_price)
-                    new_p = Decimal(_chosen_price)
+                    try:
+                        new_p = Decimal(_chosen_price)
+                    except Exception:
+                        await bot.send_message(chat_id=chat_id,
+                            text=f"⚠️ {prefix}<b>Cycle {cycle}</b> — Ad Copy got an unreadable price from the market listing. Skipping this cycle.",
+                            parse_mode="HTML")
+                        for _ in range(interval * 60):
+                            if not _ad_running(sess, slot_idx): break
+                            await asyncio.sleep(1)
+                        continue
                 else:
                     # ── Fallback for any other pair: original shallow
                     # page-1, position-#1 behaviour (unchanged). ──
