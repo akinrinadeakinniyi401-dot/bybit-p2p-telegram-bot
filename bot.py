@@ -434,6 +434,36 @@ def _pick_ad_copy_price(competing: list):
     return str(top.get("price", "")), top
 
 
+def _pick_ad_copy_price_windowed(combined: list):
+    """Selection rule for the USDT/USD deep-window Ad Copy comparison.
+
+    Given the COMBINED set of market ads pulled from two separate deep
+    windows (ranks 150-160 and ranks 240-250), choose whichever price
+    appears MOST OFTEN across that combined set — a price several
+    independent ads have converged on is treated as a more reliable
+    signal of the "real" market price than whatever sits at position #1,
+    which can be a single outlier or a boosted/stale listing.
+
+    Ties (more than one price sharing the top frequency) are broken by
+    whichever of the tied prices appears EARLIEST in `combined` — i.e.
+    window 150-160 takes priority over 240-250, and within a window
+    Bybit's own return order is preserved.
+
+    Returns (chosen_price_str, chosen_item) or (None, None) if the
+    combined set is empty.
+    """
+    if not combined:
+        return None, None
+    from collections import Counter
+    prices = [str(it.get("price", "")) for it in combined]
+    counts = Counter(prices)
+    best_count = max(counts.values())
+    for it, p in zip(combined, prices):
+        if counts[p] == best_count:
+            return p, it
+    return None, None   # unreachable — combined is non-empty
+
+
 def _market_ads_query_side(ad_data: dict) -> str:
     """Which 'side' value to pass to /v5/p2p/item/online when looking for
     ads that actually compete with this one.
@@ -4979,66 +5009,135 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                 }
                 _want_token    = ad_data.get("tokenId","").upper()
                 _want_currency = ad_data.get("currencyId","").upper()
-                # Fetch a full 100-item page-1 window regardless of the
-                # self-exclusion range setting — gives us more raw data to
-                # look at / potentially filter on later, since Bybit's own
-                # support confirmed the API's page-1 order doesn't match
-                # what's actually visible on the site (server-side hidden
-                # ads + boosted visibility that the API doesn't expose).
-                # _range_n still controls how deep we search for the first
-                # non-self ad — this only widens what we fetch.
-                _market = await asyncio.get_event_loop().run_in_executor(
-                    _ad_executor, get_market_ads,
-                    ad_data.get("tokenId",""), ad_data.get("currencyId",""),
-                    _market_ads_query_side(ad_data), 1, 100, creds
-                )
-                _items = (_market.get("result") or {}).get("items", []) if isinstance(_market, dict) else []
-                logger.info(
-                    f"[{label}] Ad Copy fetched {len(_items)} item(s) for requested "
-                    f"tokenId={_want_token} currencyId={_want_currency} — "
-                    f"sample: {[(it.get('tokenId'), it.get('currencyId'), it.get('price')) for it in _items[:3]]}"
-                )
-                # EXPLICIT verification — don't trust the API's own filtering
-                # blindly. Confirmed in production: a request for USDT/USD
-                # returned (or was matched against) a USDC price, which got
-                # copied as if it were USDT — a real, meaningful pricing
-                # error since USDC/USD and USDT/USD traded at genuinely
-                # different rates (1.20 vs 1.015). Every candidate must
-                # match the ad's own tokenId AND currencyId exactly before
-                # it's ever eligible to be copied.
-                _competing = [
-                    it for it in _items
-                    if str(it.get("id","")) not in _own_ad_ids
-                    and it.get("tokenId","").upper()    == _want_token
-                    and it.get("currencyId","").upper() == _want_currency
-                ][:_range_n]
-                if not _competing:
-                    await bot.send_message(chat_id=chat_id,
-                        text=(
-                            f"⚠️ {prefix}<b>Cycle {cycle}</b> — Ad Copy found no other "
-                            f"{_want_currency}/{_want_token} ads to copy "
-                            f"in the top {_range_n} of the live market right now. Skipping this cycle."
-                        ), parse_mode="HTML")
-                    for _ in range(interval * 60):
-                        if not _ad_running(sess, slot_idx): break
-                        await asyncio.sleep(1)
-                    continue
-                try:
-                    _chosen_price, _chosen_item = _pick_ad_copy_price(_competing)
-                    new_p = Decimal(_chosen_price)
-                    logger.info(
-                        f"[{label}] Ad Copy window (top {_range_n}): "
-                        f"{[it.get('price') for it in _competing]} — chose {_chosen_price} "
-                        f"from {_chosen_item.get('nickName','?')}"
+                _side = _market_ads_query_side(ad_data)
+
+                if _want_token == "USDT" and _want_currency == "USD":
+                    # ── USDT/USD deep-window comparison ──
+                    # Copy Range (1-10 / 1-20) no longer picks a shallow
+                    # page-1 depth for this pair. Both settings now do the
+                    # SAME thing: fetch two much deeper windows — ranks
+                    # 150-160 and ranks 240-250 — compare the prices found
+                    # in both together, and copy whichever single price
+                    # shows up most often across the combined set. A price
+                    # several independent ads have converged on out there
+                    # is treated as the more reliable "real" market price
+                    # than whatever sits at position #1, which can be a
+                    # single outlier or a stale/boosted listing.
+                    _win_a_items = await _fetch_market_ads_up_to(
+                        ad_data.get("tokenId",""), ad_data.get("currencyId",""), _side, 160, creds
                     )
-                except Exception:
-                    await bot.send_message(chat_id=chat_id,
-                        text=f"⚠️ {prefix}<b>Cycle {cycle}</b> — Ad Copy got an unreadable price from the market listing. Skipping this cycle.",
-                        parse_mode="HTML")
-                    for _ in range(interval * 60):
-                        if not _ad_running(sess, slot_idx): break
-                        await asyncio.sleep(1)
-                    continue
+                    _win_b_items = await _fetch_market_ads_up_to(
+                        ad_data.get("tokenId",""), ad_data.get("currencyId",""), _side, 250, creds
+                    )
+                    _window_a = _win_a_items[149:160]   # ranks 150-160
+                    _window_b = _win_b_items[239:250]   # ranks 240-250
+                    logger.info(
+                        f"[{label}] Ad Copy (USDT/USD) fetched {len(_win_a_items)} item(s) up to rank 160 "
+                        f"({len(_window_a)} in ranks 150-160) and {len(_win_b_items)} item(s) up to rank 250 "
+                        f"({len(_window_b)} in ranks 240-250)."
+                    )
+                    # Same explicit self/token/currency verification as
+                    # before — don't trust the API's own filtering blindly.
+                    def _filter_window(_win):
+                        return [
+                            it for it in _win
+                            if str(it.get("id","")) not in _own_ad_ids
+                            and it.get("tokenId","").upper()    == _want_token
+                            and it.get("currencyId","").upper() == _want_currency
+                        ]
+                    _competing = _filter_window(_window_a) + _filter_window(_window_b)
+                    if not _competing:
+                        await bot.send_message(chat_id=chat_id,
+                            text=(
+                                f"⚠️ {prefix}<b>Cycle {cycle}</b> — Ad Copy found no other "
+                                f"{_want_currency}/{_want_token} ads in ranks 150-160 or 240-250 "
+                                f"of the live market right now. Skipping this cycle."
+                            ), parse_mode="HTML")
+                        for _ in range(interval * 60):
+                            if not _ad_running(sess, slot_idx): break
+                            await asyncio.sleep(1)
+                        continue
+                    try:
+                        _chosen_price, _chosen_item = _pick_ad_copy_price_windowed(_competing)
+                        new_p = Decimal(_chosen_price)
+                        logger.info(
+                            f"[{label}] Ad Copy windows 150-160 + 240-250: "
+                            f"{[it.get('price') for it in _competing]} — chose {_chosen_price} "
+                            f"(most common price, {sum(1 for it in _competing if str(it.get('price','')) == _chosen_price)} match(es)) "
+                            f"from {_chosen_item.get('nickName','?')}"
+                        )
+                    except Exception:
+                        await bot.send_message(chat_id=chat_id,
+                            text=f"⚠️ {prefix}<b>Cycle {cycle}</b> — Ad Copy got an unreadable price from the market listing. Skipping this cycle.",
+                            parse_mode="HTML")
+                        for _ in range(interval * 60):
+                            if not _ad_running(sess, slot_idx): break
+                            await asyncio.sleep(1)
+                        continue
+                else:
+                    # ── Fallback for any other pair: original shallow
+                    # page-1, position-#1 behaviour (unchanged). ──
+                    # Fetch a full 100-item page-1 window regardless of the
+                    # self-exclusion range setting — gives us more raw data to
+                    # look at / potentially filter on later, since Bybit's own
+                    # support confirmed the API's page-1 order doesn't match
+                    # what's actually visible on the site (server-side hidden
+                    # ads + boosted visibility that the API doesn't expose).
+                    # _range_n still controls how deep we search for the first
+                    # non-self ad — this only widens what we fetch.
+                    _market = await asyncio.get_event_loop().run_in_executor(
+                        _ad_executor, get_market_ads,
+                        ad_data.get("tokenId",""), ad_data.get("currencyId",""),
+                        _side, 1, 100, creds
+                    )
+                    _items = (_market.get("result") or {}).get("items", []) if isinstance(_market, dict) else []
+                    logger.info(
+                        f"[{label}] Ad Copy fetched {len(_items)} item(s) for requested "
+                        f"tokenId={_want_token} currencyId={_want_currency} — "
+                        f"sample: {[(it.get('tokenId'), it.get('currencyId'), it.get('price')) for it in _items[:3]]}"
+                    )
+                    # EXPLICIT verification — don't trust the API's own filtering
+                    # blindly. Confirmed in production: a request for USDT/USD
+                    # returned (or was matched against) a USDC price, which got
+                    # copied as if it were USDT — a real, meaningful pricing
+                    # error since USDC/USD and USDT/USD traded at genuinely
+                    # different rates (1.20 vs 1.015). Every candidate must
+                    # match the ad's own tokenId AND currencyId exactly before
+                    # it's ever eligible to be copied.
+                    _competing = [
+                        it for it in _items
+                        if str(it.get("id","")) not in _own_ad_ids
+                        and it.get("tokenId","").upper()    == _want_token
+                        and it.get("currencyId","").upper() == _want_currency
+                    ][:_range_n]
+                    if not _competing:
+                        await bot.send_message(chat_id=chat_id,
+                            text=(
+                                f"⚠️ {prefix}<b>Cycle {cycle}</b> — Ad Copy found no other "
+                                f"{_want_currency}/{_want_token} ads to copy "
+                                f"in the top {_range_n} of the live market right now. Skipping this cycle."
+                            ), parse_mode="HTML")
+                        for _ in range(interval * 60):
+                            if not _ad_running(sess, slot_idx): break
+                            await asyncio.sleep(1)
+                        continue
+                    try:
+                        _chosen_price, _chosen_item = _pick_ad_copy_price(_competing)
+                        new_p = Decimal(_chosen_price)
+                        logger.info(
+                            f"[{label}] Ad Copy window (top {_range_n}): "
+                            f"{[it.get('price') for it in _competing]} — chose {_chosen_price} "
+                            f"from {_chosen_item.get('nickName','?')}"
+                        )
+                    except Exception:
+                        await bot.send_message(chat_id=chat_id,
+                            text=f"⚠️ {prefix}<b>Cycle {cycle}</b> — Ad Copy got an unreadable price from the market listing. Skipping this cycle.",
+                            parse_mode="HTML")
+                        for _ in range(interval * 60):
+                            if not _ad_running(sess, slot_idx): break
+                            await asyncio.sleep(1)
+                        continue
+
             else:
                 try:
                     float_pct = float(s.get("float_pct") or 0)
