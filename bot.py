@@ -6819,15 +6819,23 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             and it.get("currencyId","").upper() == want_currency.upper()
         ][:size_n]
         _chosen_price, _chosen_item = _pick_ad_copy_price(_competing)
-        lines = [
+        header_lines = [
             f"🔍 <b>Live Market Ads</b>",
             f"<code>{_esc(want_token)}/{_esc(want_currency)}</code> · side=<code>{_esc(str(want_side))}</code> "
             f"(your ad's own side is <code>{_esc(str(ad_data.get('side','?')))}</code>)",
             f"👉 Would copy: <code>{_esc(str(_chosen_price))}</code>" if _chosen_price else "⚠️ No eligible ad in this window.",
+            f"📄 Fetched {len(items)} item(s) from page 1.",
             "",
         ]
         if not items:
-            lines.append("No items returned.")
+            header_lines.append("No items returned.")
+        # Build each item as ONE complete, self-contained HTML chunk (never
+        # split a tag across the truncation boundary) then only add whole
+        # chunks while there's room — this is what was crashing edit_menu:
+        # blindly slicing the final joined string at a fixed character
+        # count could cut a <code> or <b> tag in half, and Telegram's HTML
+        # parser rejects the whole message ("unsupported start tag").
+        item_chunks = []
         for i, it in enumerate(items[:size_n], 1):
             mark = " 🔸YOURS" if str(it.get("id","")) in own_ids else ""
             if _chosen_item is not None and it.get("id") == _chosen_item.get("id"):
@@ -6835,14 +6843,50 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             nick = it.get("nickName","?")
             if len(nick) > 18:
                 nick = nick[:17] + "…"
-            lines.append(
+            item_chunks.append(
                 f"<b>{i}.</b> <code>{_esc(str(it.get('price','?')))}</code>{mark}\n"
                 f"    {_esc(nick)} {'🟢' if it.get('isOnline') else '⚪'} · "
                 f"{_esc(str(it.get('minAmount','?')))}-{_esc(str(it.get('maxAmount','?')))}"
             )
-        txt = "\n".join(lines)
-        if len(txt) > 3900:
-            txt = txt[:3900] + "\n…(truncated)"
+        header_txt = "\n".join(header_lines)
+        budget = 3800 - len(header_txt)
+        shown_lines, used = [], 0
+        for chunk in item_chunks:
+            cost = len(chunk) + 1  # +1 for the joining newline
+            if used + cost > budget:
+                break
+            shown_lines.append(chunk)
+            used += cost
+        if len(shown_lines) < len(item_chunks):
+            shown_lines.append(f"…({len(item_chunks) - len(shown_lines)} more not shown — full list attached as a file below)")
+        txt = "\n".join(header_lines + shown_lines)
+        # A raw, plain-text dump of every fetched item — attached whenever
+        # not everything fit inline, so nothing requested is ever lost to
+        # the message-length limit. Plain text (no HTML) so it's never at
+        # risk of the same entity-parsing failure.
+        dump_file = None
+        if len(shown_lines) < len(item_chunks) or size_n >= 50:
+            import io as _io
+            raw_lines = [
+                f"Live Market Ads — {want_token}/{want_currency} · side={want_side} "
+                f"(your ad's own side is {ad_data.get('side','?')})",
+                f"Fetched {len(items)} item(s) from page 1. Requested size={size_n}.",
+                "",
+            ]
+            for i, it in enumerate(items[:size_n], 1):
+                mark = " YOURS" if str(it.get("id","")) in own_ids else ""
+                if _chosen_item is not None and it.get("id") == _chosen_item.get("id"):
+                    mark += " <-- WOULD COPY"
+                raw_lines.append(
+                    f"{i}. price={it.get('price','?')} id={it.get('id','?')} "
+                    f"nick={it.get('nickName','?')} online={it.get('isOnline','?')} "
+                    f"min={it.get('minAmount','?')} max={it.get('maxAmount','?')} "
+                    f"recentOrderNum={it.get('recentOrderNum','?')} "
+                    f"recentExecuteRate={it.get('recentExecuteRate','?')}{mark}"
+                )
+            raw_txt = "\n".join(raw_lines)
+            dump_file = _io.BytesIO(raw_txt.encode("utf-8"))
+            dump_file.name = f"market_ads_{want_token}_{want_currency}_s{want_side}_n{size_n}.txt"
         rows = [
             [
                 InlineKeyboardButton(("✅ " if want_token.upper() == "USDT" else "") + "USDT", callback_data=f"view_market_ads_s{want_side}_n{size_n}_tUSDT"),
@@ -6859,6 +6903,15 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             ],
         ] + back_section("section_ads")
         await edit_menu(query, txt, InlineKeyboardMarkup(rows))
+        if dump_file is not None:
+            try:
+                await query.message.reply_document(
+                    document=dump_file,
+                    filename=dump_file.name,
+                    caption=f"📄 Full raw dump — {want_token}/{want_currency} side={want_side}, {len(items)} item(s)."
+                )
+            except Exception as _e:
+                logger.warning(f"[view_market_ads] dump file send failed: {_e}")
 
     elif data == "set_ad_copy_range":
         sess = _s(tuser.id)
