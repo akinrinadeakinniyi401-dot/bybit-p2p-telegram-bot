@@ -38,6 +38,12 @@ def _default_settings() -> dict:
         # "top5" or "top10" — how deep into the live market listing to
         # look when picking the highest non-self price to copy.
         "ad_copy_range":  "top5",
+        # Manual override for the automatic Ad 2/Ad 3 nudge amount (see
+        # _MANUAL_NUDGE_ELIGIBLE_PAIRS / _manual_nudge_for_slot in bot.py).
+        # Empty string = use the automatic amount ($9/₦12,600 per gap
+        # level). Only meaningful for slot_idx != -1 on BTC/USD, ETH/USD,
+        # BTC/NGN, ETH/NGN — harmless (and simply ignored) everywhere else.
+        "manual_nudge":   "",
     }
 
 
@@ -297,6 +303,49 @@ class SessionState:
                 slot["task"].cancel()
             slot["running"] = False
             slot["task"]    = None
+
+    # ── Auto Resume Agent snapshot ──
+    def snapshot_active_engines(self) -> dict:
+        """Capture exactly which engines are ON right now, for the Auto
+        Resume Agent to replay later (see db.save/get_resume_snapshot and
+        bot.py's _resume_user_engines). Ad slots record enough to fetch
+        ad details fresh and start auto-update again (slot_idx + ad_id) —
+        never the running task itself, which obviously can't survive a
+        reset or redeploy.
+
+        Deliberately does NOT capture anything if NOTHING is active — an
+        all-False snapshot is functionally identical to no snapshot at
+        all, and avoiding the write means a user's LAST genuinely-active
+        snapshot survives on disk instead of being overwritten by an
+        all-off one the moment they stop everything (e.g. right before a
+        scheduled reset catches them mid-session-cleanup).
+        """
+        ad_slots = []
+        if self.refresh_running and self.settings.get("ad_id"):
+            ad_slots.append({"slot_idx": -1, "ad_id": self.settings.get("ad_id")})
+        for i, slot in enumerate(self.extra_ad_slots):
+            if slot.get("running") and slot["settings"].get("ad_id"):
+                ad_slots.append({"slot_idx": i, "ad_id": slot["settings"].get("ad_id")})
+
+        snapshot = {
+            "ad_slots":         ad_slots,
+            "order_monitor":    self.order_monitor_running,
+            "chat_monitor":     self.chat_monitor_enabled,
+            "sell_msg":         self.sell_msg_enabled,
+            "buyer_protection": self.buyer_protection_on,
+            "name_match":       self.name_match_enabled,
+            "auto_pay_bybit":   self.auto_pay_enabled,
+            "auto_pay_flw":     self.flw_pay_enabled,
+            "auto_pay_paga":    self.paga_pay_enabled,
+        }
+        has_anything_on = bool(ad_slots) or any(
+            snapshot[k] for k in (
+                "order_monitor", "chat_monitor", "sell_msg",
+                "buyer_protection", "name_match",
+                "auto_pay_bybit", "auto_pay_flw", "auto_pay_paga",
+            )
+        )
+        return snapshot if has_anything_on else {}
 
     def get_active_float_pcts(self, exclude_index: int = None, currency_id: str = None, token_id: str = None) -> list:
         """
