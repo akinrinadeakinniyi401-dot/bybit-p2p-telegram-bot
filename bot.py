@@ -443,24 +443,55 @@ def _pick_ad_copy_price_windowed(combined: list):
     market price than whatever sits at position #1, which can be a single
     outlier or a boosted/stale listing.
 
-    Ties (more than one price sharing the top frequency) are broken by
-    whichever of the tied prices appears EARLIEST in `combined` — i.e.
-    Bybit's own return order (closer to rank 50 wins ties over ranks
-    closer to 250).
+    JUNK PRICES ARE SKIPPED — some ads park at an obviously-fake decoy
+    price (exactly 1, 0.9, or 0.8) just to sit in the listing; no matter
+    how many ads happen to share one of those exact values, it's never
+    treated as the real dominant price. Ranking instead moves on to the
+    next most-common price down the list. E.g. if 1 appears 46 times,
+    1.014 appears 30 times, and 1.017 appears 40 times, the bot skips the
+    46-count junk price entirely and copies 1.017 (the next-highest
+    genuine ranking, not just whatever beats the junk price).
+
+    Ties among genuine (non-junk) prices sharing the top frequency are
+    broken by whichever appears EARLIEST in `combined` — i.e. Bybit's own
+    return order (closer to rank 1 wins ties over ranks closer to 300).
 
     Returns (chosen_price_str, chosen_item) or (None, None) if the
-    combined set is empty.
+    combined set is empty or every distinct price found is junk.
     """
     if not combined:
         return None, None
     from collections import Counter
     prices = [str(it.get("price", "")) for it in combined]
     counts = Counter(prices)
-    best_count = max(counts.values())
-    for it, p in zip(combined, prices):
-        if counts[p] == best_count:
-            return p, it
-    return None, None   # unreachable — combined is non-empty
+    first_seen = {}
+    for idx, p in enumerate(prices):
+        first_seen.setdefault(p, idx)
+    # Rank distinct prices by frequency (highest first), ties broken by
+    # earliest occurrence in `combined`.
+    ranked = sorted(counts.keys(), key=lambda p: (-counts[p], first_seen[p]))
+    for p in ranked:
+        if _is_ad_copy_junk_price(p):
+            logger.info(
+                f"[AdCopy] skipping junk price {p} ({counts[p]} occurrence(s)) — "
+                f"moving to next-ranked price"
+            )
+            continue
+        idx = first_seen[p]
+        return p, combined[idx]
+    return None, None   # every distinct price found was junk
+
+
+# Decoy/junk prices some USDT/USD ads park at just to sit in the listing —
+# never realistic values for this pair, so never eligible to be copied no
+# matter how many ads share one of them. See _pick_ad_copy_price_windowed.
+_AD_COPY_JUNK_PRICE_VALUES = {Decimal("1"), Decimal("0.9"), Decimal("0.8")}
+
+def _is_ad_copy_junk_price(price_str: str) -> bool:
+    try:
+        return Decimal(price_str) in _AD_COPY_JUNK_PRICE_VALUES
+    except Exception:
+        return False
 
 
 def _market_ads_query_side(ad_data: dict) -> str:
