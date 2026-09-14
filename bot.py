@@ -437,7 +437,7 @@ def _pick_ad_copy_price(competing: list):
 def _pick_ad_copy_price_windowed(combined: list):
     """Selection rule for the USDT/USD deep-window Ad Copy comparison.
 
-    Given a deep window of market ads (ranks 50-250), choose whichever
+    Given a deep window of market ads (ranks 1-300), choose whichever
     price appears MOST OFTEN within it — a price several independent ads
     have converged on is treated as a more reliable signal of the "real"
     market price than whatever sits at position #1, which can be a single
@@ -783,6 +783,33 @@ def _fast_chase_gap(currency_id: str, token_id: str, reference_price=None) -> De
     return get_min_price_gap(currency_id, token_id, reference_price)
 
 
+# Pairs eligible for the manual "Nudge Amount" override (Ad 2/Ad 3 only —
+# see _MANUAL_NUDGE_ELIGIBLE_PAIRS usage in ads_section_keyboard and
+# _resolve_price_collision). These are exactly the 4 pairs that currently
+# get an automatic fixed-amount nudge ($9/₦12,600 per gap level) rather
+# than the stablecoin 1%-of-price gap, so a manual override actually makes
+# sense as a flat currency amount here.
+_MANUAL_NUDGE_ELIGIBLE_PAIRS = {("USD", "BTC"), ("USD", "ETH"), ("NGN", "BTC"), ("NGN", "ETH")}
+
+
+def _manual_nudge_for_slot(sess, slot_idx: int, currency_id: str, token_id: str):
+    """Return this slot's manually-set nudge amount (Decimal) if the user
+    has set one for an eligible pair, else None (meaning: fall back to the
+    automatic get_min_price_gap()-derived amount)."""
+    if slot_idx == -1:
+        return None
+    if (currency_id.upper(), token_id.upper()) not in _MANUAL_NUDGE_ELIGIBLE_PAIRS:
+        return None
+    raw = (_ad_settings(sess, slot_idx) or {}).get("manual_nudge", "")
+    if not raw:
+        return None
+    try:
+        val = Decimal(str(raw))
+        return val if val > 0 else None
+    except Exception:
+        return None
+
+
 # How far to nudge a price off of ITS OWN last posted value when Bybit
 # rejects it as an exact duplicate (90043 — "differs from your existing ad
 # by less than 0%"). Deliberately tiny, and shared by every place that
@@ -853,6 +880,9 @@ def _resolve_price_collision(sess, slot_idx: int, currency_id: str, token_id: st
     only ever one $3 collision.
     """
     gap = get_min_price_gap(currency_id, token_id, natural_price)
+    _manual = _manual_nudge_for_slot(sess, slot_idx, currency_id, token_id)
+    if _manual is not None:
+        gap = _manual
     conflicts = []   # list of (price, label, required_gap)
     for i in range(-1, len(sess.extra_ad_slots)):
         if i == slot_idx:
@@ -1165,6 +1195,7 @@ def main_menu_keyboard(uid: int = 0):
          InlineKeyboardButton("💬 Contact Support",      callback_data="contact_support")],
         [InlineKeyboardButton("📡 Bot Status",           callback_data="bot_status"),
          InlineKeyboardButton("🌍 Get My IP",            callback_data="get_my_ip")],
+        [InlineKeyboardButton("🤖 Auto Resume Agent",    callback_data="auto_resume_menu")],
         [InlineKeyboardButton("🔁 Reset Session",        callback_data="reset_confirm")],
     ]
     return InlineKeyboardMarkup(kb)
@@ -1298,8 +1329,18 @@ def ads_section_keyboard(uid: int = 0):
     else:
         rows.append([InlineKeyboardButton("📊 Set Float %",   callback_data="set_float_pct")])
         _cur = ad_data.get("currencyId","").upper()
+        _tok = ad_data.get("tokenId","").upper()
         if currency_needs_ref(_cur) or _cur == "NGN":
             rows.append([InlineKeyboardButton(f"💱 Set {_cur}/USDT Ref", callback_data="set_ngn_ref")])
+        # Manual nudge amount — Ad 2/Ad 3 only, and only for the 4 pairs
+        # where fast-chase auto-nudges a junior ad below a senior sibling
+        # (-$9/₦12,600 for Ad 2, -$18/₦25,200 for Ad 3 by default). Ad 1
+        # never gets this button — it has nothing senior to defer to, so
+        # there's nothing to nudge away from.
+        if slot_idx != -1 and (_cur, _tok) in _MANUAL_NUDGE_ELIGIBLE_PAIRS:
+            _nudge_val = (s.get("manual_nudge") or "").strip()
+            _nudge_label = f"↔️ Nudge Amount: {_nudge_val}" if _nudge_val else "↔️ Set Nudge Amount"
+            rows.append([InlineKeyboardButton(_nudge_label, callback_data="set_manual_nudge")])
 
     # Update Once Now only makes sense — and is only offered — when the
     # user is running a single ad. With multiple ads active, a one-off
@@ -5021,68 +5062,36 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                 _side = _market_ads_query_side(ad_data)
 
                 if _want_token == "USDT" and _want_currency == "USD":
-                    # ── USDT/USD deep-window comparison, cross-checked ──
+                    # ── USDT/USD deep-window comparison ──
                     # Copy Range (1-10 / 1-20) no longer picks a shallow
                     # page-1 depth for this pair. Both settings now do the
-                    # SAME thing: fetch ONE much deeper window — ranks
-                    # 50-250 — and copy whichever single price shows up
-                    # most often within it. A price several independent
-                    # ads have converged on out there is treated as the
+                    # SAME thing: fetch ONE window — ranks 1-300 — and copy
+                    # whichever single price shows up most often (the
+                    # "dominant" price) within it. A price several
+                    # independent ads have converged on is treated as the
                     # more reliable "real" market price than whatever sits
-                    # at position #1, which can be a single outlier or a
-                    # stale/boosted listing.
-                    #
-                    # CROSS-CHECK: a single fetch of that window can
-                    # occasionally come back stale/incomplete from Bybit —
-                    # confirmed in production: the skip-gate below kept
-                    # reporting "unchanged" against an old price for
-                    # several cycles even after the real highest-common
-                    # price had genuinely moved, and only a full bot
-                    # restart picked up the correct new price. So instead
-                    # of trusting one fetch, fetch the SAME window 3
-                    # separate times and only trust a highest-common price
-                    # that's confirmed by at least 2 of those 3 independent
-                    # fetches. Each individual fetch attempt is logged
-                    # internally only — the user is never notified about
-                    # these retries, only about the final confirmed
-                    # decision (skip vs post).
-                    _attempts = []   # [(price_or_None, item_or_None, competing_list), ...]
-                    for _attempt_n in range(1, 4):
-                        _win_items = await _fetch_market_ads_up_to(
-                            ad_data.get("tokenId",""), ad_data.get("currencyId",""), _side, 250, creds
-                        )
-                        _window_n = _win_items[49:250]   # ranks 50-250
-                        _competing_n = [
-                            it for it in _window_n
-                            if str(it.get("id","")) not in _own_ad_ids
-                            and it.get("tokenId","").upper()    == _want_token
-                            and it.get("currencyId","").upper() == _want_currency
-                        ]
-                        if _competing_n:
-                            try:
-                                _price_n, _item_n = _pick_ad_copy_price_windowed(_competing_n)
-                            except Exception:
-                                _price_n, _item_n = None, None
-                        else:
-                            _price_n, _item_n = None, None
-                        logger.info(
-                            f"[{label}] Ad Copy (USDT/USD) cross-check fetch {_attempt_n}/3: "
-                            f"{len(_win_items)} item(s) fetched, {len(_competing_n)} in ranks 50-250 — "
-                            f"highest-common price {_price_n}"
-                        )
-                        _attempts.append((_price_n, _item_n, _competing_n))
-
-                    from collections import Counter as _Counter
-                    _price_votes = _Counter(p for p, _, _ in _attempts if p is not None)
-                    _consensus_price, _consensus_count = (
-                        _price_votes.most_common(1)[0] if _price_votes else (None, 0)
+                    # at position #1 alone, which can be a single outlier
+                    # or a stale/boosted listing.
+                    _win_items = await _fetch_market_ads_up_to(
+                        ad_data.get("tokenId",""), ad_data.get("currencyId",""), _side, 300, creds
+                    )
+                    _window = _win_items[0:300]   # ranks 1-300
+                    _competing = [
+                        it for it in _window
+                        if str(it.get("id","")) not in _own_ad_ids
+                        and it.get("tokenId","").upper()    == _want_token
+                        and it.get("currencyId","").upper() == _want_currency
+                    ]
+                    logger.info(
+                        f"[{label}] Ad Copy (USDT/USD) fetched {len(_win_items)} item(s), "
+                        f"{len(_competing)} in ranks 1-300."
                     )
 
-                    if all(not comp for _, _, comp in _attempts):
+                    if not _competing:
                         await bot.send_message(chat_id=chat_id,
                             text=(
                                 f"⚠️ {prefix}<b>Cycle {cycle}</b> — Ad Copy found no other "
-                                f"{_want_currency}/{_want_token} ads in ranks 50-250 "
+                                f"{_want_currency}/{_want_token} ads in ranks 1-300 "
                                 f"of the live market right now. Skipping this cycle."
                             ), parse_mode="HTML")
                         for _ in range(interval * 60):
@@ -5090,32 +5099,21 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                             await asyncio.sleep(1)
                         continue
 
-                    if _consensus_price is None or _consensus_count < 2:
-                        logger.warning(
-                            f"[{label}] Ad Copy (USDT/USD) cross-check INCONCLUSIVE — 3 fetches "
-                            f"disagreed ({[p for p, _, _ in _attempts]}) — no price confirmed by "
-                            f"at least 2/3. Skipping this cycle."
-                        )
+                    try:
+                        _chosen_price, _chosen_item = _pick_ad_copy_price_windowed(_competing)
+                    except Exception:
                         await bot.send_message(chat_id=chat_id,
-                            text=(
-                                f"⚠️ {prefix}<b>Cycle {cycle}</b> — Ad Copy's cross-check fetches of the "
-                                f"live market didn't agree on a highest-common price this time. "
-                                f"Skipping this cycle to avoid acting on unreliable data."
-                            ), parse_mode="HTML")
+                            text=f"⚠️ {prefix}<b>Cycle {cycle}</b> — Ad Copy got an unreadable price from the market listing. Skipping this cycle.",
+                            parse_mode="HTML")
                         for _ in range(interval * 60):
                             if not _ad_running(sess, slot_idx): break
                             await asyncio.sleep(1)
                         continue
-
-                    _chosen_price = _consensus_price
-                    _chosen_item, _competing = next(
-                        (it, comp) for p, it, comp in _attempts if p == _consensus_price
-                    )
                     _match_count = sum(1 for it in _competing if str(it.get("price","")) == _chosen_price)
                     logger.info(
-                        f"[{label}] Ad Copy (USDT/USD) cross-check CONFIRMED price {_chosen_price} "
-                        f"({_consensus_count}/3 fetches agreed, {_match_count} ad match(es) in that "
-                        f"fetch's window) from {_chosen_item.get('nickName','?') if _chosen_item else '?'}"
+                        f"[{label}] Ad Copy (USDT/USD) dominant price {_chosen_price} "
+                        f"({_match_count} match(es) in ranks 1-300) from "
+                        f"{_chosen_item.get('nickName','?') if _chosen_item else '?'}"
                     )
 
                     # ── Skip-until-new-highest-common-price gate ──
@@ -6274,6 +6272,97 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             InlineKeyboardMarkup(back_main())
         )
 
+    # ── 🤖 Auto Resume Agent menu ──
+    elif data == "auto_resume_menu":
+        ar = db.auto_resume_agent_status(tuser.id)
+        kb_rows = []
+        if ar["status"] == "approved":
+            enabled = db.get_auto_resume_agent_enabled(tuser.id)
+            exp_str = f"until <code>{ar['expires']}</code>" if ar["expires"] else "for the lifetime of your Pro plan"
+            txt = (
+                f"🤖 <b>Auto Resume Agent</b>\n\n"
+                f"✅ Approved and active {exp_str}.\n\n"
+                f"While <b>ON</b>, whatever you had running (Ad Price Bot, Order Monitor, "
+                f"Chat Monitor, Auto-Pay, Buyer Protection, Sell Message) gets automatically "
+                f"restarted after every scheduled 2-hour reset — no need to open the bot.\n\n"
+                f"Current status: {'🟢 ON' if enabled else '🔴 OFF'}"
+            )
+            kb_rows.append([InlineKeyboardButton(
+                "🔴 Turn OFF" if enabled else "🟢 Turn ON",
+                callback_data="toggle_auto_resume_agent"
+            )])
+        elif ar["status"] == "pending":
+            txt = (
+                f"🤖 <b>Auto Resume Agent</b>\n\n"
+                f"⏳ Your request is pending admin approval."
+            )
+        else:
+            note = ""
+            if ar["status"] == "rejected":
+                note = "\n\n⚠️ A previous request was declined."
+            elif ar["status"] == "expired":
+                note = "\n\n⚠️ A previous approval has expired."
+            txt = (
+                f"🤖 <b>Auto Resume Agent</b>\n\n"
+                f"Automatically restarts whatever you had running (Ad Price Bot, Order Monitor, "
+                f"Chat Monitor, Auto-Pay, Buyer Protection, Sell Message) after every scheduled "
+                f"2-hour reset — without you needing to open the bot.\n\n"
+                f"Requires admin approval (tied to your Pro plan, same as Permanent IP).{note}"
+            )
+            kb_rows.append([InlineKeyboardButton("🤖 Request Auto Resume Agent Approval", callback_data="request_auto_resume_agent")])
+        kb_rows += back_main()
+        await edit_menu(query, txt, InlineKeyboardMarkup(kb_rows))
+
+    # ── 🤖 Request Auto Resume Agent Approval ──
+    elif data == "request_auto_resume_agent":
+        db.request_auto_resume_agent(tuser.id)
+        uname = f"@{tuser.username}" if tuser.username else "(no username)"
+        badge = sub.plan_badge(tuser.id)
+        admin_text = (
+            f"🤖 <b>Auto Resume Agent requested</b>\n\n"
+            f"User: <code>{tuser.id}</code> {uname}\n"
+            f"Plan: {badge}\n\n"
+            f"✅ Approve: <code>/approveresume {tuser.id}</code>\n"
+            f"❌ Reject: <code>/rejectresume {tuser.id}</code>"
+        )
+        for admin_id in list(_admin_chat_ids):
+            try:
+                await context.bot.send_message(chat_id=admin_id, text=admin_text, parse_mode="HTML")
+            except Exception as e:
+                logger.warning(f"[AutoResume] Failed to notify admin {admin_id}: {e}")
+        await edit_menu(query,
+            "🤖 <b>Request sent</b>\n\nYour Auto Resume Agent request has been sent to the admin — "
+            "you'll be notified here once it's reviewed.",
+            InlineKeyboardMarkup(back_main())
+        )
+
+    # ── 🤖 Toggle Auto Resume Agent on/off ──
+    elif data == "toggle_auto_resume_agent":
+        currently_on = db.get_auto_resume_agent_enabled(tuser.id)
+        db.set_auto_resume_agent_enabled(tuser.id, not currently_on)
+        if not currently_on:
+            # Just turned it ON — snapshot whatever is running RIGHT NOW so
+            # there's something to resume even if the very next event is a
+            # reset a moment later, rather than waiting for the next toggle.
+            _maybe_snapshot_resume_state(tuser.id)
+        await query.answer(f"Auto Resume Agent {'disabled' if currently_on else 'enabled'}.")
+        ar = db.auto_resume_agent_status(tuser.id)
+        enabled = db.get_auto_resume_agent_enabled(tuser.id)
+        exp_str = f"until <code>{ar['expires']}</code>" if ar["expires"] else "for the lifetime of your Pro plan"
+        txt = (
+            f"🤖 <b>Auto Resume Agent</b>\n\n"
+            f"✅ Approved and active {exp_str}.\n\n"
+            f"While <b>ON</b>, whatever you had running (Ad Price Bot, Order Monitor, "
+            f"Chat Monitor, Auto-Pay, Buyer Protection, Sell Message) gets automatically "
+            f"restarted after every scheduled 2-hour reset — no need to open the bot.\n\n"
+            f"Current status: {'🟢 ON' if enabled else '🔴 OFF'}"
+        )
+        kb_rows = [[InlineKeyboardButton(
+            "🔴 Turn OFF" if enabled else "🟢 Turn ON",
+            callback_data="toggle_auto_resume_agent"
+        )]] + back_main()
+        await edit_menu(query, txt, InlineKeyboardMarkup(kb_rows))
+
     # ── 🔑 Switch Account ──
     elif data.startswith("switch_account_"):
         idx      = int(data.split("_")[-1])
@@ -6441,6 +6530,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
     elif data == "toggle_buyer_protection":
         _s(tuser.id).buyer_protection_on = not _s(tuser.id).buyer_protection_on
+        _maybe_snapshot_resume_state(tuser.id)
         status = "✅ ON" if _s(tuser.id).buyer_protection_on else "❌ OFF"
         await edit_menu(query,
             f"🛡 <b>Buyer Protection {status}</b>\n\nThreshold: <code>{_s(tuser.id).buyer_protection_mins} min</code>\n\n"
@@ -6470,6 +6560,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
     # ── 🔍 Name Match toggle ──
     elif data == "toggle_name_match":
         _s(tuser.id).name_match_enabled = not _s(tuser.id).name_match_enabled
+        _maybe_snapshot_resume_state(tuser.id)
         status = "✅ ON" if _s(tuser.id).name_match_enabled else "❌ OFF"
         await edit_menu(query,
             f"🔍 <b>Name Match {status}</b>\n\n"
@@ -6491,6 +6582,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             _s(tuser.id).flw_pay_enabled = False
         if _s(tuser.id).auto_pay_enabled and _s(tuser.id).paga_pay_enabled:
             _s(tuser.id).paga_pay_enabled = False
+        _maybe_snapshot_resume_state(tuser.id)
         await edit_menu(query, autopay_section_text(tuser.id), autopay_section_keyboard(tuser.id))
 
     # ── 🟢 Toggle Flutterwave Pay ──
@@ -6511,6 +6603,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             _s(tuser.id).auto_pay_enabled = False
         if _s(tuser.id).flw_pay_enabled and _s(tuser.id).paga_pay_enabled:
             _s(tuser.id).paga_pay_enabled = False
+        _maybe_snapshot_resume_state(tuser.id)
         await edit_menu(query, autopay_section_text(tuser.id), autopay_section_keyboard(tuser.id))
 
     # ── 🟡 Toggle Paga Pay ──
@@ -6528,6 +6621,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             _s(tuser.id).auto_pay_enabled = False
         if _s(tuser.id).paga_pay_enabled and _s(tuser.id).flw_pay_enabled:
             _s(tuser.id).flw_pay_enabled = False
+        _maybe_snapshot_resume_state(tuser.id)
         await edit_menu(query, autopay_section_text(tuser.id), autopay_section_keyboard(tuser.id))
 
     # ── ℹ️ Paga info ──
@@ -6623,6 +6717,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             if _s(tuser.id).chat_monitor_task:
                 _s(tuser.id).chat_monitor_task.cancel()
                 _s(tuser.id).chat_monitor_task = None
+            _maybe_snapshot_resume_state(tuser.id)
             await edit_menu(query,
                 "💬 *Chat Monitor stopped.*\n\n" + orders_section_text(tuser.id),
                 orders_section_keyboard(tuser.id)
@@ -6644,6 +6739,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             _s(tuser.id).chat_monitor_task = asyncio.create_task(
                 chat_monitor_loop(context.bot, chat_id)
             )
+            _maybe_snapshot_resume_state(tuser.id)
             await edit_menu(query,
                 "💬 *Chat Monitor started!*\nPolling Bybit order chats every 8 seconds.\n\n"
                 + orders_section_text(tuser.id),
@@ -6693,6 +6789,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             if _s(tuser.id).order_monitor_task:
                 _s(tuser.id).order_monitor_task.cancel()
                 _s(tuser.id).order_monitor_task = None
+            _maybe_snapshot_resume_state(tuser.id)
             await edit_menu(query,
                 "🔕 *Order monitoring stopped.*\n\n" + orders_section_text(tuser.id),
                 orders_section_keyboard(tuser.id)
@@ -6715,6 +6812,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             # _s(tuser.id).order_monitor_running is set to True inside the loop itself,
             # but we set it here immediately so the UI reflects it instantly
             _s(tuser.id).order_monitor_running = True
+            _maybe_snapshot_resume_state(tuser.id)
             await edit_menu(query,
                 "🔔 *Order monitoring started!*\nChecking every 10 seconds.\n\n"
                 + orders_section_text(tuser.id),
@@ -6744,6 +6842,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
     # ── ✉️ Toggle Sell Msg ──
     elif data == "toggle_sell_msg":
         _s(tuser.id).sell_msg_enabled = not _s(tuser.id).sell_msg_enabled
+        _maybe_snapshot_resume_state(tuser.id)
         await edit_menu(query, orders_section_text(tuser.id), orders_section_keyboard(tuser.id))
 
     # ── ✏️ Set Sell Message ──
@@ -7151,6 +7250,31 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         await edit_menu(query,
             f"➕ <b>Set Increment — {_ad_slot_label(sess.editing_slot)}</b>\n\nCurrent: <code>+{s.get('increment','0.05')}</code> per cycle\n\n"
             "Send the amount to add each cycle.\nExamples: `0.05` | `1` | `0.5`",
+            InlineKeyboardMarkup(back_section("section_ads"))
+        )
+
+    # ── ↔️ Set Manual Nudge Amount (Ad 2/Ad 3 only) ──
+    elif data == "set_manual_nudge":
+        _btn_state["action"]       = "manual_nudge"
+        _btn_state["prev_section"] = "section_ads"
+        sess = _s(tuser.id)
+        slot_idx = sess.editing_slot
+        s = _ad_settings(sess, slot_idx)
+        ad_data = _ad_data_of(sess, slot_idx)
+        cur = ad_data.get("currencyId","").upper()
+        tok = ad_data.get("tokenId","").upper()
+        _auto_gap = get_min_price_gap(cur, tok, None)
+        _cur_val = (s.get("manual_nudge") or "").strip()
+        await edit_menu(query,
+            f"↔️ <b>Set Nudge Amount — {_ad_slot_label(slot_idx)}</b>\n\n"
+            f"Pair: <code>{_esc(tok)}/{_esc(cur)}</code>\n"
+            f"Automatic default for this pair: <code>{_auto_gap}</code>\n"
+            f"Current manual override: <code>{_cur_val if _cur_val else '— none, using automatic —'}</code>\n\n"
+            f"Send the amount to nudge {_ad_slot_label(slot_idx)}'s price down whenever it "
+            f"would otherwise land too close to a senior ad's price (or, for fast-chase, "
+            f"how much to subtract from Ad 1's freshly fetched price).\n"
+            f"Example: <code>5</code> or <code>10</code>\n\n"
+            f"Send <code>0</code> or <code>clear</code> to remove the override and go back to the automatic amount.",
             InlineKeyboardMarkup(back_section("section_ads"))
         )
 
@@ -7988,6 +8112,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             _set_ad_running(sess, slot_idx, False)
             _set_ad_task(sess, slot_idx, None)
             _set_ad_current_price(sess, slot_idx, Decimal("0"))
+            _maybe_snapshot_resume_state(tuser.id)
             await edit_menu(query,
                 f"🔴 <b>{label} price update stopped.</b>\n\n" + ads_section_text(tuser.id),
                 ads_section_keyboard(tuser.id)
@@ -8054,6 +8179,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             _set_ad_running(sess, slot_idx, True)   # set BEFORE create_task, no await in between — closes the race
             task = asyncio.create_task(auto_update_loop(context.bot, chat_id, slot_idx))
             _set_ad_task(sess, slot_idx, task)
+            _maybe_snapshot_resume_state(tuser.id)
             await edit_menu(query,
                 f"🟢 <b>{label} price update started!</b>\n🔀 <code>{mode.replace('_',' ').upper()}</code> | ⏱ every <code>{interval}</code> min\n\n"
                 + ads_section_text(tuser.id),
@@ -8619,6 +8745,36 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             await update.message.reply_text("❌ Send a positive number like `0.05`", parse_mode="HTML")
 
+    elif action == "manual_nudge":
+        sess = _s(uid)
+        slot_idx = sess.editing_slot
+        s = _ad_settings(sess, slot_idx)
+        cleared = text.strip().lower() in ("0", "clear", "none", "reset")
+        if cleared:
+            s["manual_nudge"] = ""
+            _save_settings(uid)
+            _state["action"] = None
+            await reply_with_back(
+                f"✅ <b>{_ad_slot_label(slot_idx)} nudge override cleared</b> — back to the automatic amount."
+            )
+        else:
+            try:
+                val = Decimal(text)
+                if val <= 0: raise ValueError
+                s["manual_nudge"] = text.strip()
+                _save_settings(uid)
+                _state["action"] = None
+                await reply_with_back(
+                    f"✅ <b>{_ad_slot_label(slot_idx)} nudge amount saved!</b>\n\n"
+                    f"<code>{_esc(text.strip())}</code> will be subtracted whenever {_ad_slot_label(slot_idx)}'s "
+                    f"price would otherwise sit too close to a senior ad."
+                )
+            except Exception:
+                await update.message.reply_text(
+                    "❌ Send a positive number like `5` or `10` — or `0` to clear the override.",
+                    parse_mode="HTML"
+                )
+
     elif action == "float_pct":
         sess = _s(uid)
         slot_idx = sess.editing_slot
@@ -9150,6 +9306,183 @@ def _reset_user_session(sess) -> bool:
     return True
 
 
+# ─────────────────────────────────────────
+# 🤖 Auto Resume Agent
+# ─────────────────────────────────────────
+# Admin-approved (see db.request/approve/reject_auto_resume_agent — same
+# gated pattern as Permanent IP, expiring with the user's Pro plan), then
+# user-toggled on/off. While ON, whatever engines the user had running
+# get transparently restarted after the 2-hour scheduled reset (and after
+# a full redeploy, which wipes the in-memory session dict completely) —
+# without the user needing to open the bot at all.
+def _maybe_snapshot_resume_state(uid: int):
+    """Call after any engine on/off change. Cheap no-op for the vast
+    majority of users (this is opt-in and admin-approved) — only writes
+    to disk for users who actually have Auto Resume Agent enabled, so
+    it's safe to call after every toggle handler regardless."""
+    try:
+        if db.get_auto_resume_agent_enabled(uid):
+            snap = _s(uid).snapshot_active_engines()
+            if snap:
+                db.save_resume_snapshot(uid, snap)
+    except Exception as e:
+        logger.debug(f"[AutoResume] snapshot failed for user {uid}: {e}")
+
+
+async def _resume_user_engines(bot, uid: int, snapshot: dict) -> list:
+    """Replay a saved engine snapshot for one user — the actual work
+    behind Auto Resume Agent. Returns a list of short human-readable
+    labels for whatever it actually managed to bring back (for the
+    notification message); anything that fails along the way is logged
+    and simply skipped rather than blocking the rest.
+
+    Ad slots are the one case that needs real network I/O first: fetch
+    that ad's live details from Bybit BEFORE starting its auto-update
+    loop, exactly as the manual "📋 Fetch Ad Details" button would, so a
+    stale/missing ad_data cache can never make the freshly-started loop
+    fail on its very first cycle.
+    """
+    if not snapshot:
+        return []
+    sess = get_session(uid)   # creates + restores persisted settings if this is a fresh (post-redeploy) session
+    resumed = []
+
+    creds = get_user_creds(uid, slot=_get_user_slot(uid))
+
+    ad_slots = snapshot.get("ad_slots") or []
+    any_ad_resumed = False
+    for entry in ad_slots:
+        slot_idx = entry.get("slot_idx")
+        ad_id    = entry.get("ad_id")
+        if slot_idx is None or not ad_id:
+            continue
+        # Bounds check — the persisted extra slots might not have been
+        # restored yet, or the user removed a slot since the snapshot was
+        # taken. Never guess or create a slot here; just skip it.
+        if slot_idx != -1 and slot_idx >= len(sess.extra_ad_slots):
+            logger.warning(f"[AutoResume] user {uid} — slot {slot_idx} no longer exists, skipping")
+            continue
+        s = _ad_settings(sess, slot_idx)
+        if s.get("ad_id") != ad_id:
+            # Settings drifted (ad_id changed) since the snapshot was taken —
+            # don't force a stale ad_id back onto a slot the user has since
+            # reconfigured.
+            logger.warning(f"[AutoResume] user {uid} — {_ad_slot_label(slot_idx)}'s ad_id changed since snapshot, skipping")
+            continue
+        if _ad_running(sess, slot_idx):
+            continue   # already running somehow — nothing to do
+        try:
+            result = await asyncio.get_event_loop().run_in_executor(
+                None, partial(get_ad_details, ad_id, creds=creds)
+            )
+            ret_code = result.get("retCode", result.get("ret_code", -1))
+            if ret_code != 0:
+                logger.warning(
+                    f"[AutoResume] user {uid} — {_ad_slot_label(slot_idx)} fetch failed "
+                    f"({result.get('retMsg', result.get('ret_msg',''))}), not starting auto-update"
+                )
+                continue
+            ad_data = _ad_data_of(sess, slot_idx)
+            ad_data.clear()
+            ad_data.update(result.get("result", {}))
+        except Exception as e:
+            logger.warning(f"[AutoResume] user {uid} — {_ad_slot_label(slot_idx)} fetch raised {e}, not starting auto-update")
+            continue
+
+        _reset_ad_failures(sess, slot_idx)
+        _set_ad_running(sess, slot_idx, True)
+        task = asyncio.create_task(auto_update_loop(bot, uid, slot_idx))
+        _set_ad_task(sess, slot_idx, task)
+        resumed.append(f"{_ad_slot_label(slot_idx)} auto-update")
+        any_ad_resumed = True
+        logger.info(f"[AutoResume] user {uid} — {_ad_slot_label(slot_idx)} resumed (ad {ad_id})")
+
+    # Order/chat monitor and ad auto-update are mutually exclusive on this
+    # bot (same guard the manual toggles enforce) — a snapshot should
+    # never contain both, but this is a hard safety check regardless of
+    # how the snapshot was produced.
+    if not any_ad_resumed:
+        if snapshot.get("order_monitor") and not sess.order_monitor_running:
+            sess.order_monitor_running = True
+            sess.order_monitor_task = asyncio.create_task(order_monitor_loop(bot, uid))
+            resumed.append("Order Monitor")
+            logger.info(f"[AutoResume] user {uid} — Order Monitor resumed")
+        if snapshot.get("chat_monitor") and not sess.chat_monitor_enabled:
+            sess.chat_monitor_enabled = True
+            sess.chat_monitor_task = asyncio.create_task(chat_monitor_loop(bot, uid))
+            resumed.append("Chat Monitor")
+            logger.info(f"[AutoResume] user {uid} — Chat Monitor resumed")
+    elif snapshot.get("order_monitor") or snapshot.get("chat_monitor"):
+        logger.warning(
+            f"[AutoResume] user {uid} — snapshot had both ad auto-update and a monitor active "
+            f"(shouldn't be possible) — ad auto-update wins, monitor skipped"
+        )
+
+    # Plain flags — no background task of their own, they only matter
+    # while Order Monitor is actually running, but replay them exactly as
+    # captured either way (harmless if inert).
+    flag_map = {
+        "buyer_protection": ("buyer_protection_on", "Buyer Protection"),
+        "name_match":       ("name_match_enabled",  "Name Match"),
+        "sell_msg":         ("sell_msg_enabled",     "Sell Message"),
+        "auto_pay_bybit":   ("auto_pay_enabled",     "Auto-Pay (Bybit)"),
+        "auto_pay_flw":     ("flw_pay_enabled",      "Auto-Pay (Flutterwave)"),
+        "auto_pay_paga":    ("paga_pay_enabled",     "Auto-Pay (Paga)"),
+    }
+    for snap_key, (attr, label) in flag_map.items():
+        if snapshot.get(snap_key) and not getattr(sess, attr):
+            setattr(sess, attr, True)
+            resumed.append(label)
+
+    # Refresh the on-disk snapshot to match what ACTUALLY came back up
+    # (e.g. an ad slot whose fetch failed above shouldn't keep getting
+    # "resumed" every cycle if it's genuinely broken).
+    try:
+        db.save_resume_snapshot(uid, sess.snapshot_active_engines())
+    except Exception:
+        pass
+
+    return resumed
+
+
+async def _auto_resume_agent_run_for_all(bot, context_label: str = "scheduled"):
+    """Resume every eligible user's saved engines in one pass — used both
+    right after the 2-hour scheduled reset and once at bot startup (to
+    cover a full redeploy, which wipes _sessions entirely). Silently
+    skips anyone without Auto Resume Agent approved+enabled or with
+    nothing saved to resume."""
+    resumed_count = 0
+    for user in db.get_all_users():
+        uid = user.get("user_id")
+        if not uid or not db.get_auto_resume_agent_enabled(uid):
+            continue
+        snapshot = db.get_resume_snapshot(uid)
+        if not snapshot:
+            continue
+        try:
+            resumed = await _resume_user_engines(bot, uid, snapshot)
+        except Exception as e:
+            logger.error(f"[AutoResume] user {uid} — resume failed ({context_label}): {e}")
+            continue
+        if resumed and bot:
+            resumed_count += 1
+            try:
+                await bot.send_message(
+                    chat_id=uid,
+                    text=(
+                        f"🤖 <b>Auto Resume Agent</b>\n\n"
+                        f"Automatically restarted after the {context_label} reset:\n"
+                        + "\n".join(f"• {r}" for r in resumed) +
+                        f"\n\nTurn Auto Resume Agent off from the main menu any time you don't want this."
+                    ),
+                    parse_mode="HTML"
+                )
+            except Exception as e:
+                logger.debug(f"[AutoResume] Could not notify user {uid}: {e}")
+    if resumed_count:
+        logger.info(f"[AutoResume] {context_label} pass — resumed engines for {resumed_count} user(s)")
+
+
 async def _session_auto_reset_loop(bot=None):
     """
     Runs every 120 minutes (2 hours).
@@ -9185,6 +9518,12 @@ async def _session_auto_reset_loop(bot=None):
                 if hasattr(_sess, "order_msg_ids") and len(_sess.order_msg_ids) > 200:
                     _keep = list(_sess.order_msg_ids.items())[-200:]
                     _sess.order_msg_ids = dict(_keep)
+
+                # Snapshot what's active BEFORE resetting wipes it — this is
+                # the ONLY moment the "true" pre-reset state is still known
+                # for a user who has Auto Resume Agent enabled. Cheap no-op
+                # for everyone else (see _maybe_snapshot_resume_state).
+                _maybe_snapshot_resume_state(_sess.user_id)
 
                 # Reset any user who has at least one active feature, then notify
                 was_reset = _reset_user_session(_sess)
@@ -9238,6 +9577,12 @@ async def _session_auto_reset_loop(bot=None):
                 f"locks={len(_order_action_locks)} "
                 f"flw_registry={len(_flw_transfer_registry)}"
             )
+
+            # Auto Resume Agent — bring back whatever eligible users had
+            # running, right after the reset above stopped it. Runs after
+            # the full reset pass (not interleaved with it) so every
+            # snapshot is captured before anything starts getting resumed.
+            await _auto_resume_agent_run_for_all(bot, "scheduled 2-hour")
         except Exception as e:
             logger.error(f"[AutoReset] Error: {e}")
 async def _db_session_cleanup_loop():
@@ -9510,6 +9855,77 @@ async def cmd_rejectip(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────
+# 🤖 /approveresume, /rejectresume — Admin approval for Auto Resume Agent
+# ─────────────────────────────────────────
+async def cmd_approveresume(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("❌ Admin only.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /approveresume <user_id>")
+        return
+    try:
+        target_uid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Invalid user ID.")
+        return
+    if not sub.is_pro(target_uid):
+        await update.message.reply_text(
+            f"❌ User <code>{target_uid}</code> isn't currently on an active Pro plan — "
+            f"nothing to tie the Auto Resume Agent expiry to. Approval NOT applied.",
+            parse_mode="HTML"
+        )
+        return
+    updated = db.approve_auto_resume_agent(target_uid)
+    if not updated:
+        await update.message.reply_text(f"❌ Could not approve user <code>{target_uid}</code>.", parse_mode="HTML")
+        return
+    exp = updated.get("auto_resume_expires")
+    exp_str = f"until {exp}" if exp else "for the lifetime of their Pro plan"
+    await update.message.reply_text(
+        f"✅ Auto Resume Agent approved for user <code>{target_uid}</code>, active {exp_str}.",
+        parse_mode="HTML"
+    )
+    try:
+        await context.bot.send_message(
+            chat_id=target_uid,
+            text=(
+                f"✅ <b>Auto Resume Agent Approved</b>\n\n"
+                f"You can now turn it on {exp_str} from 🤖 Auto Resume Agent in the main menu.\n\n"
+                f"Once you turn it on, it'll automatically restart whatever you had running "
+                f"(Ad Price Bot, Order Monitor, Auto-Pay, etc.) after every scheduled 2-hour reset — "
+                f"until you turn it back off."
+            ),
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.warning(f"[AutoResume] Failed to notify user {target_uid} of approval: {e}")
+
+async def cmd_rejectresume(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("❌ Admin only.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /rejectresume <user_id>")
+        return
+    try:
+        target_uid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("❌ Invalid user ID.")
+        return
+    db.reject_auto_resume_agent(target_uid)
+    await update.message.reply_text(f"❌ Auto Resume Agent request rejected for user <code>{target_uid}</code>.", parse_mode="HTML")
+    try:
+        await context.bot.send_message(
+            chat_id=target_uid,
+            text="❌ <b>Auto Resume Agent Request Declined</b>\n\nContact the admin for details.",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        logger.warning(f"[AutoResume] Failed to notify user {target_uid} of rejection: {e}")
+
+
+# ─────────────────────────────────────────
 # 📊 /userdata — Admin export (overrides admin_commands import)
 # Includes total_buy_orders + total_sell_orders from DB and live session.
 # ─────────────────────────────────────────
@@ -9662,6 +10078,8 @@ def start_bot():
     application.add_handler(CommandHandler("approvewithdraw",  cmd_approvewithdraw))
     application.add_handler(CommandHandler("approveip", cmd_approveip))
     application.add_handler(CommandHandler("rejectip",  cmd_rejectip))
+    application.add_handler(CommandHandler("approveresume", cmd_approveresume))
+    application.add_handler(CommandHandler("rejectresume",  cmd_rejectresume))
     application.add_handler(CommandHandler("rejectwithdraw",   cmd_rejectwithdraw))
     application.add_handler(CommandHandler("broadcast",        broadcast_command))
 
@@ -9703,6 +10121,20 @@ def start_bot():
 
         # Auto-reset stale sessions every 2 hours + notify active users
         asyncio.create_task(_session_auto_reset_loop(app.bot))
+
+        # Auto Resume Agent — startup pass. A redeploy restarts this whole
+        # process, wiping every in-memory session — this is what actually
+        # recovers eligible users' engines after THAT (as opposed to the
+        # scheduled 2h reset, which is handled inside
+        # _session_auto_reset_loop itself). Small delay so DB/network
+        # dependencies are fully up before it starts hitting Bybit.
+        async def _startup_auto_resume():
+            await asyncio.sleep(15)
+            try:
+                await _auto_resume_agent_run_for_all(app.bot, "startup/redeploy")
+            except Exception as e:
+                logger.error(f"[AutoResume] startup pass failed: {e}")
+        asyncio.create_task(_startup_auto_resume())
 
         # Auto-clear old DB sessions every 12h
         asyncio.create_task(_db_session_cleanup_loop())
