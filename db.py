@@ -442,6 +442,131 @@ def is_permanent_ip_active(user_id: int) -> bool:
 
 
 # ─────────────────────────────────────────
+# Auto Resume Agent approval
+# ─────────────────────────────────────────
+# Same admin-gated, per-user opt-in pattern as Permanent IP above, and for
+# the same reason: this is a real access grant (it lets the bot start
+# trading engines on a user's behalf without them tapping anything), not
+# something to hand out by default. Tied to the user's Pro plan expiry AT
+# THE MOMENT OF APPROVAL, never re-synced afterward — same rationale as
+# Permanent IP: a user whose plan later lapses can't keep benefiting from
+# an approval granted while they were still paying.
+#
+# Deliberately a TWO-LAYER design:
+#   1. "approval" (this section) — admin-gated, expires with Pro plan.
+#      Just makes the feature available at all.
+#   2. "enabled" (see set/get_auto_resume_agent_enabled below) — the
+#      user's OWN on/off switch once approved. Approval alone does
+#      nothing; the user still has to turn it on, and can turn it back
+#      off any time without losing the underlying approval.
+def request_auto_resume_agent(user_id: int) -> dict:
+    """Mark a pending Auto Resume Agent request. Safe to call again while
+    already pending/expired/rejected — just resets to pending."""
+    with _lock:
+        user = get_user(user_id)
+        if not user:
+            return {}
+        user["auto_resume_status"]       = "pending"
+        user["auto_resume_requested_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        _write_json(_user_path(user_id), user)
+        logger.info(f"[DB] Auto Resume Agent requested by user {user_id}")
+        return user
+
+def approve_auto_resume_agent(user_id: int) -> dict | None:
+    """Approve a pending Auto Resume Agent request. Expiry pegged to this
+    user's CURRENT plan_expires exactly like Permanent IP. Returns None
+    and changes nothing if the user isn't currently an active Pro."""
+    with _lock:
+        user = get_user(user_id)
+        if not user or not is_pro(user_id):
+            return None
+        user["auto_resume_status"]  = "approved"
+        user["auto_resume_expires"] = user.get("plan_expires")
+        _write_json(_user_path(user_id), user)
+        logger.info(
+            f"[DB] Auto Resume Agent approved for user {user_id}, "
+            f"expires {user['auto_resume_expires'] or 'lifetime (matches Pro plan)'}"
+        )
+        return user
+
+def reject_auto_resume_agent(user_id: int) -> dict:
+    with _lock:
+        user = get_user(user_id)
+        if not user:
+            return {}
+        user["auto_resume_status"]  = "rejected"
+        user["auto_resume_expires"] = None
+        _write_json(_user_path(user_id), user)
+        logger.info(f"[DB] Auto Resume Agent request rejected for user {user_id}")
+        return user
+
+def auto_resume_agent_status(user_id: int) -> dict:
+    """Returns {"status": "none"|"pending"|"approved"|"rejected"|"expired",
+    "expires": str|None} — "expired" computed live, same as permanent_ip_status."""
+    user = get_user(user_id)
+    if not user:
+        return {"status": "none", "expires": None}
+    status  = user.get("auto_resume_status", "none")
+    expires = user.get("auto_resume_expires")
+    if status == "approved" and expires:
+        try:
+            if datetime.strptime(expires, "%Y-%m-%d %H:%M:%S") <= datetime.now():
+                return {"status": "expired", "expires": expires}
+        except Exception:
+            pass
+    return {"status": status, "expires": expires}
+
+def is_auto_resume_agent_active(user_id: int) -> bool:
+    """True only while approved AND (lifetime or not yet expired) —
+    mirrors is_permanent_ip_active. Doesn't check the user's own on/off
+    toggle — see get_auto_resume_agent_enabled for that."""
+    return auto_resume_agent_status(user_id)["status"] == "approved"
+
+def set_auto_resume_agent_enabled(user_id: int, enabled: bool) -> dict:
+    """The user's own on/off switch, independent of admin approval.
+    No-op (returns {}) if the user isn't currently approved — the menu
+    should never expose this toggle to a user who isn't, but this is a
+    defense-in-depth check at the data layer too."""
+    with _lock:
+        user = get_user(user_id)
+        if not user or not is_auto_resume_agent_active(user_id):
+            return {}
+        user["auto_resume_enabled"] = bool(enabled)
+        _write_json(_user_path(user_id), user)
+        logger.info(f"[DB] Auto Resume Agent {'enabled' if enabled else 'disabled'} by user {user_id}")
+        return user
+
+def get_auto_resume_agent_enabled(user_id: int) -> bool:
+    user = get_user(user_id)
+    if not user:
+        return False
+    return bool(user.get("auto_resume_enabled", False)) and is_auto_resume_agent_active(user_id)
+
+
+# ─────────────────────────────────────────
+# Auto Resume Agent — engine snapshot
+# ─────────────────────────────────────────
+# What the user had actively running, captured continuously so it
+# survives BOTH the 2-hour scheduled session reset AND a full process
+# redeploy (which wipes the in-memory session dict entirely). See
+# SessionState.snapshot_active_engines() in user_session.py for the exact
+# shape, and _resume_user_engines() in bot.py for how it's replayed.
+def save_resume_snapshot(user_id: int, snapshot: dict):
+    with _lock:
+        user = _read_json(_user_path(user_id))
+        if not user:
+            return
+        user["auto_resume_snapshot"] = snapshot
+        _write_json(_user_path(user_id), user)
+
+def get_resume_snapshot(user_id: int) -> dict:
+    user = get_user(user_id)
+    if not user:
+        return {}
+    return user.get("auto_resume_snapshot", {}) or {}
+
+
+# ─────────────────────────────────────────
 # Upgrade requests
 # ─────────────────────────────────────────
 def request_upgrade(user_id: int, username: str, display_name: str, contact: str = ""):
