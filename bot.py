@@ -444,9 +444,9 @@ def _pick_ad_copy_price_windowed(combined: list):
     outlier or a boosted/stale listing.
 
     JUNK PRICES ARE SKIPPED — some ads park at an obviously-fake decoy
-    price (exactly 1, 0.9, or 0.8) just to sit in the listing; no matter
-    how many ads happen to share one of those exact values, it's never
-    treated as the real dominant price. Ranking instead moves on to the
+    price (exactly 1, 0.9, 0.8, or 1.2) just to sit in the listing; no
+    matter how many ads happen to share one of those exact values, it's
+    never treated as the real dominant price. Ranking instead moves on to the
     next most-common price down the list. E.g. if 1 appears 46 times,
     1.014 appears 30 times, and 1.017 appears 40 times, the bot skips the
     46-count junk price entirely and copies 1.017 (the next-highest
@@ -485,7 +485,7 @@ def _pick_ad_copy_price_windowed(combined: list):
 # Decoy/junk prices some USDT/USD ads park at just to sit in the listing —
 # never realistic values for this pair, so never eligible to be copied no
 # matter how many ads share one of them. See _pick_ad_copy_price_windowed.
-_AD_COPY_JUNK_PRICE_VALUES = {Decimal("1"), Decimal("0.9"), Decimal("0.8")}
+_AD_COPY_JUNK_PRICE_VALUES = {Decimal("1"), Decimal("0.9"), Decimal("0.8"), Decimal("1.2")}
 
 def _is_ad_copy_junk_price(price_str: str) -> bool:
     try:
