@@ -597,19 +597,167 @@ def review_seller_cancel(order_id: str, examine_result: str,
 
 # 💬 Chat
 # ─────────────────────────────────────────
+# Bybit RETIRED the old per-order chat endpoints
+# (/v5/p2p/order/message/send and /v5/p2p/order/message/listpage). Chat is
+# now session-based: you resolve a counterparty's AES-encrypted sessionId
+# once, then send/read against THAT, passing orderId only for validation.
+#
+# The two public helpers below (send_chat_message / get_chat_messages)
+# deliberately keep their ORIGINAL order_id-based signatures and their
+# original return shape, so none of bot.py's ~10 call sites had to change.
+# All the new session plumbing and the response-shape translation is
+# contained here.
+
+def get_chat_session_list(last_id: int = 0, size: int = 50,
+                          read_status: int = 2, session_type: str = "",
+                          creds: dict | None = None) -> dict:
+    """POST /v5/p2p/chat/session/list_v1
+    read_status: 0=unread, 1=read, 2=all. session_type: "SINGLE"/"GROUP"."""
+    payload = {"lastId": last_id, "size": size, "readStatus": read_status}
+    if session_type:
+        payload["type"] = session_type
+    return _post("/v5/p2p/chat/session/list_v1", payload, creds=creds)
+
+
+def get_session_id(user_mask_id: str, creds: dict | None = None) -> dict:
+    """POST /v5/p2p/chat/session/getSessionId
+    user_mask_id comes from an order detail's targetUserMaskId field."""
+    return _post("/v5/p2p/chat/session/getSessionId",
+                 {"userMaskId": user_mask_id}, creds=creds)
+
+
+# sessionId is stable per counterparty, and resolving it costs 1-2 extra
+# API calls, so cache it rather than re-resolving on every 8-second chat
+# poll. Keyed by (api_key, order_id) so one user's cache can never leak
+# into another's — the same multi-user safety rule as the rest of this file.
+_session_id_cache: dict = {}
+
+
+def _resolve_chat_context(order_id: str, creds: dict | None = None) -> tuple:
+    """Find (sessionId, counterparty_nickname) for an order.
+
+    The counterparty nickname matters because the new message-list
+    endpoint no longer returns userId/accountId — only sendUserNickName.
+    Resolving the counterparty's nick from the order detail (where it's
+    authoritative) lets callers forward ONLY their messages, instead of
+    trying to guess which messages are the user's own and risking echoing
+    the user's own messages back at them.
+
+    Returns ("", "") if it can't be resolved — callers should skip rather
+    than fire a request that's guaranteed to fail.
+    """
+    cache_key = ((creds or {}).get("key", "_env"), str(order_id))
+    cached = _session_id_cache.get(cache_key)
+    if cached:
+        return cached
+
+    detail = get_order_detail(order_id, creds=creds)
+    if detail.get("retCode", detail.get("ret_code", -1)) != 0:
+        logger.warning(f"[Chat] Could not load order {order_id} to resolve sessionId")
+        return "", ""
+    result      = detail.get("result", {}) or {}
+    mask_id     = str(result.get("targetUserMaskId", "") or "").strip()
+    target_nick = str(result.get("targetNickName", "") or "").strip()
+    if not mask_id:
+        logger.warning(f"[Chat] Order {order_id} has no targetUserMaskId — cannot resolve sessionId")
+        return "", target_nick
+
+    resp = get_session_id(mask_id, creds=creds)
+    if resp.get("retCode", resp.get("ret_code", -1)) != 0:
+        logger.warning(f"[Chat] getSessionId failed for order {order_id}: "
+                       f"{resp.get('retMsg', resp.get('ret_msg', ''))}")
+        return "", target_nick
+    session_id = str((resp.get("result", {}) or {}).get("sessionId", "") or "").strip()
+    if session_id:
+        _session_id_cache[cache_key] = (session_id, target_nick)
+    return session_id, target_nick
+
+
+def _resolve_session_id(order_id: str, creds: dict | None = None) -> str:
+    return _resolve_chat_context(order_id, creds=creds)[0]
+
+
 def send_chat_message(order_id: str, message: str,
                       creds: dict | None = None) -> dict:
-    return _post("/v5/p2p/order/message/send", {
-        "orderId": order_id, "message": message,
-        "contentType": "str", "msgUuid": uuid.uuid4().hex
+    """POST /v5/p2p/chat/message/send_v1 — same signature as before."""
+    session_id = _resolve_session_id(order_id, creds=creds)
+    if not session_id:
+        return {"retCode": -1, "retMsg": "Could not resolve chat sessionId for this order"}
+    return _post("/v5/p2p/chat/message/send_v1", {
+        "message":     message,
+        "contentType": "str",
+        "sessionId":   session_id,
+        "orderId":     str(order_id),
     }, creds=creds)
+
+
+# New contentType strings → the numeric msgType codes bot.py already
+# branches on, so its existing type handling keeps working untouched.
+_CONTENT_TYPE_TO_MSGTYPE = {"str": 1, "pic": 2, "pdf": 7, "video": 8}
 
 
 def get_chat_messages(order_id: str, page: str = "1", size: str = "30",
                       creds: dict | None = None) -> dict:
-    return _post("/v5/p2p/order/message/listpage",
-                 {"orderId": order_id, "currentPage": page, "size": size},
+    """POST /v5/p2p/chat/message/listpage_v1
+
+    Signature and return shape are unchanged from the retired endpoint, so
+    bot.py's parsing keeps working. The `page` argument is now ignored —
+    the new endpoint paginates by message-ID cursor rather than page
+    number, and every caller only ever asks for page 1 (the latest
+    messages) anyway.
+
+    Each message is translated back to the old field names:
+      sendUserNickName -> nickName
+      contentType      -> msgType (numeric)
+      message (JSON)   -> message (the plain `content` string inside it)
+    """
+    session_id, target_nick = _resolve_chat_context(order_id, creds=creds)
+    if not session_id:
+        return {"retCode": -1, "retMsg": "Could not resolve chat sessionId for this order",
+                "result": [], "counterpartyNick": target_nick}
+
+    try:
+        limit = min(int(size), 30)   # new endpoint caps page size at 30
+    except (TypeError, ValueError):
+        limit = 30
+
+    resp = _post("/v5/p2p/chat/message/listpage_v1",
+                 {"lastId": 0, "limit": limit, "sessionId": session_id},
                  creds=creds)
+    if resp.get("retCode", resp.get("ret_code", -1)) != 0:
+        return resp
+
+    raw = (resp.get("result", {}) or {}).get("messages", []) or []
+    normalized = []
+    for m in raw:
+        content_type = str(m.get("contentType", "str"))
+        # `message` is a JSON string: {"content", "msgCode", "msgType",
+        # "fileName", "size"}. Fall back to the raw value if it isn't
+        # valid JSON, so a format change can't blank out the whole chat.
+        content = ""
+        try:
+            content = str(json.loads(m.get("message", "") or "{}").get("content", "") or "")
+        except (ValueError, TypeError):
+            content = str(m.get("message", "") or "")
+        normalized.append({
+            "id":        str(m.get("id", "")),
+            "nickName":  str(m.get("sendUserNickName", "")),
+            "message":   content,
+            "msgType":   _CONTENT_TYPE_TO_MSGTYPE.get(content_type, 1),
+            "createDate": m.get("createDate", ""),
+            # The new endpoint no longer returns userId/accountId/roleType/
+            # onlyForCustomer. Emit them as empty so bot.py's own-message
+            # filters degrade gracefully to nickname matching instead of
+            # raising KeyError — see _poll_order_chat.
+            "userId":    "",
+            "accountId": "",
+            "roleType":  "",
+            "onlyForCustomer": 0,
+        })
+    # counterpartyNick is the reliable way to tell whose message is whose
+    # now that userId/accountId are gone — see _poll_order_chat in bot.py.
+    return {"retCode": 0, "retMsg": "", "result": normalized,
+            "counterpartyNick": target_nick}
 
 
 # ─────────────────────────────────────────
