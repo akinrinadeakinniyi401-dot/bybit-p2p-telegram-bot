@@ -100,6 +100,27 @@ class SessionState:
         # using bybit.MAX_ADS_PER_USER (currently 3, i.e. up to 2 extras).
         self.extra_ad_slots: list = []
 
+        # ── USDT/USD 3-way ranking rotation (Ad Copy) ──
+        # Two dedicated, HIDDEN ad slots — separate from extra_ad_slots on
+        # purpose, so they never appear in the normal Ad 2/Ad 3/Add-Ad-Slot
+        # UI or count toward MAX_ADS_PER_USER. Same dict shape as a normal
+        # extra ad slot (_default_extra_ad_slot()); created lazily the
+        # first time the user opens "USDT AD2"/"USDT AD3" (see
+        # _usdt_dedicated_slot in bot.py). Mode is permanently locked to
+        # "ad_copy" — these only exist to be the 2nd/3rd participant in
+        # the rank-rotation engine alongside whichever real ad slot the
+        # user set up as the first USDT/USD ad_copy ad ("USDT AD1").
+        self.usdt_ad2: dict | None = None
+        self.usdt_ad3: dict | None = None
+        # Shared coordinator for the 3-way rank rotation, once 2+ of
+        # {USDT AD1, USDT AD2, USDT AD3} are running — see
+        # _usdt_triad_loop in bot.py. Deliberately ONE task, not one per
+        # slot: the ranking logic has to see all 3 current prices at once
+        # to decide who moves and who stays, which independent per-slot
+        # loops can't coordinate safely.
+        self.usdt_triad_running = False
+        self.usdt_triad_task    = None
+
         # Shared NGN/USDT (or other local currency) reference price — ONE
         # value used by every active ad slot for this user, since BTC and
         # ETH ads on the same account quote off the same reference price.
@@ -246,11 +267,15 @@ class SessionState:
         return age > max_hours * 3600
 
     def stop_all_tasks(self):
-        """Cancel all background tasks safely — including any extra ad slots."""
+        """Cancel all background tasks safely — including any extra ad slots
+        and the USDT AD2/AD3 dedicated slots + their shared triad coordinator."""
+        _usdt_slots = [s for s in (self.usdt_ad2, self.usdt_ad3) if s is not None]
         for task in [
             self.refresh_task, self.order_monitor_task,
-            self.chat_monitor_task, self.paga_worker_task
-        ] + [slot["task"] for slot in self.extra_ad_slots]:
+            self.chat_monitor_task, self.paga_worker_task,
+            self.usdt_triad_task,
+        ] + [slot["task"] for slot in self.extra_ad_slots] \
+          + [slot["task"] for slot in _usdt_slots]:
             if task and not task.done():
                 task.cancel()
         self.refresh_running       = False
@@ -260,7 +285,12 @@ class SessionState:
         self.order_monitor_task    = None
         self.chat_monitor_task     = None
         self.paga_worker_task      = None
+        self.usdt_triad_running    = False
+        self.usdt_triad_task       = None
         for slot in self.extra_ad_slots:
+            slot["running"] = False
+            slot["task"]    = None
+        for slot in _usdt_slots:
             slot["running"] = False
             slot["task"]    = None
 
@@ -326,6 +356,14 @@ class SessionState:
         for i, slot in enumerate(self.extra_ad_slots):
             if slot.get("running") and slot["settings"].get("ad_id"):
                 ad_slots.append({"slot_idx": i, "ad_id": slot["settings"].get("ad_id")})
+        # USDT AD2/AD3 — dedicated hidden slots (see _usdt_dedicated_slot
+        # in bot.py). Same shape, just stored separately from
+        # extra_ad_slots. Recorded the same way (-2/-3) so
+        # _resume_user_engines can tell them apart from a normal slot.
+        if self.usdt_ad2 is not None and self.usdt_ad2.get("running") and self.usdt_ad2["settings"].get("ad_id"):
+            ad_slots.append({"slot_idx": -2, "ad_id": self.usdt_ad2["settings"].get("ad_id")})
+        if self.usdt_ad3 is not None and self.usdt_ad3.get("running") and self.usdt_ad3["settings"].get("ad_id"):
+            ad_slots.append({"slot_idx": -3, "ad_id": self.usdt_ad3["settings"].get("ad_id")})
 
         snapshot = {
             "ad_slots":         ad_slots,
