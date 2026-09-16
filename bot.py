@@ -3710,23 +3710,21 @@ async def _poll_order_chat(bot, chat_id: int, order_id: str):
         if not isinstance(messages, list):
             return
 
+        # The current chat endpoint no longer returns userId/accountId, so
+        # "is this my own message?" can't be answered by UID any more.
+        # Instead bybit.py resolves the ORDER's counterparty nickname from
+        # the order detail (authoritative) and passes it back here, and we
+        # forward only messages whose sender matches it. This is strictly
+        # safer than the old approach: previously anything that failed the
+        # own-message checks got forwarded, so a missed match meant echoing
+        # the user's own message back at them. Now the default is to
+        # forward NOTHING unless it's positively identified as theirs.
+        counterparty_nick = str(result.get("counterpartyNick", "") or "").strip()
+
         my_uid     = str(_s(chat_id).settings.get("bybit_uid", "")).strip()
         _chat_msgs = _s(chat_id).seen_chat_msgs   # per-user dict: {order_id: set(msg_ids)}
 
         if order_id not in _chat_msgs:
-            # First poll — learn my accountId and nick by matching bybit_uid
-            for m in messages:
-                uid  = str(m.get("userId",    ""))
-                acct = str(m.get("accountId", ""))
-                nck  = str(m.get("nickName",  ""))
-                # Match on userId OR accountId
-                if my_uid and (uid == my_uid or acct == my_uid):
-                    if acct and not _s(chat_id).my_account_id:
-                        _s(chat_id).my_account_id = acct
-                        logger.info(f"[ChatMonitor] Learned my accountId={acct} nick='{nck}'")
-                    if nck and not _s(chat_id).my_nick:
-                        _s(chat_id).my_nick = nck
-                    break
             # Seed seen IDs — do not forward existing messages on startup
             _chat_msgs[order_id] = {str(m.get("id", "")) for m in messages}
             return
@@ -3758,26 +3756,24 @@ async def _poll_order_chat(bot, chat_id: int, order_id: str):
             if not content:
                 continue
 
-            # ── Primary filter: bybit_uid matches userId OR accountId ──
-            # This is the most reliable check — uses the UID you explicitly set
-            if my_uid and (user_id == my_uid or account_id == my_uid):
-                # Also learn accountId for future faster matching
-                if account_id and not _s(chat_id).my_account_id:
-                    _s(chat_id).my_account_id = account_id
-                if nick and not _s(chat_id).my_nick:
-                    _s(chat_id).my_nick = nick
-                logger.debug(f"[ChatMonitor] ⏭ Own msg {msg_id} (uid match)")
-                continue
-
-            # ── Secondary filter: learned accountId ──
-            if _s(chat_id).my_account_id and account_id == _s(chat_id).my_account_id:
-                logger.debug(f"[ChatMonitor] ⏭ Own msg {msg_id} (accountId match)")
-                continue
-
-            # ── Tertiary filter: learned nick ──
-            if _s(chat_id).my_nick and nick == _s(chat_id).my_nick:
-                logger.debug(f"[ChatMonitor] ⏭ Own msg {msg_id} (nick match)")
-                continue
+            # ── Forward ONLY positively-identified counterparty messages ──
+            # Allow-list, not deny-list: if we can't confirm the sender is
+            # the order's counterparty, we stay silent rather than risk
+            # echoing the user's own message back to them.
+            if counterparty_nick:
+                if nick != counterparty_nick:
+                    logger.debug(
+                        f"[ChatMonitor] ⏭ msg {msg_id} from '{nick}' is not the "
+                        f"counterparty ('{counterparty_nick}') — skipping"
+                    )
+                    continue
+            else:
+                # Couldn't resolve the counterparty nick for this order —
+                # fall back to the learned-own-nick deny check so the
+                # feature still works, just less strictly.
+                if _s(chat_id).my_nick and nick == _s(chat_id).my_nick:
+                    logger.debug(f"[ChatMonitor] ⏭ Own msg {msg_id} (nick match)")
+                    continue
 
             # ── This is a counterparty message — forward it ──
             logger.debug(f"[ChatMonitor] ✅ Forwarding msg {msg_id} from '{nick}' (userId={user_id} acctId={account_id})")
