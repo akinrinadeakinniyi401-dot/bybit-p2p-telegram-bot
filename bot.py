@@ -67,7 +67,7 @@ async def _get_current_ip() -> str:
 # Globals below are ONLY kept for:
 #   - admin-level Paga queue (shared infra, not per-user state)
 #   - _current_user_id / _current_plan_badge (display-only, refreshed per request)
-from user_session import get_session, clear_session, get_all_sessions, SessionState
+from user_session import get_session, clear_session, get_all_sessions, SessionState, _default_extra_ad_slot
 
 # Dedicated thread pool for ad modification calls (modify_ad via run_in_executor).
 # Isolated from the default executor so order/chat monitor threads can never starve
@@ -141,27 +141,62 @@ def _get_user_slot_str(uid: int) -> str:
 # they share that account's API keys and UID, same as Ad 1 does.
 def _valid_slot(sess, slot_idx: int) -> int:
     """Clamp a possibly-stale slot index back to -1 (Ad 1) if it no longer
-    exists — e.g. the slot was removed from another tab/click in between."""
+    exists — e.g. the slot was removed from another tab/click in between.
+    -2/-3 (the dedicated hidden USDT AD2/AD3 slots) are never clamped —
+    they live in their own separate storage, not extra_ad_slots, and are
+    always considered valid once initialized (see _usdt_dedicated_slot)."""
+    if slot_idx in (-2, -3):
+        return slot_idx
     if slot_idx != -1 and slot_idx >= len(sess.extra_ad_slots):
         return -1
     return slot_idx
 
+def _usdt_dedicated_slot(sess, slot_idx: int):
+    """Returns the dedicated dict backing 'USDT AD2' (-2) or 'USDT AD3'
+    (-3), creating it (mode locked to ad_copy) on first access. Returns
+    None for any other slot_idx — callers use that to fall through to the
+    normal extra_ad_slots-based logic."""
+    if slot_idx == -2:
+        if sess.usdt_ad2 is None:
+            sess.usdt_ad2 = _default_extra_ad_slot()
+            sess.usdt_ad2["settings"]["mode"] = "ad_copy"
+        return sess.usdt_ad2
+    if slot_idx == -3:
+        if sess.usdt_ad3 is None:
+            sess.usdt_ad3 = _default_extra_ad_slot()
+            sess.usdt_ad3["settings"]["mode"] = "ad_copy"
+        return sess.usdt_ad3
+    return None
+
 def _ad_settings(sess, slot_idx: int) -> dict:
     slot_idx = _valid_slot(sess, slot_idx)
+    _usdt = _usdt_dedicated_slot(sess, slot_idx)
+    if _usdt is not None:
+        return _usdt["settings"]
     return sess.settings if slot_idx == -1 else sess.extra_ad_slots[slot_idx]["settings"]
 
 def _ad_data_of(sess, slot_idx: int) -> dict:
     slot_idx = _valid_slot(sess, slot_idx)
+    _usdt = _usdt_dedicated_slot(sess, slot_idx)
+    if _usdt is not None:
+        return _usdt["ad_data"]
     return sess.ad_data if slot_idx == -1 else sess.extra_ad_slots[slot_idx]["ad_data"]
 
 def _ad_running(sess, slot_idx: int) -> bool:
     slot_idx = _valid_slot(sess, slot_idx)
+    _usdt = _usdt_dedicated_slot(sess, slot_idx)
+    if _usdt is not None:
+        return _usdt["running"]
     if slot_idx == -1:
         return sess.refresh_running
     return sess.extra_ad_slots[slot_idx]["running"]
 
 def _set_ad_running(sess, slot_idx: int, val: bool):
     slot_idx = _valid_slot(sess, slot_idx)
+    _usdt = _usdt_dedicated_slot(sess, slot_idx)
+    if _usdt is not None:
+        _usdt["running"] = val
+        return
     if slot_idx == -1:
         sess.refresh_running = val
     else:
@@ -169,6 +204,10 @@ def _set_ad_running(sess, slot_idx: int, val: bool):
 
 def _set_ad_task(sess, slot_idx: int, task):
     slot_idx = _valid_slot(sess, slot_idx)
+    _usdt = _usdt_dedicated_slot(sess, slot_idx)
+    if _usdt is not None:
+        _usdt["task"] = task
+        return
     if slot_idx == -1:
         sess.refresh_task = task
     else:
@@ -235,6 +274,9 @@ async def _handle_ad_ip_error(bot, chat_id: int, sess, slot_idx: int, ret_code, 
 
 def _ad_current_price(sess, slot_idx: int) -> Decimal:
     slot_idx = _valid_slot(sess, slot_idx)
+    _usdt = _usdt_dedicated_slot(sess, slot_idx)
+    if _usdt is not None:
+        return _usdt["current_price"]
     return sess.current_price if slot_idx == -1 else sess.extra_ad_slots[slot_idx]["current_price"]
 
 def _ceiling_ref(sess, slot_idx: int):
@@ -376,7 +418,10 @@ async def _resync_price_from_bybit(ad_id: str, creds: dict, sess, slot_idx: int,
 
 def _set_ad_current_price(sess, slot_idx: int, price, collision_adjusted: bool = False):
     slot_idx = _valid_slot(sess, slot_idx)
-    if slot_idx == -1:
+    _usdt = _usdt_dedicated_slot(sess, slot_idx)
+    if _usdt is not None:
+        _usdt["current_price"] = price
+    elif slot_idx == -1:
         sess.current_price = price
     else:
         sess.extra_ad_slots[slot_idx]["current_price"] = price
@@ -444,7 +489,7 @@ def _pick_ad_copy_price_windowed(combined: list):
     outlier or a boosted/stale listing.
 
     JUNK PRICES ARE SKIPPED — some ads park at an obviously-fake decoy
-    price (exactly 1, 0.9, 0.8, or 1.2) just to sit in the listing; no
+    price (0.99 or below, or exactly 1.2) just to sit in the listing; no
     matter how many ads happen to share one of those exact values, it's
     never treated as the real dominant price. Ranking instead moves on to the
     next most-common price down the list. E.g. if 1 appears 46 times,
@@ -485,13 +530,17 @@ def _pick_ad_copy_price_windowed(combined: list):
 # Decoy/junk prices some USDT/USD ads park at just to sit in the listing —
 # never realistic values for this pair, so never eligible to be copied no
 # matter how many ads share one of them. See _pick_ad_copy_price_windowed.
-_AD_COPY_JUNK_PRICE_VALUES = {Decimal("1"), Decimal("0.9"), Decimal("0.8"), Decimal("1.2")}
+# Anything at or below 0.99 is junk (covers 1, 0.9, 0.8, and everything
+# else down that far), plus 1.2 specifically as an extra known decoy.
+_AD_COPY_JUNK_THRESHOLD = Decimal("0.99")
+_AD_COPY_JUNK_EXTRA_VALUES = {Decimal("1"), Decimal("1.2")}
 
 def _is_ad_copy_junk_price(price_str: str) -> bool:
     try:
-        return Decimal(price_str) in _AD_COPY_JUNK_PRICE_VALUES
+        val = Decimal(price_str)
     except Exception:
         return False
+    return val <= _AD_COPY_JUNK_THRESHOLD or val in _AD_COPY_JUNK_EXTRA_VALUES
 
 
 def _market_ads_query_side(ad_data: dict) -> str:
@@ -538,6 +587,234 @@ async def _fetch_market_ads_up_to(token: str, currency: str, side: str,
     return items[:total]
 
 
+def _rank_ad_copy_prices(combined: list, top_n: int) -> list:
+    """Like _pick_ad_copy_price_windowed but returns up to `top_n` DISTINCT
+    non-junk prices, ranked by occurrence count (highest first, ties
+    broken by earliest occurrence in `combined`). Used by the USDT triad
+    coordinator, which needs the whole top-N ranking at once (not just
+    #1) to decide which participant holds which rank.
+    """
+    if not combined:
+        return []
+    from collections import Counter
+    prices = [str(it.get("price", "")) for it in combined]
+    counts = Counter(prices)
+    first_seen = {}
+    for idx, p in enumerate(prices):
+        first_seen.setdefault(p, idx)
+    ranked = sorted(counts.keys(), key=lambda p: (-counts[p], first_seen[p]))
+    result = []
+    for p in ranked:
+        if _is_ad_copy_junk_price(p):
+            continue
+        result.append(p)
+        if len(result) >= top_n:
+            break
+    return result
+
+
+def _find_usdt_ad1_slot_idx(sess):
+    """Whichever REAL ad slot (never -2/-3 — those are USDT AD2/AD3
+    themselves) is confirmed USDT/USD AND in ad_copy mode — i.e.
+    'USDT AD1', wherever the user happened to configure it. None if not
+    set up yet."""
+    for i in range(-1, sess.total_ad_slots() - 1):
+        ad_data = _ad_data_of(sess, i)
+        s = _ad_settings(sess, i)
+        if (ad_data.get("tokenId","").upper() == "USDT"
+                and ad_data.get("currencyId","").upper() == "USD"
+                and s.get("mode") == "ad_copy"):
+            return i
+    return None
+
+
+def _usdt_triad_participants(sess) -> list:
+    """Slot indices of whichever of {USDT AD1, USDT AD2, USDT AD3} are
+    CURRENTLY marked running right now. AD1's slot_idx varies (wherever
+    the user configured it); AD2/AD3 are always -2/-3."""
+    participants = []
+    ad1_idx = _find_usdt_ad1_slot_idx(sess)
+    if ad1_idx is not None and _ad_running(sess, ad1_idx):
+        participants.append(ad1_idx)
+    if sess.usdt_ad2 is not None and _ad_running(sess, -2):
+        participants.append(-2)
+    if sess.usdt_ad3 is not None and _ad_running(sess, -3):
+        participants.append(-3)
+    return participants
+
+
+async def _usdt_triad_reconcile(bot, chat_id: int, sess):
+    """Call this right after starting OR stopping any of {USDT AD1, USDT
+    AD2, USDT AD3} — decides whether the shared rank-rotation coordinator
+    should be running, and starts/stops it (and any individual per-slot
+    task) accordingly:
+      • 0 or 1 active participants → coordinator OFF. Exactly 1 active
+        participant gets the plain individual auto_update_loop (original
+        single-ad Ad Copy behavior — always just copies the #1 dominant
+        price, nothing to rotate with).
+      • 2+ active participants → coordinator ON, and any individual task
+        one of them might still be holding is cancelled first (the
+        coordinator posts on their behalf directly — see
+        _usdt_triad_loop).
+    """
+    participants = _usdt_triad_participants(sess)
+
+    if len(participants) >= 2:
+        # Kill any individual tasks these participants might still be
+        # running solo — the coordinator takes over posting for all of them.
+        for idx in participants:
+            t = None
+            if idx == -2 and sess.usdt_ad2:
+                t = sess.usdt_ad2.get("task")
+            elif idx == -3 and sess.usdt_ad3:
+                t = sess.usdt_ad3.get("task")
+            elif idx == -1:
+                t = sess.refresh_task
+            elif idx >= 0 and idx < len(sess.extra_ad_slots):
+                t = sess.extra_ad_slots[idx].get("task")
+            if t and not t.done():
+                t.cancel()
+            _set_ad_task(sess, idx, None)
+        if not sess.usdt_triad_running:
+            sess.usdt_triad_running = True
+            sess.usdt_triad_task = asyncio.create_task(_usdt_triad_loop(bot, chat_id))
+            logger.info(f"[USDT Triad] coordinator started for user {chat_id} — participants: {[_ad_slot_label(i) for i in participants]}")
+    else:
+        if sess.usdt_triad_running:
+            sess.usdt_triad_running = False
+            if sess.usdt_triad_task and not sess.usdt_triad_task.done():
+                sess.usdt_triad_task.cancel()
+            sess.usdt_triad_task = None
+            logger.info(f"[USDT Triad] coordinator stopped for user {chat_id} — fewer than 2 active participants")
+        if len(participants) == 1:
+            solo_idx = participants[0]
+            task = asyncio.create_task(auto_update_loop(bot, chat_id, solo_idx))
+            _set_ad_task(sess, solo_idx, task)
+            logger.info(f"[USDT Triad] {_ad_slot_label(solo_idx)} handed back to solo Ad Copy loop")
+
+
+async def _usdt_triad_loop(bot, chat_id: int):
+    """Shared coordinator for the USDT/USD Ad Copy rank-rotation engine —
+    started/stopped by _usdt_triad_reconcile once 2+ of {USDT AD1, USDT
+    AD2, USDT AD3} are running together. Every cycle:
+
+      1. Fetches the market ONCE (ranks 1-300) and ranks distinct
+         non-junk prices by occurrence — P1 (most common) down to P_n,
+         one per active participant.
+      2. Checks each active participant's CURRENT live price against
+         {P1..P_n}. Anyone already sitting on one of those prices KEEPS
+         IT — zero edits, zero disruption to that ad's first-come-first-
+         served position on Bybit — and is simply relabeled with
+         whichever rank that price now holds.
+      3. Anyone whose current price fell OUT of {P1..P_n} gets moved to
+         whichever rank is left unclaimed by a "staying" participant —
+         only THAT ad gets an actual modify_ad call this cycle.
+
+    A market rotation that only shuffles WHICH ad holds which rank (with
+    everyone already parked on a genuine top-N price) costs ZERO API
+    calls — the same "skip unless something truly changed" principle the
+    single-ad version already had, now coordinated across all
+    participants at once instead of each deciding in isolation.
+    """
+    sess  = _s(chat_id)
+    label = "[USDT Triad]"
+    try:
+        while sess.usdt_triad_running:
+            participants = _usdt_triad_participants(sess)
+            if len(participants) < 2:
+                logger.info(f"{label} fewer than 2 active participants — stopping for user {chat_id}")
+                await _usdt_triad_reconcile(bot, chat_id, sess)
+                return
+
+            creds = get_user_creds(chat_id, slot=_get_user_slot(chat_id))
+            ref_ad_data = _ad_data_of(sess, participants[0])
+            token    = ref_ad_data.get("tokenId", "USDT")
+            currency = ref_ad_data.get("currencyId", "USD")
+            side     = _market_ads_query_side(ref_ad_data)
+            own_ids  = {_ad_settings(sess, i).get("ad_id", "") for i in participants}
+
+            win_items = await _fetch_market_ads_up_to(token, currency, side, 300, creds)
+            competing = [
+                it for it in win_items
+                if str(it.get("id","")) not in own_ids
+                and it.get("tokenId","").upper()    == token.upper()
+                and it.get("currencyId","").upper() == currency.upper()
+            ]
+            ranked_prices = _rank_ad_copy_prices(competing, len(participants))
+
+            if not ranked_prices:
+                logger.warning(f"{label} no usable (non-junk) price found in ranks 1-300 for user {chat_id} — skipping this pass")
+            else:
+                current_prices = {i: str(_ad_data_of(sess, i).get("price","")) for i in participants}
+                claimed_ranks  = {}
+                staying        = set()
+                for rank_i, price in enumerate(ranked_prices):
+                    for idx in participants:
+                        if idx in staying:
+                            continue
+                        if current_prices.get(idx) == price:
+                            claimed_ranks[rank_i] = idx
+                            staying.add(idx)
+                            break
+
+                movers       = [idx for idx in participants if idx not in staying]
+                vacant_ranks = [i for i in range(len(ranked_prices)) if i not in claimed_ranks]
+
+                if not movers:
+                    logger.info(
+                        f"{label} user {chat_id} — all {len(participants)} participant(s) already on "
+                        f"genuine top-{len(participants)} prices {ranked_prices} — nothing to do this cycle"
+                    )
+                else:
+                    for mover_idx, rank_i in zip(movers, vacant_ranks):
+                        price = ranked_prices[rank_i]
+                        try:
+                            new_p = Decimal(price)
+                        except Exception:
+                            logger.warning(f"{label} unreadable price {price!r} for {_ad_slot_label(mover_idx)} — skipping")
+                            continue
+                        s       = _ad_settings(sess, mover_idx)
+                        ad_data = _ad_data_of(sess, mover_idx)
+                        result = await asyncio.get_event_loop().run_in_executor(
+                            _ad_executor, modify_ad, s["ad_id"], str(new_p), ad_data, creds
+                        )
+                        ret_code = result.get("retCode", result.get("ret_code", -1))
+                        if ret_code == 0:
+                            ad_data["price"] = str(new_p)
+                            _set_ad_current_price(sess, mover_idx, new_p)
+                            _reset_ad_failures(sess, mover_idx)
+                            logger.info(f"{label} {_ad_slot_label(mover_idx)} moved to rank {rank_i+1}: {new_p}")
+                            try:
+                                await bot.send_message(
+                                    chat_id=chat_id,
+                                    text=f"🔄 <b>{_ad_slot_label(mover_idx)}</b> moved to rank {rank_i+1}: <code>{new_p}</code>",
+                                    parse_mode="HTML"
+                                )
+                            except Exception:
+                                pass
+                        else:
+                            n = _increment_ad_failures(sess, mover_idx)
+                            logger.warning(
+                                f"{label} {_ad_slot_label(mover_idx)} move to rank {rank_i+1} failed "
+                                f"({result.get('retMsg', result.get('ret_msg',''))}) — failures={n}"
+                            )
+
+            intervals = [int(_ad_settings(sess, i).get("interval", 2) or 2) for i in participants]
+            wait_secs = max(5, min(intervals) * 60)
+            for _ in range(wait_secs):
+                if not sess.usdt_triad_running or len(_usdt_triad_participants(sess)) < 2:
+                    break
+                await asyncio.sleep(1)
+    except asyncio.CancelledError:
+        logger.info(f"{label} coordinator cancelled for user {chat_id}")
+        raise
+    except Exception as e:
+        logger.error(f"{label} coordinator crashed for user {chat_id}: {e}")
+    finally:
+        sess.usdt_triad_running = False
+        sess.usdt_triad_task    = None
+
+
 def _ad_copy_range_n(s: dict) -> int:
     """How many page-1 positions deep to look — ONLY to skip past your
     own ad id(s), never to change which price gets picked (that's always
@@ -565,10 +842,18 @@ def _ad_copy_range_label(v: str) -> str:
 
 
 def _ad_slot_label(slot_idx: int) -> str:
+    if slot_idx == -2:
+        return "USDT AD2"
+    if slot_idx == -3:
+        return "USDT AD3"
     return "Ad 1" if slot_idx == -1 else f"Ad {slot_idx + 2}"
 
 def _increment_ad_failures(sess, slot_idx: int) -> int:
     slot_idx = _valid_slot(sess, slot_idx)
+    _usdt = _usdt_dedicated_slot(sess, slot_idx)
+    if _usdt is not None:
+        _usdt["consecutive_failures"] += 1
+        return _usdt["consecutive_failures"]
     if slot_idx == -1:
         sess.consecutive_failures += 1
         return sess.consecutive_failures
@@ -578,7 +863,10 @@ def _increment_ad_failures(sess, slot_idx: int) -> int:
 
 def _reset_ad_failures(sess, slot_idx: int):
     slot_idx = _valid_slot(sess, slot_idx)
-    if slot_idx == -1:
+    _usdt = _usdt_dedicated_slot(sess, slot_idx)
+    if _usdt is not None:
+        _usdt["consecutive_failures"] = 0
+    elif slot_idx == -1:
         sess.consecutive_failures = 0
     else:
         sess.extra_ad_slots[slot_idx]["consecutive_failures"] = 0
@@ -991,10 +1279,15 @@ def _settings(uid: int) -> dict:
 def _save_settings(uid: int):
     """Persist the user's current session settings to disk — Ad 1's fields
     AND any extra ad slots (Ad 2/Ad 3), so a redeploy doesn't silently
-    delete multi-ad configuration that was never being saved before."""
+    delete multi-ad configuration that was never being saved before.
+    Also persists the dedicated USDT AD2/USDT AD3 slots when present."""
     sess = get_session(uid)
     db.save_settings(uid, sess.settings)
     db.save_extra_slots(uid, [slot["settings"] for slot in sess.extra_ad_slots])
+    if sess.usdt_ad2 is not None:
+        db.save_usdt_ad_slot(uid, "2", sess.usdt_ad2["settings"])
+    if sess.usdt_ad3 is not None:
+        db.save_usdt_ad_slot(uid, "3", sess.usdt_ad3["settings"])
 
 def _load_settings_from_disk(uid: int):
     """Load persisted settings from disk into the user's session on first access.
@@ -1062,6 +1355,25 @@ def _load_settings_from_disk(uid: int):
             if not sess.extra_ad_slots[i]["settings"].get("ad_id"):
                 sess.extra_ad_slots[i]["settings"].update(extra_settings)
         logger.debug(f"[Settings] Restored {len(saved_extra)} extra ad slot(s) for user={uid}")
+
+    # ── Restore USDT AD2 / USDT AD3 (dedicated hidden slots) ──
+    # Same idempotent pattern as extra_ad_slots above — only ever CREATES
+    # the dedicated slot here if it doesn't already exist in this session,
+    # and only fills in the ad_id if one isn't already set (never clobbers
+    # something the user is actively editing right now).
+    sess = get_session(uid)
+    for which, attr in (("2", "usdt_ad2"), ("3", "usdt_ad3")):
+        saved_usdt = db.load_usdt_ad_slot(uid, which)
+        if not saved_usdt:
+            continue
+        if getattr(sess, attr) is None:
+            setattr(sess, attr, _default_extra_ad_slot())
+            getattr(sess, attr)["settings"]["mode"] = "ad_copy"
+        slot = getattr(sess, attr)
+        if not slot["settings"].get("ad_id"):
+            slot["settings"].update(saved_usdt)
+            slot["settings"]["mode"] = "ad_copy"   # always locked, regardless of what was saved
+        logger.debug(f"[Settings] Restored USDT AD{which} for user={uid}")
 
 SELLER_WARN_MSG = (
     "Dear seller, your average release time is too long, I can't proceed with the payment. "
@@ -1305,6 +1617,19 @@ def back_prev(prev: str):
 # ─────────────────────────────────────────
 # 📊 AD PRICE BOT SECTION
 # ─────────────────────────────────────────
+def _has_usdt_usd_ad_configured(sess) -> bool:
+    """True once ANY real ad slot (Ad 1/2/3...) has confirmed USDT/USD ad
+    data fetched — the trigger condition for the hidden 'USDT AD2' button
+    to appear. Deliberately checks ad_data only (not mode) — the user
+    just needs to have fetched a USDT/USD ad on any slot, mode can be
+    switched to Ad Copy separately."""
+    for i in range(-1, sess.total_ad_slots() - 1):
+        ad_data = _ad_data_of(sess, i)
+        if ad_data.get("tokenId","").upper() == "USDT" and ad_data.get("currencyId","").upper() == "USD":
+            return True
+    return False
+
+
 def ads_section_keyboard(uid: int = 0):
     sess       = _s(uid) if uid else None
     slot_idx   = sess.editing_slot if sess else -1
@@ -1341,10 +1666,28 @@ def ads_section_keyboard(uid: int = 0):
         # Ads 2/3 share Ad 1's Bybit account + UID — only the Ad ID differs.
         rows.append([InlineKeyboardButton("🆔 Set Ad ID", callback_data="set_ad_id")])
 
-    rows.append([
-        InlineKeyboardButton("📋 Fetch Ad Details", callback_data="fetch_ad"),
-        InlineKeyboardButton("📃 My Ads List",      callback_data="fetch_my_ads"),
-    ])
+    rows.append([InlineKeyboardButton("📋 Fetch Ad Details", callback_data="fetch_ad")])
+
+    # Hidden USDT AD2/AD3 — dedicated 2nd/3rd participants in the USDT/USD
+    # ad_copy rank-rotation engine. AD2 appears once ANY real ad slot has
+    # a confirmed USDT/USD ad fetched; AD3 only after AD2 itself has an
+    # ad_id saved. Shown on every slot's view (not just while looking at
+    # the USDT/USD one), since they're independent of whichever slot is
+    # currently being edited.
+    if sess and _has_usdt_usd_ad_configured(sess):
+        _ad2_id = sess.usdt_ad2["settings"].get("ad_id") if sess.usdt_ad2 else ""
+        rows.append([InlineKeyboardButton(
+            ("🪞 USDT AD2 ✅" if _ad2_id else "🪞 USDT AD2"),
+            callback_data="usdt_ad2_menu"
+        )])
+        if _ad2_id:
+            _ad3_id = sess.usdt_ad3["settings"].get("ad_id") if sess.usdt_ad3 else ""
+            rows.append([InlineKeyboardButton(
+                ("🪞 USDT AD3 ✅" if _ad3_id else "🪞 USDT AD3"),
+                callback_data="usdt_ad3_menu"
+            )])
+
+    rows.append([InlineKeyboardButton("📃 My Ads List", callback_data="fetch_my_ads")])
     rows.append([
         InlineKeyboardButton(mode_label,        callback_data="mode_menu"),
         InlineKeyboardButton("⏱ Set Interval", callback_data="set_interval"),
@@ -6897,6 +7240,17 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             InlineKeyboardMarkup(back_section("section_orders"))
         )
 
+    # ── 🪞 USDT AD2 / USDT AD3 (hidden dedicated slots) ──
+    elif data in ("usdt_ad2_menu", "usdt_ad3_menu"):
+        sess = _s(tuser.id)
+        which_idx = -2 if data == "usdt_ad2_menu" else -3
+        if which_idx == -3 and not (sess.usdt_ad2 and sess.usdt_ad2["settings"].get("ad_id")):
+            await query.answer("Set up USDT AD2 first.", show_alert=True)
+            return
+        _usdt_dedicated_slot(sess, which_idx)   # creates it (mode locked to ad_copy) on first open
+        sess.editing_slot = which_idx
+        await edit_menu(query, ads_section_text(tuser.id), ads_section_keyboard(tuser.id))
+
     # ── 🆔 Set Ad ID ──
     elif data == "set_ad_id":
         _btn_state["action"]       = "ad_id"
@@ -7082,6 +7436,14 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         s = _ad_settings(sess, slot_idx)
         ad_data = _ad_data_of(sess, slot_idx)
         cur_mode = s.get("mode", "fixed")
+        if slot_idx in (-2, -3):
+            await edit_menu(query,
+                f"🔒 <b>{_ad_slot_label(slot_idx)} mode is locked to 🪞 AD COPY</b>\n\n"
+                f"This slot exists specifically to be the 2nd/3rd participant in the "
+                f"USDT/USD ad_copy rank-rotation engine, so its mode can't be changed.",
+                InlineKeyboardMarkup(back_section("section_ads"))
+            )
+            return
         is_usdt_usd = ad_data.get("currencyId","").upper() == "USD" and ad_data.get("tokenId","").upper() == "USDT"
         rows = [
             [InlineKeyboardButton(("✅ " if cur_mode == "fixed" else "") + "💲 Fixed",    callback_data="set_mode_fixed")],
@@ -7102,6 +7464,9 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
     elif data in ("set_mode_fixed", "set_mode_floating", "set_mode_ad_copy"):
         sess = _s(tuser.id)
         slot_idx = sess.editing_slot
+        if slot_idx in (-2, -3):
+            await query.answer("This slot's mode is locked to AD COPY.", show_alert=True)
+            return
         s = _ad_settings(sess, slot_idx)
         ad_data = _ad_data_of(sess, slot_idx)
         new_mode = data[len("set_mode_"):]
@@ -8140,9 +8505,22 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         s        = _ad_settings(sess, slot_idx)
         label    = _ad_slot_label(slot_idx)
         if _ad_running(sess, slot_idx):
+            ad_data_now = _ad_data_of(sess, slot_idx)
+            _is_usdt_triad_slot = (
+                slot_idx in (-2, -3) or
+                (s.get("mode") == "ad_copy"
+                 and ad_data_now.get("tokenId","").upper() == "USDT"
+                 and ad_data_now.get("currencyId","").upper() == "USD")
+            )
             _set_ad_running(sess, slot_idx, False)
             _set_ad_task(sess, slot_idx, None)
             _set_ad_current_price(sess, slot_idx, Decimal("0"))
+            if _is_usdt_triad_slot:
+                # Recompute the participant set now that this one dropped
+                # out — stops the shared coordinator if fewer than 2 are
+                # left running, or hands the sole survivor (if any) back
+                # to the plain solo Ad Copy loop.
+                await _usdt_triad_reconcile(context.bot, chat_id, sess)
             _maybe_snapshot_resume_state(tuser.id)
             await edit_menu(query,
                 f"🔴 <b>{label} price update stopped.</b>\n\n" + ads_section_text(tuser.id),
@@ -8208,8 +8586,22 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 return
             _reset_ad_failures(sess, slot_idx)
             _set_ad_running(sess, slot_idx, True)   # set BEFORE create_task, no await in between — closes the race
-            task = asyncio.create_task(auto_update_loop(context.bot, chat_id, slot_idx))
-            _set_ad_task(sess, slot_idx, task)
+            _is_usdt_triad_slot = (
+                slot_idx in (-2, -3) or
+                (mode == "ad_copy"
+                 and ad_data.get("tokenId","").upper() == "USDT"
+                 and ad_data.get("currencyId","").upper() == "USD")
+            )
+            if _is_usdt_triad_slot:
+                # _usdt_triad_reconcile creates whichever task is actually
+                # appropriate itself: the plain solo Ad Copy loop if this
+                # is the only active participant right now, or the shared
+                # rank-rotation coordinator if 2+ of {USDT AD1, AD2, AD3}
+                # are now active together. Nothing more to do here either way.
+                await _usdt_triad_reconcile(context.bot, chat_id, sess)
+            else:
+                task = asyncio.create_task(auto_update_loop(context.bot, chat_id, slot_idx))
+                _set_ad_task(sess, slot_idx, task)
             _maybe_snapshot_resume_state(tuser.id)
             await edit_menu(query,
                 f"🟢 <b>{label} price update started!</b>\n🔀 <code>{mode.replace('_',' ').upper()}</code> | ⏱ every <code>{interval}</code> min\n\n"
@@ -9265,7 +9657,10 @@ def _reset_user_session(sess) -> bool:
         sess.flw_pay_enabled       or sess.paga_pay_enabled or
         sess.buyer_protection_on   or sess.name_match_enabled or
         sess.sell_msg_enabled      or
-        any(slot["running"] for slot in sess.extra_ad_slots)   # Ad 2 / Ad 3
+        any(slot["running"] for slot in sess.extra_ad_slots) or  # Ad 2 / Ad 3
+        sess.usdt_triad_running or
+        (sess.usdt_ad2 is not None and sess.usdt_ad2["running"]) or
+        (sess.usdt_ad3 is not None and sess.usdt_ad3["running"])
     )
     if not was_active:
         return False
@@ -9293,6 +9688,22 @@ def _reset_user_session(sess) -> bool:
     # could be started again. The hourly reset's job is to stop anything
     # running in the background, not to erase what the user configured.
     for _slot in sess.extra_ad_slots:
+        _task = _slot.get("task")
+        if _task and not _task.done():
+            _task.cancel()
+        _slot["running"] = False
+        _slot["task"]    = None
+        _slot["consecutive_failures"] = 0
+
+    # Same treatment for USDT AD2/AD3 (their ad_id/settings are kept, only
+    # the running task is stopped) and their shared triad coordinator.
+    if sess.usdt_triad_task and not sess.usdt_triad_task.done():
+        sess.usdt_triad_task.cancel()
+    sess.usdt_triad_task    = None
+    sess.usdt_triad_running = False
+    for _slot in (sess.usdt_ad2, sess.usdt_ad3):
+        if _slot is None:
+            continue
         _task = _slot.get("task")
         if _task and not _task.done():
             _task.cancel()
@@ -9427,6 +9838,13 @@ async def _resume_user_engines(bot, uid: int, snapshot: dict) -> list:
         resumed.append(f"{_ad_slot_label(slot_idx)} auto-update")
         any_ad_resumed = True
         logger.info(f"[AutoResume] user {uid} — {_ad_slot_label(slot_idx)} resumed (ad {ad_id})")
+
+    # If 2+ of {USDT AD1, USDT AD2, USDT AD3} just got individually
+    # resumed above, hand them over to the shared rank-rotation
+    # coordinator instead of leaving them as independent tasks that would
+    # otherwise post prices in an uncoordinated race with each other.
+    if len(_usdt_triad_participants(sess)) >= 2:
+        await _usdt_triad_reconcile(bot, uid, sess)
 
     # Order/chat monitor and ad auto-update are mutually exclusive on this
     # bot (same guard the manual toggles enforce) — a snapshot should
