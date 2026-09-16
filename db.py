@@ -248,6 +248,32 @@ def load_extra_slots(user_id: int) -> list:
 
 
 # ─────────────────────────────────────────
+# USDT AD2 / USDT AD3 — dedicated hidden slots (see _usdt_dedicated_slot in
+# bot.py). Same rationale as save/load_extra_slots above: without this,
+# a redeploy would silently wipe these two slots' ad_id/settings, exactly
+# the bug that save_extra_slots was added to fix for the normal Ad 2/Ad 3
+# slots. Stored separately from p2p_extra_slots since these are NOT part
+# of the normal Ad 2/Ad 3/Add-Ad-Slot list — they're the 2nd/3rd
+# participants in the USDT/USD ad_copy rank-rotation engine specifically.
+# ─────────────────────────────────────────
+def save_usdt_ad_slot(user_id: int, which: str, settings: dict):
+    """which = '2' or '3'."""
+    with _lock:
+        user = _read_json(_user_path(user_id))
+        if not user:
+            return
+        user[f"usdt_ad{which}_settings"] = settings
+        _write_json(_user_path(user_id), user)
+
+def load_usdt_ad_slot(user_id: int, which: str) -> dict:
+    """which = '2' or '3'. Returns {} if none saved."""
+    user = get_user(user_id)
+    if not user:
+        return {}
+    return user.get(f"usdt_ad{which}_settings", {}) or {}
+
+
+# ─────────────────────────────────────────
 # API key management
 # ─────────────────────────────────────────
 def save_api(user_id: int, key: str, value: str):
