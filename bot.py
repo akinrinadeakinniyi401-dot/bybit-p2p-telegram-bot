@@ -684,18 +684,13 @@ async def _usdt_triad_reconcile(bot, chat_id: int, sess):
             sess.usdt_triad_running = True
             sess.usdt_triad_task = asyncio.create_task(_usdt_triad_loop(bot, chat_id))
             logger.info(f"[USDT Triad] coordinator started for user {chat_id} — participants: {[_ad_slot_label(i) for i in participants]}")
-        # Immediate confirmation on every start/stop that changes the
-        # participant set — even if this is the very first cycle and
-        # ranks aren't known yet, the coordinator's own first pass (which
-        # starts running right away) will follow up with a full refresh
-        # within moments.
+        # Short note only — the coordinator's own first cycle (which
+        # starts immediately, no initial delay) will follow within
+        # seconds with each participant's own detailed status message,
+        # so a full bundled status here would just be a near-duplicate.
         try:
             note = "▶️ USDT/USD rank rotation engaged." if not _was_running else "🔁 USDT/USD rank rotation participant set changed."
-            await bot.send_message(
-                chat_id=chat_id,
-                text=f"{note}\n\n{_usdt_triad_status_text(sess, participants)}",
-                parse_mode="HTML"
-            )
+            await bot.send_message(chat_id=chat_id, text=note)
         except Exception:
             pass
     else:
@@ -816,11 +811,13 @@ async def _usdt_triad_loop(bot, chat_id: int):
 
                 movers       = [idx for idx in participants if idx not in staying]
                 vacant_ranks = [i for i in range(len(ranked_prices)) if i not in claimed_ranks]
+                moved_ok     = set()   # movers that actually succeeded this cycle
 
                 if not movers:
                     logger.info(
                         f"{label} user {chat_id} — all {len(participants)} participant(s) already on "
-                        f"genuine top-{len(participants)} prices {ranked_prices} — nothing to do this cycle"
+                        f"genuine top-{len(participants)} prices {ranked_prices} — SKIPPING modify for all of them, "
+                        f"nothing changed"
                     )
                 else:
                     for mover_idx, rank_i in zip(movers, vacant_ranks):
@@ -841,7 +838,8 @@ async def _usdt_triad_loop(bot, chat_id: int):
                             _set_ad_current_price(sess, mover_idx, new_p)
                             _reset_ad_failures(sess, mover_idx)
                             claimed_ranks[rank_i] = mover_idx   # record where it actually landed
-                            logger.info(f"{label} {_ad_slot_label(mover_idx)} moved to rank {rank_i+1}: {new_p}")
+                            moved_ok.add(mover_idx)
+                            logger.info(f"{label} {_ad_slot_label(mover_idx)} PRICE CHANGED — moved to rank {rank_i+1}: {new_p}")
                         else:
                             n = _increment_ad_failures(sess, mover_idx)
                             logger.warning(
@@ -854,19 +852,41 @@ async def _usdt_triad_loop(bot, chat_id: int):
                 # next time the user starts/stops any of these 3 ads).
                 sess.usdt_triad_last_ranks = {idx: rank_i + 1 for rank_i, idx in claimed_ranks.items()}
 
-                # ONE consolidated status message every cycle — whether or
-                # not anything moved — so the user can see the interval
-                # loop is genuinely alive and exactly where each ad
-                # currently stands, instead of only hearing from the bot
-                # when something changes.
-                try:
-                    await bot.send_message(
-                        chat_id=chat_id,
-                        text=_usdt_triad_status_text(sess, participants),
-                        parse_mode="HTML"
-                    )
-                except Exception:
-                    pass
+                # ── Per-participant notification, on EACH ONE'S OWN
+                # interval — NOT a single bundled message on the shared
+                # (fastest) checking cadence. The market is checked at
+                # the fastest configured interval among all participants
+                # (needed for the ranking comparison to be accurate and
+                # for a mover to be caught promptly), but a slower ad
+                # (e.g. Ad 1 set to 5 min) only gets ITS OWN notification
+                # every 5 minutes — not every time a faster sibling's
+                # 2-minute check happens to run.
+                now = datetime.now()
+                for idx in participants:
+                    own_interval_secs = int(_ad_settings(sess, idx).get("interval", 2) or 2) * 60
+                    last = sess.usdt_triad_last_notify.get(idx)
+                    if last is not None and (now - last).total_seconds() < own_interval_secs:
+                        continue
+                    sess.usdt_triad_last_notify[idx] = now
+                    price = _ad_data_of(sess, idx).get("price", "?")
+                    rank  = sess.usdt_triad_last_ranks.get(idx)
+                    rank_str = f"Rank {rank}" if rank else "Rank —"
+                    if idx in moved_ok:
+                        verdict = "🔄 <b>Price changed</b> — moved to a new rank this cycle."
+                    else:
+                        verdict = "✅ <b>No change</b> — same price still holds this rank, modify skipped."
+                    try:
+                        await bot.send_message(
+                            chat_id=chat_id,
+                            text=(
+                                f"📊 <b>{_ad_slot_label(idx)} — USDT/USD Rank Check</b>\n"
+                                f"{rank_str} — <code>{_esc(str(price))}</code>\n"
+                                f"{verdict}"
+                            ),
+                            parse_mode="HTML"
+                        )
+                    except Exception:
+                        pass
 
             intervals = [int(_ad_settings(sess, i).get("interval", 2) or 2) for i in participants]
             wait_secs = max(5, min(intervals) * 60)
