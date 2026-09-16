@@ -125,6 +125,13 @@ class SessionState:
         # confirming to the user "Ad 2 still in rank 2" on start/stop),
         # not for any decision logic itself.
         self.usdt_triad_last_ranks: dict = {}
+        # Per-participant "last notified at" (datetime) — lets each of
+        # {USDT AD1, AD2, AD3} get its own cycle-notification cadence
+        # based on ITS OWN configured interval, even though the shared
+        # coordinator checks the market at the fastest configured interval
+        # among them (checking is decoupled from notifying — see
+        # _usdt_triad_loop in bot.py).
+        self.usdt_triad_last_notify: dict = {}
 
         # Shared NGN/USDT (or other local currency) reference price — ONE
         # value used by every active ad slot for this user, since BTC and
