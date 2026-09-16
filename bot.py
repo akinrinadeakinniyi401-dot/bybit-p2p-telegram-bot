@@ -489,7 +489,7 @@ def _pick_ad_copy_price_windowed(combined: list):
     outlier or a boosted/stale listing.
 
     JUNK PRICES ARE SKIPPED — some ads park at an obviously-fake decoy
-    price (0.99 or below, or exactly 1.2) just to sit in the listing; no
+    price (1 or below, or exactly 1.2) just to sit in the listing; no
     matter how many ads happen to share one of those exact values, it's
     never treated as the real dominant price. Ranking instead moves on to the
     next most-common price down the list. E.g. if 1 appears 46 times,
@@ -532,8 +532,12 @@ def _pick_ad_copy_price_windowed(combined: list):
 # matter how many ads share one of them. See _pick_ad_copy_price_windowed.
 # Anything at or below 0.99 is junk (covers 1, 0.9, 0.8, and everything
 # else down that far), plus 1.2 specifically as an extra known decoy.
-_AD_COPY_JUNK_THRESHOLD = Decimal("0.99")
-_AD_COPY_JUNK_EXTRA_VALUES = {Decimal("1"), Decimal("1.2")}
+# Applies to USDT AD1, USDT AD2, and USDT AD3 alike (same function used by
+# both the single-ad picker and the 3-way rank-rotation engine). Anything
+# at or below 1 is junk — no legitimate USDT/USD price sits at or under
+# parity — plus 1.2 specifically as an extra known decoy above parity.
+_AD_COPY_JUNK_THRESHOLD = Decimal("1")
+_AD_COPY_JUNK_EXTRA_VALUES = {Decimal("1.2")}
 
 def _is_ad_copy_junk_price(price_str: str) -> bool:
     try:
@@ -675,10 +679,25 @@ async def _usdt_triad_reconcile(bot, chat_id: int, sess):
             if t and not t.done():
                 t.cancel()
             _set_ad_task(sess, idx, None)
-        if not sess.usdt_triad_running:
+        _was_running = sess.usdt_triad_running
+        if not _was_running:
             sess.usdt_triad_running = True
             sess.usdt_triad_task = asyncio.create_task(_usdt_triad_loop(bot, chat_id))
             logger.info(f"[USDT Triad] coordinator started for user {chat_id} — participants: {[_ad_slot_label(i) for i in participants]}")
+        # Immediate confirmation on every start/stop that changes the
+        # participant set — even if this is the very first cycle and
+        # ranks aren't known yet, the coordinator's own first pass (which
+        # starts running right away) will follow up with a full refresh
+        # within moments.
+        try:
+            note = "▶️ USDT/USD rank rotation engaged." if not _was_running else "🔁 USDT/USD rank rotation participant set changed."
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"{note}\n\n{_usdt_triad_status_text(sess, participants)}",
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
     else:
         if sess.usdt_triad_running:
             sess.usdt_triad_running = False
@@ -691,6 +710,38 @@ async def _usdt_triad_reconcile(bot, chat_id: int, sess):
             task = asyncio.create_task(auto_update_loop(bot, chat_id, solo_idx))
             _set_ad_task(sess, solo_idx, task)
             logger.info(f"[USDT Triad] {_ad_slot_label(solo_idx)} handed back to solo Ad Copy loop")
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"⏸ USDT/USD rank rotation paused — only one participant left active.\n\n"
+                        f"<b>{_ad_slot_label(solo_idx)}</b> switched back to solo Ad Copy mode "
+                        f"(always tracks rank #1 of ranks 1-300)."
+                    ),
+                    parse_mode="HTML"
+                )
+            except Exception:
+                pass
+        else:
+            try:
+                await bot.send_message(chat_id=chat_id, text="⏹ USDT/USD rank rotation stopped — no participants active.")
+            except Exception:
+                pass
+
+
+def _usdt_triad_status_text(sess, participants) -> str:
+    """Human-readable rank/price summary for whichever of {USDT AD1, AD2,
+    AD3} are currently active — sent every coordinator cycle, and on
+    start/stop, so the user always has visibility into what the rotation
+    engine currently thinks without needing to check logs."""
+    lines = ["📊 <b>USDT/USD Rank Status</b>"]
+    ranks = sess.usdt_triad_last_ranks or {}
+    for idx in participants:
+        price    = _ad_data_of(sess, idx).get("price", "?")
+        rank     = ranks.get(idx)
+        rank_str = f"Rank {rank}" if rank else "Rank —"
+        lines.append(f"• <b>{_ad_slot_label(idx)}</b> — {rank_str} — <code>{_esc(str(price))}</code>")
+    return "\n".join(lines)
 
 
 async def _usdt_triad_loop(bot, chat_id: int):
@@ -744,6 +795,12 @@ async def _usdt_triad_loop(bot, chat_id: int):
 
             if not ranked_prices:
                 logger.warning(f"{label} no usable (non-junk) price found in ranks 1-300 for user {chat_id} — skipping this pass")
+                try:
+                    await bot.send_message(chat_id=chat_id,
+                        text="⚠️ <b>USDT/USD Rank Check</b> — no usable (non-junk) price found in ranks 1-300 this cycle. No changes made.",
+                        parse_mode="HTML")
+                except Exception:
+                    pass
             else:
                 current_prices = {i: str(_ad_data_of(sess, i).get("price","")) for i in participants}
                 claimed_ranks  = {}
@@ -783,21 +840,33 @@ async def _usdt_triad_loop(bot, chat_id: int):
                             ad_data["price"] = str(new_p)
                             _set_ad_current_price(sess, mover_idx, new_p)
                             _reset_ad_failures(sess, mover_idx)
+                            claimed_ranks[rank_i] = mover_idx   # record where it actually landed
                             logger.info(f"{label} {_ad_slot_label(mover_idx)} moved to rank {rank_i+1}: {new_p}")
-                            try:
-                                await bot.send_message(
-                                    chat_id=chat_id,
-                                    text=f"🔄 <b>{_ad_slot_label(mover_idx)}</b> moved to rank {rank_i+1}: <code>{new_p}</code>",
-                                    parse_mode="HTML"
-                                )
-                            except Exception:
-                                pass
                         else:
                             n = _increment_ad_failures(sess, mover_idx)
                             logger.warning(
                                 f"{label} {_ad_slot_label(mover_idx)} move to rank {rank_i+1} failed "
                                 f"({result.get('retMsg', result.get('ret_msg',''))}) — failures={n}"
                             )
+
+                # Record the final rank assignment (used purely for status
+                # messages — e.g. confirming "Ad 2 still in rank 2" the
+                # next time the user starts/stops any of these 3 ads).
+                sess.usdt_triad_last_ranks = {idx: rank_i + 1 for rank_i, idx in claimed_ranks.items()}
+
+                # ONE consolidated status message every cycle — whether or
+                # not anything moved — so the user can see the interval
+                # loop is genuinely alive and exactly where each ad
+                # currently stands, instead of only hearing from the bot
+                # when something changes.
+                try:
+                    await bot.send_message(
+                        chat_id=chat_id,
+                        text=_usdt_triad_status_text(sess, participants),
+                        parse_mode="HTML"
+                    )
+                except Exception:
+                    pass
 
             intervals = [int(_ad_settings(sess, i).get("interval", 2) or 2) for i in participants]
             wait_secs = max(5, min(intervals) * 60)
@@ -1676,16 +1745,17 @@ def ads_section_keyboard(uid: int = 0):
     # currently being edited.
     if sess and _has_usdt_usd_ad_configured(sess):
         _ad2_id = sess.usdt_ad2["settings"].get("ad_id") if sess.usdt_ad2 else ""
-        rows.append([InlineKeyboardButton(
+        _usdt_row = [InlineKeyboardButton(
             ("🪞 USDT AD2 ✅" if _ad2_id else "🪞 USDT AD2"),
             callback_data="usdt_ad2_menu"
-        )])
+        )]
         if _ad2_id:
             _ad3_id = sess.usdt_ad3["settings"].get("ad_id") if sess.usdt_ad3 else ""
-            rows.append([InlineKeyboardButton(
+            _usdt_row.append(InlineKeyboardButton(
                 ("🪞 USDT AD3 ✅" if _ad3_id else "🪞 USDT AD3"),
                 callback_data="usdt_ad3_menu"
-            )])
+            ))
+        rows.append(_usdt_row)
 
     rows.append([InlineKeyboardButton("📃 My Ads List", callback_data="fetch_my_ads")])
     rows.append([
