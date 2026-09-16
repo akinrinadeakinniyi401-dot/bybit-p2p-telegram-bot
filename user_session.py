@@ -120,6 +120,11 @@ class SessionState:
         # loops can't coordinate safely.
         self.usdt_triad_running = False
         self.usdt_triad_task    = None
+        # Last computed rank assignment from the coordinator — {slot_idx:
+        # rank_number (1-based)} — used purely for status messages (e.g.
+        # confirming to the user "Ad 2 still in rank 2" on start/stop),
+        # not for any decision logic itself.
+        self.usdt_triad_last_ranks: dict = {}
 
         # Shared NGN/USDT (or other local currency) reference price — ONE
         # value used by every active ad slot for this user, since BTC and
