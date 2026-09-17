@@ -44,6 +44,13 @@ def _default_settings() -> dict:
         # level). Only meaningful for slot_idx != -1 on BTC/USD, ETH/USD,
         # BTC/NGN, ETH/NGN — harmless (and simply ignored) everywhere else.
         "manual_nudge":   "",
+        # BTC/NGN Ad Copy only — the leading digits of the price band to
+        # track ("Close Price Range"), and the last band-leader price
+        # actually copied, so an unchanged leader is skipped rather than
+        # re-posted. Persisted with the rest of settings, so both survive
+        # a redeploy and the Auto Resume Agent.
+        "close_price_range":     "",
+        "close_range_last_price": "",
     }
 
 
