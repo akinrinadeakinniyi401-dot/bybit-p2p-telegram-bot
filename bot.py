@@ -916,22 +916,39 @@ def _is_usdt_usd_ad(ad_data: dict) -> bool:
             and ad_data.get("currencyId", "").upper() == "USD")
 
 
+def _interval_floor_secs(s: dict, ad_data: dict):
+    """The seconds-level interval floor for this ad, or None if this ad
+    uses the normal whole-minutes floor instead.
+      • USDT/USD               → 25s
+      • BTC/NGN in ad_copy mode → 10s
+    Floating/fixed BTC/NGN ads are NOT included — they keep the 2-minute
+    floor, since they submit an edit every cycle rather than only on a
+    genuine price change.
+    """
+    if _is_usdt_usd_ad(ad_data):
+        return bybit.MIN_USDT_INTERVAL_SECONDS
+    if _is_btc_ngn_ad(ad_data) and s.get("mode") == "ad_copy":
+        return bybit.MIN_BTC_NGN_ADCOPY_INTERVAL_SECONDS
+    return None
+
+
 def _ad_interval_seconds(s: dict, ad_data: dict) -> int:
     """This ad's update interval in SECONDS.
 
-    Everything except USDT/USD stores `interval` as whole MINUTES (floor
-    2), so seconds = interval * 60. USDT/USD additionally supports an
-    `interval_secs` field holding a raw seconds value (floor 25), which
-    takes precedence when set. Keeping the old minutes field untouched
-    means every non-USDT ad, and any USDT ad configured before this
-    existed, keeps behaving exactly as before.
+    Most ads store `interval` as whole MINUTES (floor 2), so seconds =
+    interval * 60. The copy modes (USDT/USD, and BTC/NGN in ad_copy) also
+    support an `interval_secs` field holding a raw seconds value, which
+    takes precedence when set and valid for that ad's floor. Keeping the
+    old minutes field untouched means every other ad, and any copy-mode ad
+    configured before this existed, keeps behaving exactly as before.
     """
-    if _is_usdt_usd_ad(ad_data):
+    floor = _interval_floor_secs(s, ad_data)
+    if floor is not None:
         raw = s.get("interval_secs")
         if raw:
             try:
                 val = int(raw)
-                if val >= bybit.MIN_USDT_INTERVAL_SECONDS:
+                if val >= floor:
                     return val
             except (TypeError, ValueError):
                 pass
@@ -947,6 +964,72 @@ def _ad_interval_label(s: dict, ad_data: dict) -> str:
     if secs % 60 == 0:
         return f"{secs // 60} min"
     return f"{secs} sec"
+
+
+def _is_btc_ngn_ad(ad_data: dict) -> bool:
+    """True if this ad's pair is BTC/NGN — the pair that uses prefix-based
+    ("Close Price Range") Ad Copy rather than dominant-price Ad Copy."""
+    return (ad_data.get("tokenId", "").upper() == "BTC"
+            and ad_data.get("currencyId", "").upper() == "NGN")
+
+
+def _find_btc_ngn_ad_copy_slot(sess, exclude_slot=None):
+    """Slot index of the ONE ad already set to ad_copy mode on BTC/NGN, or
+    None. Used to enforce the single-slot rule — two BTC/NGN ad_copy ads
+    would chase the same prefix in the same market list and fight each
+    other for the same price."""
+    for i in range(-1, sess.total_ad_slots() - 1):
+        if exclude_slot is not None and i == exclude_slot:
+            continue
+        s = _ad_settings(sess, i)
+        if s.get("mode") != "ad_copy":
+            continue
+        if _is_btc_ngn_ad(_ad_data_of(sess, i)):
+            return i
+    return None
+
+
+def _pick_close_range_price(items: list, prefix: str, own_ids: set = None):
+    """BTC/NGN "Close Price Range" pick.
+
+    The user saves a leading-digits prefix (e.g. 1047435). Among all
+    fetched market ads whose price starts with those exact digits, return
+    the HIGHEST one — that's the price leading that band.
+
+    e.g. prefix 1047435 against
+         104743520.00, 104743530.20, 104743590.50, 104743730.80
+    matches the first three (the fourth is 1047437..., a different band)
+    and returns 104743590.50.
+
+    Comparison is done on the digits of the price with any decimal point
+    stripped, so "1047435" matches 104743520.00 regardless of where the
+    decimal falls. Returns (price_str, item) or (None, None).
+    """
+    prefix = str(prefix or "").strip()
+    if not prefix or not items:
+        return None, None
+    own_ids = own_ids or set()
+
+    best_price, best_item = None, None
+    for it in items:
+        if str(it.get("id", "")) in own_ids:
+            continue          # never match against the user's own ad
+        price_str = str(it.get("price", "") or "").strip()
+        if not price_str:
+            continue
+        digits = price_str.replace(".", "").replace(",", "")
+        if not digits.startswith(prefix):
+            continue
+        try:
+            val = Decimal(price_str)
+        except Exception:
+            continue
+        if best_price is None or val > best_price:
+            best_price, best_item = val, it
+
+    if best_price is None:
+        return None, None
+    return str(best_item.get("price")), best_item
 
 
 def _ad_copy_range_n(s: dict) -> int:
@@ -1831,10 +1914,18 @@ def ads_section_keyboard(uid: int = 0):
     if mode == "fixed":
         rows.append([InlineKeyboardButton("➕ Set Increment", callback_data="set_increment")])
     elif mode == "ad_copy":
-        _range = s.get("ad_copy_range", "top10")
-        _range_label = _ad_copy_range_label(_range)
-        rows.append([InlineKeyboardButton(f"🔝 Copy Range: {_range_label}", callback_data="set_ad_copy_range")])
-        rows.append([InlineKeyboardButton("🔍 View Market Ads List", callback_data="view_market_ads")])
+        if _is_btc_ngn_ad(ad_data):
+            _cpr = (s.get("close_price_range") or "").strip()
+            rows.append([InlineKeyboardButton(
+                f"🎯 Close Price Range: {_cpr}" if _cpr else "🎯 Set Close Price Range",
+                callback_data="set_close_price_range"
+            )])
+            rows.append([InlineKeyboardButton("🔍 View Market Ads List (BTC/NGN)", callback_data="view_market_ads")])
+        else:
+            _range = s.get("ad_copy_range", "top10")
+            _range_label = _ad_copy_range_label(_range)
+            rows.append([InlineKeyboardButton(f"🔝 Copy Range: {_range_label}", callback_data="set_ad_copy_range")])
+            rows.append([InlineKeyboardButton("🔍 View Market Ads List", callback_data="view_market_ads")])
     else:
         rows.append([InlineKeyboardButton("📊 Set Float %",   callback_data="set_float_pct")])
         _cur = ad_data.get("currencyId","").upper()
@@ -5582,7 +5673,85 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                 _want_currency = ad_data.get("currencyId","").upper()
                 _side = _market_ads_query_side(ad_data)
 
-                if _want_token == "USDT" and _want_currency == "USD":
+                if _want_token == "BTC" and _want_currency == "NGN":
+                    # ── BTC/NGN "Close Price Range" copy ──
+                    # Completely different rule from USDT/USD. The user
+                    # saves a leading-digit prefix (the price band they
+                    # want to sit in); each cycle we pull ranks 1-300 and
+                    # copy the HIGHEST market price whose digits start
+                    # with that prefix — i.e. whoever currently leads that
+                    # band. If no new leader has appeared since last
+                    # cycle, we skip the edit entirely rather than
+                    # re-posting the same number.
+                    _prefix = (s.get("close_price_range") or "").strip()
+                    if not _prefix:
+                        await bot.send_message(chat_id=chat_id,
+                            text=(f"⚠️ {prefix}<b>Cycle {cycle}</b> — No Close Price Range set for "
+                                  f"{label}. Set one in the ad menu to start copying. Skipping this cycle."),
+                            parse_mode="HTML")
+                        for _ in range(interval_secs):
+                            if not _ad_running(sess, slot_idx): break
+                            await asyncio.sleep(1)
+                        continue
+
+                    _win_items = await _fetch_market_ads_up_to(
+                        ad_data.get("tokenId",""), ad_data.get("currencyId",""), _side, 300, creds
+                    )
+                    _btc_match_price, _btc_match_item = _pick_close_range_price(
+                        _win_items, _prefix, _own_ad_ids
+                    )
+                    logger.info(
+                        f"[{label}] Ad Copy (BTC/NGN) prefix={_prefix} — fetched "
+                        f"{len(_win_items)} item(s), leader in band: {_btc_match_price}"
+                    )
+
+                    if not _btc_match_price:
+                        await bot.send_message(chat_id=chat_id,
+                            text=(f"⚠️ {prefix}<b>Cycle {cycle}</b> — No BTC/NGN ad in ranks 1-300 "
+                                  f"matches <code>{_esc(_prefix)}</code> right now. Skipping this cycle."),
+                            parse_mode="HTML")
+                        for _ in range(interval_secs):
+                            if not _ad_running(sess, slot_idx): break
+                            await asyncio.sleep(1)
+                        continue
+
+                    # Only move when a genuinely NEW leader appears —
+                    # re-posting an unchanged price would just reset this
+                    # ad's own position for nothing.
+                    _prev = s.get("close_range_last_price")
+                    if _prev is not None and str(_prev) == str(_btc_match_price):
+                        logger.info(
+                            f"[{label}] Ad Copy (BTC/NGN) band leader unchanged "
+                            f"({_btc_match_price}) — skipping edit this cycle"
+                        )
+                        await bot.send_message(chat_id=chat_id,
+                            text=(f"⏭ {prefix}<b>Cycle {cycle}</b> — Band <code>{_esc(_prefix)}</code> "
+                                  f"leader still <code>{_esc(str(_btc_match_price))}</code> "
+                                  f"(no new high) — skipping edit."),
+                            parse_mode="HTML")
+                        for _ in range(interval_secs):
+                            if not _ad_running(sess, slot_idx): break
+                            await asyncio.sleep(1)
+                        continue
+
+                    try:
+                        new_p = Decimal(_btc_match_price)
+                    except Exception:
+                        await bot.send_message(chat_id=chat_id,
+                            text=f"⚠️ {prefix}<b>Cycle {cycle}</b> — Unreadable price from the market listing. Skipping this cycle.",
+                            parse_mode="HTML")
+                        for _ in range(interval_secs):
+                            if not _ad_running(sess, slot_idx): break
+                            await asyncio.sleep(1)
+                        continue
+                    s["close_range_last_price"] = str(_btc_match_price)
+                    _quant = Decimal("0.01")   # NGN prices are 2dp, not USDT's 4dp
+                    logger.info(
+                        f"[{label}] Ad Copy (BTC/NGN) copying band leader {new_p} "
+                        f"from {(_btc_match_item or {}).get('nickName','?')}"
+                    )
+
+                elif _want_token == "USDT" and _want_currency == "USD":
                     # ── USDT/USD deep-window comparison ──
                     # Copy Range (1-10 / 1-20) no longer picks a shallow
                     # page-1 depth for this pair. Both settings now do the
@@ -7592,11 +7761,12 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             )
             return
         is_usdt_usd = ad_data.get("currencyId","").upper() == "USD" and ad_data.get("tokenId","").upper() == "USDT"
+        is_btc_ngn  = _is_btc_ngn_ad(ad_data)
         rows = [
             [InlineKeyboardButton(("✅ " if cur_mode == "fixed" else "") + "💲 Fixed",    callback_data="set_mode_fixed")],
             [InlineKeyboardButton(("✅ " if cur_mode == "floating" else "") + "📈 Floating", callback_data="set_mode_floating")],
         ]
-        if is_usdt_usd:
+        if is_usdt_usd or is_btc_ngn:
             rows.append([InlineKeyboardButton(("✅ " if cur_mode == "ad_copy" else "") + "🪞 Ad Copy", callback_data="set_mode_ad_copy")])
         rows += back_section("section_ads")
         txt = (
@@ -7606,6 +7776,12 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         )
         if is_usdt_usd:
             txt += "🪞 <b>Ad Copy</b> — copies the top live market ad price directly (USD/USDT only).\n"
+        elif is_btc_ngn:
+            txt += (
+                "🪞 <b>Ad Copy</b> — matches a price prefix you set and copies the highest "
+                "market ad sharing it (BTC/NGN).\n\n"
+                "<i>Only one ad on the bot can use Ad Copy for BTC/NGN at a time.</i>\n"
+            )
         await edit_menu(query, txt, InlineKeyboardMarkup(rows))
 
     elif data in ("set_mode_fixed", "set_mode_floating", "set_mode_ad_copy"):
@@ -7617,11 +7793,25 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         s = _ad_settings(sess, slot_idx)
         ad_data = _ad_data_of(sess, slot_idx)
         new_mode = data[len("set_mode_"):]
-        if new_mode == "ad_copy" and not (
-            ad_data.get("currencyId","").upper() == "USD" and ad_data.get("tokenId","").upper() == "USDT"
-        ):
-            await query.answer("Ad Copy is only available for USD/USDT ads.", show_alert=True)
-            return
+        if new_mode == "ad_copy":
+            _is_usdt = (ad_data.get("currencyId","").upper() == "USD"
+                        and ad_data.get("tokenId","").upper() == "USDT")
+            _is_btc_ngn = _is_btc_ngn_ad(ad_data)
+            if not (_is_usdt or _is_btc_ngn):
+                await query.answer("Ad Copy is only available for USD/USDT and BTC/NGN ads.", show_alert=True)
+                return
+            if _is_btc_ngn:
+                # Exactly ONE BTC/NGN ad_copy slot per user. Two of them
+                # would chase the same prefix against the same market list
+                # and end up fighting each other for the same price.
+                existing = _find_btc_ngn_ad_copy_slot(sess, exclude_slot=slot_idx)
+                if existing is not None:
+                    await query.answer(
+                        f"{_ad_slot_label(existing)} is already using Ad Copy for BTC/NGN. "
+                        f"Only one BTC/NGN Ad Copy ad is allowed — switch that one off first.",
+                        show_alert=True
+                    )
+                    return
         s["mode"] = new_mode
         next_hint = ""
         if slot_idx == -1:
@@ -7636,6 +7826,30 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         )
 
     # ── 🔝 Ad Copy Range ──
+    # ── 🎯 Set Close Price Range (BTC/NGN Ad Copy) ──
+    elif data == "set_close_price_range":
+        sess = _s(tuser.id)
+        slot_idx = sess.editing_slot
+        s = _ad_settings(sess, slot_idx)
+        ad_data = _ad_data_of(sess, slot_idx)
+        if not _is_btc_ngn_ad(ad_data):
+            await query.answer("Close Price Range is for BTC/NGN Ad Copy ads only.", show_alert=True)
+            return
+        _btn_state["action"]       = "close_price_range"
+        _btn_state["prev_section"] = "section_ads"
+        _cur = (s.get("close_price_range") or "").strip() or "— not set —"
+        await edit_menu(query,
+            f"🎯 <b>Close Price Range — {_ad_slot_label(slot_idx)}</b>\n\n"
+            f"Current: <code>{_esc(_cur)}</code>\n\n"
+            f"Send the leading digits of the price band you want to track.\n"
+            f"Example: <code>1047435</code>\n\n"
+            f"Each cycle the bot fetches BTC/NGN market ads (ranks 1-300), keeps only the ads "
+            f"whose price starts with those digits, and copies the <b>highest</b> one of them.\n\n"
+            f"<i>e.g. with 1047435, against 104743520.00 / 104743530.20 / 104743590.50 / "
+            f"104743730.80 it copies 104743590.50 — the last one is a different band (1047437).</i>",
+            InlineKeyboardMarkup(back_section("section_ads"))
+        )
+
     # ── 🔍 View Market Ads List (diagnostic) ──
     elif data == "view_market_ads" or data.startswith("view_market_ads_"):
         sess = _s(tuser.id)
@@ -7880,18 +8094,17 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         sess = _s(tuser.id)
         s = _ad_settings(sess, sess.editing_slot)
         ad_data = _ad_data_of(sess, sess.editing_slot)
-        if _is_usdt_usd_ad(ad_data):
-            # USDT/USD takes SECONDS, floor 25 — it only submits an edit
-            # when the dominant price actually changes, so polling fast is
-            # cheap and safe here in a way it isn't for floating BTC ads.
+        _floor = _interval_floor_secs(s, ad_data)
+        if _floor is not None:
+            _pair = f"{ad_data.get('tokenId','')}/{ad_data.get('currencyId','')}"
             await edit_menu(query,
-                f"⏱ <b>Set Interval — {_ad_slot_label(sess.editing_slot)}</b> (USDT/USD)\n\n"
+                f"⏱ <b>Set Interval — {_ad_slot_label(sess.editing_slot)}</b> ({_esc(_pair)})\n\n"
                 f"Current: every <code>{_ad_interval_label(s, ad_data)}</code>\n\n"
                 f"Send the number of <b>SECONDS</b> between each market check "
-                f"(minimum {bybit.MIN_USDT_INTERVAL_SECONDS}).\n"
-                f"Examples: <code>25</code> | <code>60</code> (1 min) | <code>300</code> (5 min)\n\n"
-                f"<i>Checking often is safe for this pair — the price is only edited when the "
-                f"dominant market price actually changes, otherwise the check just skips.</i>",
+                f"(minimum {_floor}).\n"
+                f"Examples: <code>{_floor}</code> | <code>60</code> (1 min) | <code>300</code> (5 min)\n\n"
+                f"<i>Checking often is safe in copy mode — the price is only edited when a new "
+                f"price actually appears, otherwise the check just skips.</i>",
                 InlineKeyboardMarkup(back_section("section_ads"))
             )
         else:
@@ -8704,8 +8917,9 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             # 2-minute one, so it must be checked against its own rule —
             # otherwise its synced-down minutes value would fail the
             # minutes floor and block the ad from ever starting.
-            if _is_usdt_usd_ad(ad_data):
-                ok, err = validate_interval_seconds(_ad_interval_seconds(s, ad_data))
+            _floor = _interval_floor_secs(s, ad_data)
+            if _floor is not None:
+                ok, err = validate_interval_seconds(_ad_interval_seconds(s, ad_data), floor=_floor)
             else:
                 ok, err = validate_interval(s.get("interval", 2))
             if not ok:
@@ -9408,14 +9622,35 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             await update.message.reply_text("❌ Send a number like `1580`", parse_mode="HTML")
 
+    elif action == "close_price_range":
+        digits = text.strip().replace(",", "").replace(".", "")
+        if not digits.isdigit() or len(digits) < 3:
+            await update.message.reply_text(
+                "❌ Send digits only — at least 3 of them.\nExample: <code>1047435</code>",
+                parse_mode="HTML"
+            )
+            return
+        sess = _s(uid)
+        slot_idx = sess.editing_slot
+        s = _ad_settings(sess, slot_idx)
+        s["close_price_range"] = digits
+        _save_settings(uid)   # persists to DB, so it survives redeploy + Auto Resume Agent
+        _state["action"] = None
+        await reply_with_back(
+            f"✅ <b>{_ad_slot_label(slot_idx)} close price range saved!</b>\n\n"
+            f"Tracking prices starting with <code>{_esc(digits)}</code>\n\n"
+            f"Each cycle the bot copies the highest BTC/NGN market ad in that band."
+        )
+
     elif action == "interval":
         sess = _s(uid)
         slot_idx = sess.editing_slot
         s = _ad_settings(sess, slot_idx)
         ad_data = _ad_data_of(sess, slot_idx)
 
-        if _is_usdt_usd_ad(ad_data):
-            ok, err = validate_interval_seconds(text)
+        _floor = _interval_floor_secs(s, ad_data)
+        if _floor is not None:
+            ok, err = validate_interval_seconds(text, floor=_floor)
             if not ok:
                 await update.message.reply_text(err, parse_mode="HTML")
                 return
@@ -10134,6 +10369,98 @@ async def _auto_resume_agent_run_for_all(bot, context_label: str = "scheduled"):
         logger.info(f"[AutoResume] {context_label} pass — resumed engines for {resumed_count} user(s)")
 
 
+def _user_has_active_engines(sess) -> bool:
+    """Any background engine running or any paid toggle switched on."""
+    return bool(
+        sess.refresh_running        or
+        sess.order_monitor_running  or
+        sess.chat_monitor_enabled   or
+        sess.auto_pay_enabled       or
+        sess.flw_pay_enabled        or
+        sess.paga_pay_enabled       or
+        sess.buyer_protection_on    or
+        sess.name_match_enabled     or
+        sess.sell_msg_enabled       or
+        sess.usdt_triad_running     or
+        any(slot["running"] for slot in sess.extra_ad_slots) or
+        (sess.usdt_ad2 is not None and sess.usdt_ad2["running"]) or
+        (sess.usdt_ad3 is not None and sess.usdt_ad3["running"])
+    )
+
+
+async def _plan_expiry_watchdog_loop(bot=None):
+    """Enforce plan expiry WITHOUT waiting for the user to touch the bot.
+
+    The problem this solves: is_pro() was always correct the instant a
+    plan lapsed, but nothing ever asked it. Plan gating lived entirely on
+    the button-press path, so a user whose plan expired at 19:10 kept
+    editing ads, monitoring orders and auto-paying indefinitely — until
+    they happened to tap something (or the process was redeployed). The
+    Auto Resume Agent made that worse: it re-starts engines on its own
+    schedule with no interaction at all, so an expired user's engines
+    could be resurrected forever.
+
+    So this runs on its own short cycle and, for every user whose Pro
+    plan has lapsed, actively tears everything down and downgrades them.
+    Checking every 60s means enforcement lands within a minute of expiry
+    rather than whenever the user next shows up.
+    """
+    while True:
+        await asyncio.sleep(60)
+        try:
+            for _sess in list(get_all_sessions()):
+                uid = _sess.user_id
+                try:
+                    user = db.get_user(uid)
+                    if not user or user.get("plan") != "pro":
+                        continue          # already free (or unknown) — nothing to downgrade
+                    if db.is_pro(uid):
+                        continue          # still within the paid window
+
+                    had_engines = _user_has_active_engines(_sess)
+
+                    # Stop everything first, THEN downgrade — so there's no
+                    # window where the plan says "free" but loops are still
+                    # mid-cycle submitting edits on Bybit.
+                    _reset_user_session(_sess)
+                    # Auto Resume Agent must not resurrect any of this on
+                    # its next pass. db.get_auto_resume_agent_enabled()
+                    # already re-checks is_pro(), but clearing the stored
+                    # snapshot makes it belt-and-braces.
+                    try:
+                        db.save_resume_snapshot(uid, {})
+                    except Exception:
+                        pass
+                    db.downgrade_user(uid)
+
+                    logger.info(
+                        f"[PlanWatchdog] User {uid} Pro plan expired — engines stopped "
+                        f"(had_active={had_engines}) and account downgraded to free"
+                    )
+
+                    if bot:
+                        try:
+                            msg = (
+                                "⏰ <b>Your Pro plan has expired</b>\n\n"
+                                "Your account has been moved to the Free plan."
+                            )
+                            if had_engines:
+                                msg += (
+                                    "\n\nEverything that was running has been stopped:\n"
+                                    "• Ad Price Bot / auto-update\n"
+                                    "• Order Monitor, Chat Monitor, Sell Message\n"
+                                    "• Auto-Pay and Buyer Protection\n"
+                                )
+                            msg += "\n\nTap <b>⬆️ Upgrade Plan</b> to renew and turn them back on."
+                            await bot.send_message(chat_id=uid, text=msg, parse_mode="HTML")
+                        except Exception as e:
+                            logger.debug(f"[PlanWatchdog] Could not notify user {uid}: {e}")
+                except Exception as e:
+                    logger.error(f"[PlanWatchdog] Failed processing user {uid}: {e}")
+        except Exception as e:
+            logger.error(f"[PlanWatchdog] Loop error: {e}")
+
+
 async def _session_auto_reset_loop(bot=None):
     """
     Runs every 120 minutes (2 hours).
@@ -10772,6 +11099,11 @@ def start_bot():
 
         # Auto-reset stale sessions every 2 hours + notify active users
         asyncio.create_task(_session_auto_reset_loop(app.bot))
+
+        # Enforce plan expiry every 60s, independently of user interaction
+        # (and independently of the Auto Resume Agent, which would
+        # otherwise keep an expired user's engines alive indefinitely).
+        asyncio.create_task(_plan_expiry_watchdog_loop(app.bot))
 
         # Auto Resume Agent — startup pass. A redeploy restarts this whole
         # process, wiping every in-memory session — this is what actually
