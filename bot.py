@@ -5953,7 +5953,15 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
             # the same pair now — this nudges the actual PRICE apart instead,
             # only when another active ad on the identical pair would
             # otherwise land within the minimum gap. ──
-            if sess.total_ad_slots() > 1:
+            # Ad Copy is deliberately EXCLUDED: it already targets a specific,
+            # real price it discovered on the live market (the dominant
+            # USDT/USD price, or the leading price in a BTC/NGN band) —
+            # nudging it away from that price for sibling separation defeats
+            # the entire point of copying it, and the extra unplanned edits
+            # were silently burning through this ad's modify-rate budget,
+            # which then made LATER cycles appear to "do nothing" while they
+            # were actually just waiting for that budget to free up.
+            if sess.total_ad_slots() > 1 and mode != "ad_copy":
                 new_p, _cycle_collided = _resolve_price_collision(
                     sess, slot_idx,
                     ad_data.get("currencyId",""), ad_data.get("tokenId",""),
@@ -6151,6 +6159,27 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                     if await _handle_ad_cycle_failure(bot, chat_id, sess, slot_idx, label, cycle, last_code, last_msg, ad_data):
                         return
 
+
+            elif ret_code == 90043 and mode == "ad_copy":
+                # For every OTHER mode this means "the computed price
+                # happens to round to what's already live — nudge off it".
+                # For Ad Copy it means something different and much
+                # simpler: the ad is ALREADY sitting at the exact market
+                # price we just discovered and tried to (re)post. That's
+                # not a problem to nudge away from — nudging here would
+                # actively move this ad OFF the real market price it's
+                # supposed to be mirroring, for no reason at all. Treat it
+                # as confirmation of success.
+                _reset_ad_failures(sess, slot_idx)
+                _set_ad_current_price(sess, slot_idx, new_p)
+                logger.info(f"[{label}] Cycle {cycle} — 90043 (already at {new_p}) treated as success for Ad Copy, no nudge")
+                await bot.send_message(chat_id=chat_id,
+                    text=(
+                        f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n"
+                        f"Already at the target price — no change needed\n"
+                        f"💲 <code>{new_p}</code> ({mode.upper()})"
+                    ),
+                    parse_mode="HTML")
 
             elif ret_code == 90043:
                 # "The price of this P2P ad differs from your existing ad by
