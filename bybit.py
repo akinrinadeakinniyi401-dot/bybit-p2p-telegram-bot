@@ -217,6 +217,12 @@ MAX_ADS_PER_USER = 3
 #      rare — polling often mostly confirms "nothing changed, skip".
 MIN_USDT_INTERVAL_SECONDS = 25
 
+# BTC/NGN in AD COPY mode only. Same reasoning as USDT/USD above — it's a
+# copy mode, so a fast cycle is mostly reads and it only submits an edit
+# when a new leading price actually appears in the tracked band. Floating
+# BTC/NGN ads are unaffected and still sit behind the 2-minute floor.
+MIN_BTC_NGN_ADCOPY_INTERVAL_SECONDS = 10
+
 
 def validate_interval(minutes) -> tuple[bool, str]:
     """Reject any update interval below the safe floor. Keeping this at
@@ -236,18 +242,18 @@ def validate_interval(minutes) -> tuple[bool, str]:
     return True, ""
 
 
-def validate_interval_seconds(seconds) -> tuple[bool, str]:
-    """USDT/USD-only interval validation, in SECONDS. Floor is 25s — above
-    that the user can pick anything (25s, 90s, 600s for 10 minutes, etc.).
-    See MIN_USDT_INTERVAL_SECONDS for why this pair gets a tighter floor."""
+def validate_interval_seconds(seconds, floor: int = MIN_USDT_INTERVAL_SECONDS) -> tuple[bool, str]:
+    """Seconds-based interval validation for the copy modes. `floor` is
+    25s for USDT/USD and 10s for BTC/NGN Ad Copy. Above the floor the user
+    can pick anything (60s, 600s for 10 minutes, etc.)."""
     try:
         val = int(seconds)
     except (TypeError, ValueError):
         return False, "❌ Interval must be a whole number of seconds."
-    if val < MIN_USDT_INTERVAL_SECONDS:
+    if val < floor:
         return False, (
-            f"❌ Minimum interval for USDT/USD is {MIN_USDT_INTERVAL_SECONDS} seconds. "
-            f"Enter {MIN_USDT_INTERVAL_SECONDS} or higher (e.g. <code>25</code>, "
+            f"❌ Minimum interval for this ad is {floor} seconds. "
+            f"Enter {floor} or higher (e.g. <code>{floor}</code>, "
             f"<code>60</code>, <code>300</code>)."
         )
     return True, ""
