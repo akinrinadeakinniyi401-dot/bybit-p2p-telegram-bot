@@ -563,6 +563,14 @@ def set_auto_resume_agent_enabled(user_id: int, enabled: bool) -> dict:
         return user
 
 def get_auto_resume_agent_enabled(user_id: int) -> bool:
+    # is_pro() is re-checked here (not just the approval's own expiry)
+    # because the Auto Resume Agent runs with NO user interaction — if it
+    # only trusted the approval record, an expired user's engines would
+    # keep being resurrected every 2 hours forever. See also
+    # _plan_expiry_watchdog_loop in bot.py, which actively tears engines
+    # down the moment a plan lapses.
+    if not is_pro(user_id):
+        return False
     user = get_user(user_id)
     if not user:
         return False
