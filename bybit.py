@@ -207,6 +207,16 @@ def get_min_price_gap(currency_id: str, token_id: str = "", reference_price=None
 MIN_AD_INTERVAL_MINUTES = 2
 MAX_ADS_PER_USER = 3
 
+# USDT/USD is the one pair allowed to run far tighter than the 2-minute
+# floor. Two reasons it's safe there and nowhere else:
+#   1. It's an ad_copy pair — it only ever submits an edit when the
+#      dominant market price actually CHANGES. A fast poll is a read, not
+#      a write, so the 10-edits-per-5-minutes-per-ad write limit isn't
+#      the binding constraint it is for floating-mode BTC ads.
+#   2. USDT/USD barely moves compared to BTC, so those price changes are
+#      rare — polling often mostly confirms "nothing changed, skip".
+MIN_USDT_INTERVAL_SECONDS = 25
+
 
 def validate_interval(minutes) -> tuple[bool, str]:
     """Reject any update interval below the safe floor. Keeping this at
@@ -222,6 +232,23 @@ def validate_interval(minutes) -> tuple[bool, str]:
             f"❌ Minimum update interval is {MIN_AD_INTERVAL_MINUTES} minutes — "
             f"this keeps every ad safely within Bybit's rate limits, "
             f"especially when running more than one ad at once."
+        )
+    return True, ""
+
+
+def validate_interval_seconds(seconds) -> tuple[bool, str]:
+    """USDT/USD-only interval validation, in SECONDS. Floor is 25s — above
+    that the user can pick anything (25s, 90s, 600s for 10 minutes, etc.).
+    See MIN_USDT_INTERVAL_SECONDS for why this pair gets a tighter floor."""
+    try:
+        val = int(seconds)
+    except (TypeError, ValueError):
+        return False, "❌ Interval must be a whole number of seconds."
+    if val < MIN_USDT_INTERVAL_SECONDS:
+        return False, (
+            f"❌ Minimum interval for USDT/USD is {MIN_USDT_INTERVAL_SECONDS} seconds. "
+            f"Enter {MIN_USDT_INTERVAL_SECONDS} or higher (e.g. <code>25</code>, "
+            f"<code>60</code>, <code>300</code>)."
         )
     return True, ""
 
