@@ -26,7 +26,7 @@ from bybit import (
     take_ad_offline, put_ad_online,
     get_user_payment_list,
     review_seller_cancel,
-    validate_interval, validate_float_pct, MAX_ADS_PER_USER,
+    validate_interval, validate_interval_seconds, validate_float_pct, MAX_ADS_PER_USER,
     get_min_price_gap,
 )
 from fraud_check import check_buyer_name, load_scammers, get_scammer_count, get_last_updated
@@ -863,7 +863,9 @@ async def _usdt_triad_loop(bot, chat_id: int):
                 # 2-minute check happens to run.
                 now = datetime.now()
                 for idx in participants:
-                    own_interval_secs = int(_ad_settings(sess, idx).get("interval", 2) or 2) * 60
+                    own_interval_secs = _ad_interval_seconds(
+                        _ad_settings(sess, idx), _ad_data_of(sess, idx)
+                    )
                     last = sess.usdt_triad_last_notify.get(idx)
                     if last is not None and (now - last).total_seconds() < own_interval_secs:
                         continue
@@ -888,8 +890,11 @@ async def _usdt_triad_loop(bot, chat_id: int):
                     except Exception:
                         pass
 
-            intervals = [int(_ad_settings(sess, i).get("interval", 2) or 2) for i in participants]
-            wait_secs = max(5, min(intervals) * 60)
+            intervals = [
+                _ad_interval_seconds(_ad_settings(sess, i), _ad_data_of(sess, i))
+                for i in participants
+            ]
+            wait_secs = max(bybit.MIN_USDT_INTERVAL_SECONDS, min(intervals))
             for _ in range(wait_secs):
                 if not sess.usdt_triad_running or len(_usdt_triad_participants(sess)) < 2:
                     break
@@ -902,6 +907,46 @@ async def _usdt_triad_loop(bot, chat_id: int):
     finally:
         sess.usdt_triad_running = False
         sess.usdt_triad_task    = None
+
+
+def _is_usdt_usd_ad(ad_data: dict) -> bool:
+    """True if this ad's pair is USDT/USD — the one pair allowed to run on
+    a seconds-level interval (floor 25s, see MIN_USDT_INTERVAL_SECONDS)."""
+    return (ad_data.get("tokenId", "").upper() == "USDT"
+            and ad_data.get("currencyId", "").upper() == "USD")
+
+
+def _ad_interval_seconds(s: dict, ad_data: dict) -> int:
+    """This ad's update interval in SECONDS.
+
+    Everything except USDT/USD stores `interval` as whole MINUTES (floor
+    2), so seconds = interval * 60. USDT/USD additionally supports an
+    `interval_secs` field holding a raw seconds value (floor 25), which
+    takes precedence when set. Keeping the old minutes field untouched
+    means every non-USDT ad, and any USDT ad configured before this
+    existed, keeps behaving exactly as before.
+    """
+    if _is_usdt_usd_ad(ad_data):
+        raw = s.get("interval_secs")
+        if raw:
+            try:
+                val = int(raw)
+                if val >= bybit.MIN_USDT_INTERVAL_SECONDS:
+                    return val
+            except (TypeError, ValueError):
+                pass
+    try:
+        return max(1, int(s.get("interval", 2))) * 60
+    except (TypeError, ValueError):
+        return 120
+
+
+def _ad_interval_label(s: dict, ad_data: dict) -> str:
+    """Human-readable interval for menus/status text."""
+    secs = _ad_interval_seconds(s, ad_data)
+    if secs % 60 == 0:
+        return f"{secs // 60} min"
+    return f"{secs} sec"
 
 
 def _ad_copy_range_n(s: dict) -> int:
@@ -1806,6 +1851,18 @@ def ads_section_keyboard(uid: int = 0):
             _nudge_label = f"↔️ Nudge Amount: {_nudge_val}" if _nudge_val else "↔️ Set Nudge Amount"
             rows.append([InlineKeyboardButton(_nudge_label, callback_data="set_manual_nudge")])
 
+    # Dedicated BTC/NGN market list — same 1-300 windowed viewer the
+    # USDT/USD ad_copy mode gets, but shown for BTC/NGN ads in ANY mode
+    # (BTC/NGN ads run floating, not ad_copy, so they'd never hit the
+    # ad_copy branch above). Strictly tied to the currently-loaded ad:
+    # fetch a non-BTC/NGN ad into this slot and the button disappears
+    # again, since the viewer always queries the loaded ad's own pair.
+    if (ad_data.get("tokenId","").upper() == "BTC"
+            and ad_data.get("currencyId","").upper() == "NGN"
+            and mode != "ad_copy"):
+        rows.append([InlineKeyboardButton("🔍 View Market Ads List (BTC/NGN)",
+                                          callback_data="view_market_ads")])
+
     # Update Once Now only makes sense — and is only offered — when the
     # user is running a single ad. With multiple ads active, a one-off
     # manual update on one of them can no longer be validated against the
@@ -1892,7 +1949,7 @@ def ads_section_text(uid: int = 0) -> str:
         f"<i>{acct_label}</i>\n\n"
         f"🆔 Ad ID: <code>{ad_id}</code>\n"
         f"👤 UID (Acct {acct_slot}): <code>{bybit_uid}</code>\n"
-        f"🔀 Mode: <code>{mode.replace('_',' ').upper()}</code> | ⏱ Every <code>{interval}</code> min\n"
+        f"🔀 Mode: <code>{mode.replace('_',' ').upper()}</code> | ⏱ Every <code>{_ad_interval_label(s, ad_data)}</code>\n"
         f"{mode_info}\n"
         f"{ad_info}\n"
         f"📈 Session price: <code>{cur}</code> | {status}\n\n"
@@ -5458,6 +5515,10 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
     s         = _ad_settings(sess, slot_idx)
     ad_data   = _ad_data_of(sess, slot_idx)
     interval  = s.get("interval", 2)
+    # Seconds-resolution interval. Non-USDT ads resolve to interval*60
+    # exactly as before; USDT/USD ads may carry a finer interval_secs
+    # (floor 25s). Every wait below uses this instead of interval*60.
+    interval_secs = _ad_interval_seconds(s, ad_data)
     increment = Decimal(str(s.get("increment","0.05")))
     # Sync our tracked state to Bybit's REAL live price for this ad the
     # moment the loop (re)starts — for BOTH modes, not just "fixed". This
@@ -5554,7 +5615,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                                 f"{_want_currency}/{_want_token} ads in ranks 1-300 "
                                 f"of the live market right now. Skipping this cycle."
                             ), parse_mode="HTML")
-                        for _ in range(interval * 60):
+                        for _ in range(interval_secs):
                             if not _ad_running(sess, slot_idx): break
                             await asyncio.sleep(1)
                         continue
@@ -5565,7 +5626,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                         await bot.send_message(chat_id=chat_id,
                             text=f"⚠️ {prefix}<b>Cycle {cycle}</b> — Ad Copy got an unreadable price from the market listing. Skipping this cycle.",
                             parse_mode="HTML")
-                        for _ in range(interval * 60):
+                        for _ in range(interval_secs):
                             if not _ad_running(sess, slot_idx): break
                             await asyncio.sleep(1)
                         continue
@@ -5605,7 +5666,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                                 f"skipping this edit. USDT/USD ranking is first-come-first-served, so "
                                 f"re-posting an unchanged price would only push {label} to the back of the queue."
                             ), parse_mode="HTML")
-                        for _ in range(interval * 60):
+                        for _ in range(interval_secs):
                             if not _ad_running(sess, slot_idx): break
                             await asyncio.sleep(1)
                         continue
@@ -5616,7 +5677,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                         await bot.send_message(chat_id=chat_id,
                             text=f"⚠️ {prefix}<b>Cycle {cycle}</b> — Ad Copy got an unreadable price from the market listing. Skipping this cycle.",
                             parse_mode="HTML")
-                        for _ in range(interval * 60):
+                        for _ in range(interval_secs):
                             if not _ad_running(sess, slot_idx): break
                             await asyncio.sleep(1)
                         continue
@@ -5663,7 +5724,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                                 f"{_want_currency}/{_want_token} ads to copy "
                                 f"in the top {_range_n} of the live market right now. Skipping this cycle."
                             ), parse_mode="HTML")
-                        for _ in range(interval * 60):
+                        for _ in range(interval_secs):
                             if not _ad_running(sess, slot_idx): break
                             await asyncio.sleep(1)
                         continue
@@ -5679,7 +5740,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                         await bot.send_message(chat_id=chat_id,
                             text=f"⚠️ {prefix}<b>Cycle {cycle}</b> — Ad Copy got an unreadable price from the market listing. Skipping this cycle.",
                             parse_mode="HTML")
-                        for _ in range(interval * 60):
+                        for _ in range(interval_secs):
                             if not _ad_running(sess, slot_idx): break
                             await asyncio.sleep(1)
                         continue
@@ -5709,7 +5770,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                 if err:
                     await bot.send_message(chat_id=chat_id,
                         text=f"⚠️ {prefix}<b>Cycle {cycle} float error</b>\n<code>{_esc(str(err))}</code>", parse_mode="HTML")
-                    for _ in range(interval * 60):
+                    for _ in range(interval_secs):
                         if not _ad_running(sess, slot_idx): break
                         await asyncio.sleep(1)
                     continue
@@ -6085,7 +6146,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
             # last_fast_modify_ts_by_slot (fast-chase skips them entirely),
             # so this is a no-op for them and behaves exactly as before.
             loop_clock = asyncio.get_event_loop()
-            wait_until = loop_clock.time() + interval * 60
+            wait_until = loop_clock.time() + interval_secs
             _seen_fast_modify_ts = _last_fast_modify_ts(sess, slot_idx) if mode == "floating" else None
             while _ad_running(sess, slot_idx) and loop_clock.time() < wait_until:
                 await asyncio.sleep(1)
@@ -6093,7 +6154,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                     _fc_ts = _last_fast_modify_ts(sess, slot_idx)
                     if _fc_ts is not None and _fc_ts != _seen_fast_modify_ts:
                         _seen_fast_modify_ts = _fc_ts
-                        wait_until = _fc_ts + interval * 60
+                        wait_until = _fc_ts + interval_secs
                         logger.info(
                             f"[{label}] Fast-chase modified price during wait for user {chat_id} — "
                             f"cycle timer restarted, next scheduled cycle now ~{interval}min from that post"
@@ -7818,11 +7879,27 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         _btn_state["prev_section"] = "section_ads"
         sess = _s(tuser.id)
         s = _ad_settings(sess, sess.editing_slot)
-        await edit_menu(query,
-            f"⏱ <b>Set Interval — {_ad_slot_label(sess.editing_slot)}</b>\n\nCurrent: every <code>{s.get('interval',2)}</code> min\n\n"
-            f"Send minutes between each price update (minimum {bybit.MIN_AD_INTERVAL_MINUTES}).\nExamples: `2` | `5` | `10`",
-            InlineKeyboardMarkup(back_section("section_ads"))
-        )
+        ad_data = _ad_data_of(sess, sess.editing_slot)
+        if _is_usdt_usd_ad(ad_data):
+            # USDT/USD takes SECONDS, floor 25 — it only submits an edit
+            # when the dominant price actually changes, so polling fast is
+            # cheap and safe here in a way it isn't for floating BTC ads.
+            await edit_menu(query,
+                f"⏱ <b>Set Interval — {_ad_slot_label(sess.editing_slot)}</b> (USDT/USD)\n\n"
+                f"Current: every <code>{_ad_interval_label(s, ad_data)}</code>\n\n"
+                f"Send the number of <b>SECONDS</b> between each market check "
+                f"(minimum {bybit.MIN_USDT_INTERVAL_SECONDS}).\n"
+                f"Examples: <code>25</code> | <code>60</code> (1 min) | <code>300</code> (5 min)\n\n"
+                f"<i>Checking often is safe for this pair — the price is only edited when the "
+                f"dominant market price actually changes, otherwise the check just skips.</i>",
+                InlineKeyboardMarkup(back_section("section_ads"))
+            )
+        else:
+            await edit_menu(query,
+                f"⏱ <b>Set Interval — {_ad_slot_label(sess.editing_slot)}</b>\n\nCurrent: every <code>{s.get('interval',2)}</code> min\n\n"
+                f"Send minutes between each price update (minimum {bybit.MIN_AD_INTERVAL_MINUTES}).\nExamples: `2` | `5` | `10`",
+                InlineKeyboardMarkup(back_section("section_ads"))
+            )
 
     # ── 🔄 Update Once Now ──
     elif data == "update_now":
@@ -8623,7 +8700,14 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 return
             # ── Interval floor — defense in depth (already enforced when the
             # value was entered, but re-checked here in case of stale state) ──
-            ok, err = validate_interval(s.get("interval", 2))
+            # USDT/USD runs on a seconds-level floor (25s) rather than the
+            # 2-minute one, so it must be checked against its own rule —
+            # otherwise its synced-down minutes value would fail the
+            # minutes floor and block the ad from ever starting.
+            if _is_usdt_usd_ad(ad_data):
+                ok, err = validate_interval_seconds(_ad_interval_seconds(s, ad_data))
+            else:
+                ok, err = validate_interval(s.get("interval", 2))
             if not ok:
                 await edit_menu(query, err, InlineKeyboardMarkup(back_section("section_ads")))
                 return
@@ -8690,7 +8774,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 _set_ad_task(sess, slot_idx, task)
             _maybe_snapshot_resume_state(tuser.id)
             await edit_menu(query,
-                f"🟢 <b>{label} price update started!</b>\n🔀 <code>{mode.replace('_',' ').upper()}</code> | ⏱ every <code>{interval}</code> min\n\n"
+                f"🟢 <b>{label} price update started!</b>\n🔀 <code>{mode.replace('_',' ').upper()}</code> | ⏱ every <code>{_ad_interval_label(s, ad_data)}</code>\n\n"
                 + ads_section_text(tuser.id),
                 ads_section_keyboard(tuser.id)
             )
@@ -9325,15 +9409,37 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Send a number like `1580`", parse_mode="HTML")
 
     elif action == "interval":
+        sess = _s(uid)
+        slot_idx = sess.editing_slot
+        s = _ad_settings(sess, slot_idx)
+        ad_data = _ad_data_of(sess, slot_idx)
+
+        if _is_usdt_usd_ad(ad_data):
+            ok, err = validate_interval_seconds(text)
+            if not ok:
+                await update.message.reply_text(err, parse_mode="HTML")
+                return
+            val = int(text)
+            s["interval_secs"] = val
+            # Keep the legacy minutes field roughly in sync so anything
+            # still reading it (status text, older code paths) shows
+            # something sane rather than a stale number.
+            s["interval"] = max(1, round(val / 60))
+            _save_settings(uid)
+            _state["action"] = None
+            await reply_with_back(
+                f"✅ <b>{_ad_slot_label(slot_idx)} interval saved!</b>\n\n"
+                f"Every <code>{_esc(_ad_interval_label(s, ad_data))}</code>"
+            )
+            return
+
         ok, err = validate_interval(text)
         if not ok:
             await update.message.reply_text(err, parse_mode="HTML")
             return
         val = int(text)
-        sess = _s(uid)
-        slot_idx = sess.editing_slot
-        s = _ad_settings(sess, slot_idx)
         s["interval"] = val
+        s.pop("interval_secs", None)   # switching back to minutes clears any seconds override
         if slot_idx == -1:
             slot_str = _get_user_slot_str(uid)
             sess.settings[f"interval_{slot_str}"] = val
@@ -9872,7 +9978,17 @@ async def _resume_user_engines(bot, uid: int, snapshot: dict) -> list:
     """
     if not snapshot:
         return []
-    sess = get_session(uid)   # creates + restores persisted settings if this is a fresh (post-redeploy) session
+    # CRITICAL on redeploy: get_session() alone returns a BLANK session —
+    # it does not read anything back off disk. Persisted settings (Ad 1's
+    # fields, the extra Ad 2/Ad 3 slots, AND the dedicated USDT AD2/AD3
+    # slots) are only rehydrated by _load_settings_from_disk, which until
+    # now only ever ran when a user actively interacted with the bot.
+    # Without this call every slot's ad_id reads back as "" here, fails
+    # the ad_id-match guard below, and gets skipped as "changed since
+    # snapshot" — which is exactly why USDT AD2/AD3 were never resumed
+    # after a redeploy.
+    _load_settings_from_disk(uid)
+    sess = get_session(uid)
     resumed = []
 
     creds = get_user_creds(uid, slot=_get_user_slot(uid))
