@@ -51,6 +51,9 @@ def _default_settings() -> dict:
         # a redeploy and the Auto Resume Agent.
         "close_price_range":     "",
         "close_range_last_price": "",
+        # How many places down the ranked band to copy — 1 = leading
+        # (highest) price in the band, 2 = second-highest, 3 = third, etc.
+        "top_range": 1,
     }
 
 
