@@ -989,28 +989,35 @@ def _find_btc_ngn_ad_copy_slot(sess, exclude_slot=None):
     return None
 
 
-def _pick_close_range_price(items: list, prefix: str, own_ids: set = None):
+def _pick_close_range_price(items: list, prefix: str, own_ids: set = None, top_range: int = 1):
     """BTC/NGN "Close Price Range" pick.
 
     The user saves a leading-digits prefix (e.g. 1047435). Among all
-    fetched market ads whose price starts with those exact digits, return
-    the HIGHEST one — that's the price leading that band.
+    fetched market ads whose price starts with those exact digits, this
+    ranks them highest-to-lowest and returns the `top_range`'th one —
+    1 = the leading (highest) price in that band, 2 = second-highest,
+    3 = third-highest, and so on.
 
-    e.g. prefix 1047435 against
-         104743520.00, 104743530.20, 104743590.50, 104743730.80
-    matches the first three (the fourth is 1047437..., a different band)
-    and returns 104743590.50.
+    e.g. prefix 100200 against 100200.9, 100200.5, 100200.3, 100200.03:
+      top_range=1 -> 100200.9  (leading)
+      top_range=2 -> 100200.5  (2nd highest)
+      top_range=3 -> 100200.3  (3rd highest)
 
     Comparison is done on the digits of the price with any decimal point
     stripped, so "1047435" matches 104743520.00 regardless of where the
-    decimal falls. Returns (price_str, item) or (None, None).
+    decimal falls. Returns (price_str, item) or (None, None) if there
+    aren't at least `top_range` matches in the band.
     """
     prefix = str(prefix or "").strip()
     if not prefix or not items:
         return None, None
     own_ids = own_ids or set()
+    try:
+        top_range = max(1, int(top_range))
+    except (TypeError, ValueError):
+        top_range = 1
 
-    best_price, best_item = None, None
+    matches = []   # [(Decimal price, item), ...]
     for it in items:
         if str(it.get("id", "")) in own_ids:
             continue          # never match against the user's own ad
@@ -1024,12 +1031,14 @@ def _pick_close_range_price(items: list, prefix: str, own_ids: set = None):
             val = Decimal(price_str)
         except Exception:
             continue
-        if best_price is None or val > best_price:
-            best_price, best_item = val, it
+        matches.append((val, it))
 
-    if best_price is None:
+    if len(matches) < top_range:
         return None, None
-    return str(best_item.get("price")), best_item
+
+    matches.sort(key=lambda pair: pair[0], reverse=True)
+    picked_val, picked_item = matches[top_range - 1]
+    return str(picked_item.get("price")), picked_item
 
 
 def _ad_copy_range_n(s: dict) -> int:
@@ -1919,6 +1928,10 @@ def ads_section_keyboard(uid: int = 0):
             rows.append([InlineKeyboardButton(
                 f"🎯 Close Price Range: {_cpr}" if _cpr else "🎯 Set Close Price Range",
                 callback_data="set_close_price_range"
+            )])
+            _top_range = int(s.get("top_range", 1) or 1)
+            rows.append([InlineKeyboardButton(
+                f"🏆 Top Range: {_top_range}", callback_data="set_top_range"
             )])
             rows.append([InlineKeyboardButton("🔍 View Market Ads List (BTC/NGN)", callback_data="view_market_ads")])
         else:
@@ -5697,37 +5710,39 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                     _win_items = await _fetch_market_ads_up_to(
                         ad_data.get("tokenId",""), ad_data.get("currencyId",""), _side, 300, creds
                     )
+                    _top_range = int(s.get("top_range", 1) or 1)
                     _btc_match_price, _btc_match_item = _pick_close_range_price(
-                        _win_items, _prefix, _own_ad_ids
+                        _win_items, _prefix, _own_ad_ids, top_range=_top_range
                     )
                     logger.info(
-                        f"[{label}] Ad Copy (BTC/NGN) prefix={_prefix} — fetched "
-                        f"{len(_win_items)} item(s), leader in band: {_btc_match_price}"
+                        f"[{label}] Ad Copy (BTC/NGN) prefix={_prefix} top_range={_top_range} — fetched "
+                        f"{len(_win_items)} item(s), matched price: {_btc_match_price}"
                     )
 
                     if not _btc_match_price:
                         await bot.send_message(chat_id=chat_id,
-                            text=(f"⚠️ {prefix}<b>Cycle {cycle}</b> — No BTC/NGN ad in ranks 1-300 "
-                                  f"matches <code>{_esc(_prefix)}</code> right now. Skipping this cycle."),
+                            text=(f"⚠️ {prefix}<b>Cycle {cycle}</b> — Fewer than {_top_range} BTC/NGN ad(s) in "
+                                  f"ranks 1-300 match <code>{_esc(_prefix)}</code> right now (Top Range {_top_range} "
+                                  f"needs at least that many matches). Skipping this cycle."),
                             parse_mode="HTML")
                         for _ in range(interval_secs):
                             if not _ad_running(sess, slot_idx): break
                             await asyncio.sleep(1)
                         continue
 
-                    # Only move when a genuinely NEW leader appears —
-                    # re-posting an unchanged price would just reset this
-                    # ad's own position for nothing.
+                    # Only move when a genuinely NEW price appears at this
+                    # rank — re-posting an unchanged price would just reset
+                    # this ad's own position for nothing.
                     _prev = s.get("close_range_last_price")
                     if _prev is not None and str(_prev) == str(_btc_match_price):
                         logger.info(
-                            f"[{label}] Ad Copy (BTC/NGN) band leader unchanged "
+                            f"[{label}] Ad Copy (BTC/NGN) rank {_top_range} price unchanged "
                             f"({_btc_match_price}) — skipping edit this cycle"
                         )
                         await bot.send_message(chat_id=chat_id,
                             text=(f"⏭ {prefix}<b>Cycle {cycle}</b> — Band <code>{_esc(_prefix)}</code> "
-                                  f"leader still <code>{_esc(str(_btc_match_price))}</code> "
-                                  f"(no new high) — skipping edit."),
+                                  f"rank {_top_range} still <code>{_esc(str(_btc_match_price))}</code> "
+                                  f"(no change) — skipping edit."),
                             parse_mode="HTML")
                         for _ in range(interval_secs):
                             if not _ad_running(sess, slot_idx): break
@@ -5747,7 +5762,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                     s["close_range_last_price"] = str(_btc_match_price)
                     _quant = Decimal("0.01")   # NGN prices are 2dp, not USDT's 4dp
                     logger.info(
-                        f"[{label}] Ad Copy (BTC/NGN) copying band leader {new_p} "
+                        f"[{label}] Ad Copy (BTC/NGN) copying rank {_top_range} price {new_p} "
                         f"from {(_btc_match_item or {}).get('nickName','?')}"
                     )
 
@@ -7855,6 +7870,31 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         )
 
     # ── 🔝 Ad Copy Range ──
+    # ── 🏆 Set Top Range (BTC/NGN Ad Copy) ──
+    elif data == "set_top_range":
+        sess = _s(tuser.id)
+        slot_idx = sess.editing_slot
+        s = _ad_settings(sess, slot_idx)
+        ad_data = _ad_data_of(sess, slot_idx)
+        if not _is_btc_ngn_ad(ad_data):
+            await query.answer("Top Range is for BTC/NGN Ad Copy ads only.", show_alert=True)
+            return
+        _btn_state["action"]       = "top_range"
+        _btn_state["prev_section"] = "section_ads"
+        _cur = int(s.get("top_range", 1) or 1)
+        await edit_menu(query,
+            f"🏆 <b>Top Range — {_ad_slot_label(slot_idx)}</b>\n\n"
+            f"Current: <code>{_cur}</code>\n\n"
+            f"How far down the ranked band (from your Close Price Range) to copy:\n"
+            f"• <code>1</code> — the leading (highest) price in the band\n"
+            f"• <code>2</code> — the 2nd-highest price in the band\n"
+            f"• <code>3</code> — the 3rd-highest, and so on\n\n"
+            f"Example with band <code>100200</code>: 100200.9, 100200.5, 100200.3, 100200.03\n"
+            f"→ Top Range <code>2</code> copies <code>100200.5</code>.\n\n"
+            f"Send a whole number, 1 or higher.",
+            InlineKeyboardMarkup(back_section("section_ads"))
+        )
+
     # ── 🎯 Set Close Price Range (BTC/NGN Ad Copy) ──
     elif data == "set_close_price_range":
         sess = _s(tuser.id)
@@ -9650,6 +9690,29 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await reply_with_back(f"✅ <b>{_esc(_scur)}/USDT ref saved!{shared_note}</b>\n\n<code>{_esc(text)}</code>\n\n<i>{_esc(next_setup_hint(uid) if sess.editing_slot == -1 else '')}</i>")
         except Exception:
             await update.message.reply_text("❌ Send a number like `1580`", parse_mode="HTML")
+
+    elif action == "top_range":
+        try:
+            val = int(text.strip())
+            if val <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            await update.message.reply_text(
+                "❌ Send a whole number, 1 or higher.\nExample: <code>2</code>",
+                parse_mode="HTML"
+            )
+            return
+        sess = _s(uid)
+        slot_idx = sess.editing_slot
+        s = _ad_settings(sess, slot_idx)
+        s["top_range"] = val
+        _save_settings(uid)   # persists to DB, so it survives redeploy + Auto Resume Agent
+        _state["action"] = None
+        _ordinal = {1: "leading (highest)", 2: "2nd-highest", 3: "3rd-highest"}.get(val, f"{val}th-highest")
+        await reply_with_back(
+            f"✅ <b>{_ad_slot_label(slot_idx)} Top Range saved!</b>\n\n"
+            f"Now copying the <b>{_ordinal}</b> price within the Close Price Range band."
+        )
 
     elif action == "close_price_range":
         digits = text.strip().replace(",", "").replace(".", "")
