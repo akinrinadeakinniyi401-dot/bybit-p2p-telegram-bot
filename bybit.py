@@ -221,7 +221,7 @@ MIN_USDT_INTERVAL_SECONDS = 25
 # copy mode, so a fast cycle is mostly reads and it only submits an edit
 # when a new leading price actually appears in the tracked band. Floating
 # BTC/NGN ads are unaffected and still sit behind the 2-minute floor.
-MIN_BTC_NGN_ADCOPY_INTERVAL_SECONDS = 10
+MIN_BTC_NGN_ADCOPY_INTERVAL_SECONDS = 5
 
 
 def validate_interval(minutes) -> tuple[bool, str]:
