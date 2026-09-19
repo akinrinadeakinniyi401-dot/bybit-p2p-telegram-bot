@@ -1,5 +1,6 @@
 import asyncio
 import random
+import json
 import re
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
@@ -7955,6 +7956,30 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         await query.answer("Fetching live market ads...")
         items = await _fetch_market_ads_up_to(want_token, want_currency, want_side, end_n, creds)
         window = items[start_n - 1:end_n]   # the ranked positions this button actually shows
+
+        # ── Raw field diagnostic dump (server logs only, not sent to the
+        # user) ──
+        # Investigating whether Bybit's own response already flags an ad
+        # as ineligible/eligible for display (authTag, blocked, etc.)
+        # rather than that only being decided client-side. Dumping the
+        # full raw item — not just the fields bot.py otherwise reads —
+        # so nothing Bybit sends back is hidden from this investigation.
+        # Kept as one JSON line per ad so it's easy to grep/diff across
+        # ranges (rank 1-50 vs 50-100, etc.) in Render's log viewer.
+        _diag_fields = [
+            "price", "userId", "isOnline", "lastQuantity", "minAmount",
+            "maxAmount", "payments", "recentOrderNum", "recentExecuteRate",
+            "authTag", "paymentPeriod", "blocked", "makerContact",
+            "tradingPreferenceSet",
+        ]
+        logger.info(
+            f"[MarketAdsDiag] {want_token}/{want_currency} side={want_side} "
+            f"ranks {start_n}-{end_n} — {len(window)} item(s) — raw field dump follows"
+        )
+        for _rank, _it in enumerate(window, start_n):
+            _diag = {f: _it.get(f, "<MISSING>") for f in _diag_fields}
+            logger.info(f"[MarketAdsDiag] rank={_rank} id={_it.get('id','?')} {json.dumps(_diag, default=str)}")
+
         own_ids = {
             (_ad_settings(sess, i) or {}).get("ad_id","")
             for i in range(-1, sess.total_ad_slots() - 1)
