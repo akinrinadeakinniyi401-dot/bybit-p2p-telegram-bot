@@ -5713,38 +5713,66 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                             await asyncio.sleep(1)
                         continue
 
-                    _win_items = await _fetch_market_ads_up_to(
-                        ad_data.get("tokenId",""), ad_data.get("currencyId",""), _side, 300, creds
-                    )
                     _merchant = (s.get("merchant_username") or "").strip()
                     _merchant_range_used = "1-300"
-                    if _merchant:
-                        # Restrict to just this merchant's ad(s) BEFORE the
-                        # prefix/rank matching below — same digit + Top
-                        # Range rule, just scoped to one seller instead of
-                        # the whole market.
-                        _search_items = [
-                            it for it in _win_items
+
+                    def _match_merchant(pool):
+                        return [
+                            it for it in pool
                             if str(it.get("nickName", "")).strip().lower() == _merchant.lower()
                         ]
-                        if not _search_items:
-                            # Bybit's own ranking rotates constantly — a
-                            # merchant sitting around rank 249 one moment can
-                            # be past 300 the next. Rather than give up after
-                            # one page, fall back to ranks 301-600 within the
-                            # SAME cycle before concluding they're not there.
-                            logger.info(f"[{label}] Ad Copy (BTC/NGN) Merchant Watch — '{_merchant}' not in ranks 1-300, trying 301-600")
-                            _win_items_600 = await _fetch_market_ads_up_to(
+
+                    if _merchant:
+                        # Sticky range preference: once we know which half
+                        # (1-300 or 301-600) the merchant is CURRENTLY
+                        # sitting in, check that half FIRST every cycle
+                        # instead of always starting from 1-300. Bybit's
+                        # ranking only shifts gradually, so a merchant that
+                        # was just found in 301-600 is far more likely to
+                        # still be there next cycle than to have jumped back
+                        # to 1-300 — checking the right half first avoids
+                        # needlessly reporting "not in 1-300, trying 301-600"
+                        # every single cycle while they're sitting steady in
+                        # the second half.
+                        _preferred = s.get("merchant_last_range", "1-300")
+
+                        if _preferred == "301-600":
+                            _win_items = await _fetch_market_ads_up_to(
                                 ad_data.get("tokenId",""), ad_data.get("currencyId",""), _side, 600, creds
                             )
-                            _win_items_301_600 = _win_items_600[300:600]
-                            _search_items = [
-                                it for it in _win_items_301_600
-                                if str(it.get("nickName", "")).strip().lower() == _merchant.lower()
-                            ]
+                            _search_items = _match_merchant(_win_items[300:600])
                             if _search_items:
                                 _merchant_range_used = "301-600"
+                            else:
+                                _search_items = _match_merchant(_win_items[0:300])
+                                if _search_items:
+                                    _merchant_range_used = "1-300"
+                        else:
+                            _win_items = await _fetch_market_ads_up_to(
+                                ad_data.get("tokenId",""), ad_data.get("currencyId",""), _side, 300, creds
+                            )
+                            _search_items = _match_merchant(_win_items)
+                            if _search_items:
+                                _merchant_range_used = "1-300"
+                            else:
+                                # Bybit's own ranking rotates constantly — a
+                                # merchant sitting around rank 249 one moment
+                                # can be past 300 the next. Fall back to
+                                # ranks 301-600 within the SAME cycle before
+                                # concluding they're not there at all.
+                                logger.info(f"[{label}] Ad Copy (BTC/NGN) Merchant Watch — '{_merchant}' not in ranks 1-300, trying 301-600")
+                                _win_items = await _fetch_market_ads_up_to(
+                                    ad_data.get("tokenId",""), ad_data.get("currencyId",""), _side, 600, creds
+                                )
+                                _search_items = _match_merchant(_win_items[300:600])
+                                if _search_items:
+                                    _merchant_range_used = "301-600"
+
                         if not _search_items:
+                            # Not found in EITHER half this cycle — leave the
+                            # sticky preference untouched so next cycle
+                            # retries the same (still most-likely) range
+                            # first, rather than resetting back to 1-300.
                             logger.info(f"[{label}] Ad Copy (BTC/NGN) Merchant Watch — '{_merchant}' not found in ranks 1-300 or 301-600 this cycle")
                             await bot.send_message(chat_id=chat_id,
                                 text=(f"⚠️ {prefix}<b>Cycle {cycle}</b> — Merchant <code>{_esc(_merchant)}</code> "
@@ -5754,7 +5782,14 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                                 if not _ad_running(sess, slot_idx): break
                                 await asyncio.sleep(1)
                             continue
+
+                        if s.get("merchant_last_range") != _merchant_range_used:
+                            logger.info(f"[{label}] Ad Copy (BTC/NGN) Merchant Watch — '{_merchant}' shifted to ranks {_merchant_range_used}, now focusing there")
+                        s["merchant_last_range"] = _merchant_range_used
                     else:
+                        _win_items = await _fetch_market_ads_up_to(
+                            ad_data.get("tokenId",""), ad_data.get("currencyId",""), _side, 300, creds
+                        )
                         _search_items = _win_items
                     _top_range = int(s.get("top_range", 1) or 1)
                     _btc_match_price, _btc_match_item = _pick_close_range_price(
@@ -9869,6 +9904,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cleared = text.strip().lower() in ("0", "clear", "none", "reset")
         if cleared:
             s["merchant_username"] = ""
+            s["merchant_last_range"] = "1-300"
             _save_settings(uid)
             _state["action"] = None
             await reply_with_back(
@@ -9884,6 +9920,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
             s["merchant_username"] = nick
+            s["merchant_last_range"] = "1-300"   # fresh merchant — don't carry over the old one's last-known range
             _save_settings(uid)   # persists to DB, so it survives redeploy + Auto Resume Agent
             _state["action"] = None
             await reply_with_back(
