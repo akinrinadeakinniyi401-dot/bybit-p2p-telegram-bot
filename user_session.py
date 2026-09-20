@@ -58,6 +58,12 @@ def _default_settings() -> dict:
         # ONE specific merchant's ad(s) instead of the whole market.
         # Empty = no restriction (search the whole market, as before).
         "merchant_username": "",
+        # Sticky "which half were they last seen in" preference for
+        # Merchant Watch — "1-300" or "301-600". Checked first each cycle
+        # before falling back to the other half, so the bot doesn't keep
+        # re-announcing "not in 1-300, trying 301-600" every cycle while
+        # the merchant is sitting steady in the second half.
+        "merchant_last_range": "1-300",
     }
 
 
