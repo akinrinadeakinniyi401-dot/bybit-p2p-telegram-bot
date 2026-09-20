@@ -5717,6 +5717,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                         ad_data.get("tokenId",""), ad_data.get("currencyId",""), _side, 300, creds
                     )
                     _merchant = (s.get("merchant_username") or "").strip()
+                    _merchant_range_used = "1-300"
                     if _merchant:
                         # Restrict to just this merchant's ad(s) BEFORE the
                         # prefix/rank matching below — same digit + Top
@@ -5727,10 +5728,27 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                             if str(it.get("nickName", "")).strip().lower() == _merchant.lower()
                         ]
                         if not _search_items:
-                            logger.info(f"[{label}] Ad Copy (BTC/NGN) Merchant Watch — '{_merchant}' not found in ranks 1-300 this cycle")
+                            # Bybit's own ranking rotates constantly — a
+                            # merchant sitting around rank 249 one moment can
+                            # be past 300 the next. Rather than give up after
+                            # one page, fall back to ranks 301-600 within the
+                            # SAME cycle before concluding they're not there.
+                            logger.info(f"[{label}] Ad Copy (BTC/NGN) Merchant Watch — '{_merchant}' not in ranks 1-300, trying 301-600")
+                            _win_items_600 = await _fetch_market_ads_up_to(
+                                ad_data.get("tokenId",""), ad_data.get("currencyId",""), _side, 600, creds
+                            )
+                            _win_items_301_600 = _win_items_600[300:600]
+                            _search_items = [
+                                it for it in _win_items_301_600
+                                if str(it.get("nickName", "")).strip().lower() == _merchant.lower()
+                            ]
+                            if _search_items:
+                                _merchant_range_used = "301-600"
+                        if not _search_items:
+                            logger.info(f"[{label}] Ad Copy (BTC/NGN) Merchant Watch — '{_merchant}' not found in ranks 1-300 or 301-600 this cycle")
                             await bot.send_message(chat_id=chat_id,
                                 text=(f"⚠️ {prefix}<b>Cycle {cycle}</b> — Merchant <code>{_esc(_merchant)}</code> "
-                                      f"not found in ranks 1-300 right now. Skipping this cycle."),
+                                      f"not found in ranks 1-300 or 301-600 right now. Skipping this cycle."),
                                 parse_mode="HTML")
                             for _ in range(interval_secs):
                                 if not _ad_running(sess, slot_idx): break
@@ -5744,7 +5762,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                     )
                     logger.info(
                         f"[{label}] Ad Copy (BTC/NGN) prefix={_prefix} top_range={_top_range}"
-                        + (f" merchant={_merchant}" if _merchant else "")
+                        + (f" merchant={_merchant} (found in ranks {_merchant_range_used})" if _merchant else "")
                         + f" — fetched {len(_win_items)} item(s)"
                         + (f", {len(_search_items)} from merchant" if _merchant else "")
                         + f", matched price: {_btc_match_price}"
@@ -5791,7 +5809,6 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                             if not _ad_running(sess, slot_idx): break
                             await asyncio.sleep(1)
                         continue
-                    s["close_range_last_price"] = str(_btc_match_price)
                     _quant = Decimal("0.01")   # NGN prices are 2dp, not USDT's 4dp
                     logger.info(
                         f"[{label}] Ad Copy (BTC/NGN) copying rank {_top_range} price {new_p} "
@@ -5886,7 +5903,15 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                             if not _ad_running(sess, slot_idx): break
                             await asyncio.sleep(1)
                         continue
-                    s["ad_copy_last_price"] = str(_chosen_price)
+                    # (ad_copy_last_price is intentionally NOT set here — only
+                    # committed downstream once modify_ad actually confirms
+                    # success. Setting it here unconditionally was the bug:
+                    # a failed post still "remembered" the new price as if it
+                    # had gone live, so every later cycle compared the real
+                    # market price against a price the ad was never actually
+                    # moved to, and kept "confirming" no change was needed
+                    # forever — even though the ad was frozen at its old
+                    # price on Bybit the whole time.)
                     try:
                         new_p = Decimal(_chosen_price)
                     except Exception:
@@ -6219,6 +6244,10 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                 # as confirmation of success.
                 _reset_ad_failures(sess, slot_idx)
                 _set_ad_current_price(sess, slot_idx, new_p)
+                if _is_btc_ngn_ad(ad_data):
+                    s["close_range_last_price"] = str(new_p)
+                elif _is_usdt_usd_ad(ad_data):
+                    s["ad_copy_last_price"] = str(new_p)
                 logger.info(f"[{label}] Cycle {cycle} — 90043 (already at {new_p}) treated as success for Ad Copy, no nudge")
                 await bot.send_message(chat_id=chat_id,
                     text=(
@@ -6362,6 +6391,21 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                 else:
                     _reset_ad_failures(sess, slot_idx)
                     _set_ad_current_price(sess, slot_idx, submit_price)
+                    # Only NOW — after Bybit has confirmed ret_code==0 — do
+                    # we commit the copy-mode "last price" trackers. Doing
+                    # this any earlier (before knowing the post succeeded)
+                    # was the root cause of ad_copy ads permanently freezing:
+                    # a failed/rejected modify would still get remembered as
+                    # if it had gone live, so every later cycle compared the
+                    # real market price against a price the ad was never
+                    # actually moved to, and kept "confirming" no change was
+                    # needed forever while the real ad sat frozen at its old
+                    # price on Bybit.
+                    if mode == "ad_copy":
+                        if _is_btc_ngn_ad(ad_data):
+                            s["close_range_last_price"] = submit_str
+                        elif _is_usdt_usd_ad(ad_data):
+                            s["ad_copy_last_price"] = submit_str
                     await bot.send_message(chat_id=chat_id,
                         text=f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n💲 <code>{submit_str}</code> ({mode.upper()})",
                         parse_mode="HTML")
@@ -9105,6 +9149,28 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
                     InlineKeyboardMarkup(back_section("section_ads"))
                 )
                 return
+            # ── BTC/NGN Ad Copy exclusivity — defense in depth ──
+            # The real gate is at mode-switch time (set_mode_ad_copy), but
+            # that only catches it if the ad's pair was already known AT
+            # THAT moment. A slot switched to ad_copy BEFORE its ad_id was
+            # ever fetched (ad_data empty, so the pair check couldn't run
+            # yet) could slip through and only turn out to be BTC/NGN
+            # later, after a fetch. So re-check here too, right before
+            # actually starting — two BTC/NGN ad_copy loops running
+            # together would both chase the same market list and, worse,
+            # each other's freshly-posted prices, fighting for the same
+            # band.
+            if s.get("mode") == "ad_copy" and _is_btc_ngn_ad(ad_data):
+                _existing_btc_copy = _find_btc_ngn_ad_copy_slot(sess, exclude_slot=slot_idx)
+                if _existing_btc_copy is not None:
+                    await edit_menu(query,
+                        f"⚠️ <b>Cannot start {label}</b>\n\n"
+                        f"<b>{_ad_slot_label(_existing_btc_copy)}</b> is already running Ad Copy for BTC/NGN.\n\n"
+                        f"Only one BTC/NGN Ad Copy ad is allowed at a time — switch "
+                        f"{_ad_slot_label(_existing_btc_copy)} to a different mode first.",
+                        InlineKeyboardMarkup(back_section("section_ads"))
+                    )
+                    return
             mode     = s.get("mode","fixed")
             interval = s.get("interval",2)
             if _ad_running(sess, slot_idx):
