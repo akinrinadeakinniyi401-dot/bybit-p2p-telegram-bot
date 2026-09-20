@@ -592,6 +592,38 @@ async def _fetch_market_ads_up_to(token: str, currency: str, side: str,
     return items[:total]
 
 
+async def _fetch_market_ads_range(token: str, currency: str, side: str,
+                                   start_rank: int, end_rank: int, creds) -> list:
+    """Fetch ONLY the market-ad ranks in [start_rank, end_rank] (1-based,
+    inclusive), using Bybit's own page numbers DIRECTLY rather than always
+    accumulating from page 1 — e.g. ranks 301-600 needs only pages 4-6
+    (3 requests), not 6 requests starting from page 1.
+
+    This is what makes Merchant Watch's sticky-range preference actually
+    fast: once a cycle knows the merchant lives in 301-600, EVERY cycle
+    after that fetches only those 3 pages, not both halves (6 pages)
+    every time — cutting fetch time roughly in half for the common case
+    where the merchant hasn't moved.
+    """
+    PAGE_CAP    = 100
+    first_page  = (start_rank - 1) // PAGE_CAP + 1
+    last_page   = (end_rank   - 1) // PAGE_CAP + 1
+    items: list = []
+    for page in range(first_page, last_page + 1):
+        resp = await asyncio.get_event_loop().run_in_executor(
+            _ad_executor, get_market_ads, token, currency, side, page, PAGE_CAP, creds
+        )
+        page_items = (resp.get("result") or {}).get("items", []) if isinstance(resp, dict) else []
+        items.extend(page_items)
+        if len(page_items) < PAGE_CAP:
+            break   # Bybit ran out of ads before filling the page
+    # `items` currently spans ranks [(first_page-1)*100+1 .. ...] — slice
+    # down to the EXACT window the caller asked for.
+    offset_start = start_rank - ((first_page - 1) * PAGE_CAP) - 1
+    offset_end   = offset_start + (end_rank - start_rank + 1)
+    return items[max(offset_start, 0):offset_end]
+
+
 def _rank_ad_copy_prices(combined: list, top_n: int) -> list:
     """Like _pick_ad_copy_price_windowed but returns up to `top_n` DISTINCT
     non-junk prices, ranked by occurrence count (highest first, ties
@@ -5725,32 +5757,29 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                     if _merchant:
                         # Sticky range preference: once we know which half
                         # (1-300 or 301-600) the merchant is CURRENTLY
-                        # sitting in, check that half FIRST every cycle
-                        # instead of always starting from 1-300. Bybit's
-                        # ranking only shifts gradually, so a merchant that
-                        # was just found in 301-600 is far more likely to
-                        # still be there next cycle than to have jumped back
-                        # to 1-300 — checking the right half first avoids
-                        # needlessly reporting "not in 1-300, trying 301-600"
-                        # every single cycle while they're sitting steady in
-                        # the second half.
+                        # sitting in, fetch and check ONLY that half every
+                        # cycle — via _fetch_market_ads_range, which hits
+                        # Bybit's page numbers directly (e.g. pages 4-6 for
+                        # 301-600) instead of always re-fetching both
+                        # halves (6 pages) every single cycle. Only falls
+                        # back to fetching the OTHER half when the merchant
+                        # isn't in the preferred one any more.
                         _preferred = s.get("merchant_last_range", "1-300")
+                        _tok, _cur = ad_data.get("tokenId",""), ad_data.get("currencyId","")
 
                         if _preferred == "301-600":
-                            _win_items = await _fetch_market_ads_up_to(
-                                ad_data.get("tokenId",""), ad_data.get("currencyId",""), _side, 600, creds
-                            )
-                            _search_items = _match_merchant(_win_items[300:600])
+                            _win_items = await _fetch_market_ads_range(_tok, _cur, _side, 301, 600, creds)
+                            _search_items = _match_merchant(_win_items)
                             if _search_items:
                                 _merchant_range_used = "301-600"
                             else:
-                                _search_items = _match_merchant(_win_items[0:300])
+                                _win_items_1_300 = await _fetch_market_ads_range(_tok, _cur, _side, 1, 300, creds)
+                                _search_items = _match_merchant(_win_items_1_300)
                                 if _search_items:
                                     _merchant_range_used = "1-300"
+                                    _win_items = _win_items_1_300
                         else:
-                            _win_items = await _fetch_market_ads_up_to(
-                                ad_data.get("tokenId",""), ad_data.get("currencyId",""), _side, 300, creds
-                            )
+                            _win_items = await _fetch_market_ads_range(_tok, _cur, _side, 1, 300, creds)
                             _search_items = _match_merchant(_win_items)
                             if _search_items:
                                 _merchant_range_used = "1-300"
@@ -5761,12 +5790,11 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                                 # ranks 301-600 within the SAME cycle before
                                 # concluding they're not there at all.
                                 logger.info(f"[{label}] Ad Copy (BTC/NGN) Merchant Watch — '{_merchant}' not in ranks 1-300, trying 301-600")
-                                _win_items = await _fetch_market_ads_up_to(
-                                    ad_data.get("tokenId",""), ad_data.get("currencyId",""), _side, 600, creds
-                                )
-                                _search_items = _match_merchant(_win_items[300:600])
+                                _win_items_301_600 = await _fetch_market_ads_range(_tok, _cur, _side, 301, 600, creds)
+                                _search_items = _match_merchant(_win_items_301_600)
                                 if _search_items:
                                     _merchant_range_used = "301-600"
+                                    _win_items = _win_items_301_600
 
                         if not _search_items:
                             # Not found in EITHER half this cycle — leave the
@@ -5797,18 +5825,26 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                     )
                     logger.info(
                         f"[{label}] Ad Copy (BTC/NGN) prefix={_prefix} top_range={_top_range}"
-                        + (f" merchant={_merchant} (found in ranks {_merchant_range_used})" if _merchant else "")
-                        + f" — fetched {len(_win_items)} item(s)"
+                        + (f" merchant={_merchant} (checked ranks {_merchant_range_used})" if _merchant else "")
+                        + f" — fetched {len(_win_items)} item(s) in that range"
                         + (f", {len(_search_items)} from merchant" if _merchant else "")
                         + f", matched price: {_btc_match_price}"
                     )
 
                     if not _btc_match_price:
-                        _scope = f"merchant <code>{_esc(_merchant)}</code>'s ads" if _merchant else "ranks 1-300"
+                        if _merchant:
+                            _scope_msg = (
+                                f"Fewer than {_top_range} ad(s) from merchant <code>{_esc(_merchant)}</code> "
+                                f"match prefix <code>{_esc(_prefix)}</code> right now"
+                            )
+                        else:
+                            _scope_msg = (
+                                f"Fewer than {_top_range} BTC/NGN ad(s) in ranks 1-300 "
+                                f"match <code>{_esc(_prefix)}</code> right now"
+                            )
                         await bot.send_message(chat_id=chat_id,
-                            text=(f"⚠️ {prefix}<b>Cycle {cycle}</b> — Fewer than {_top_range} BTC/NGN ad(s) in "
-                                  f"{_scope} match <code>{_esc(_prefix)}</code> right now (Top Range {_top_range} "
-                                  f"needs at least that many matches). Skipping this cycle."),
+                            text=(f"⚠️ {prefix}<b>Cycle {cycle}</b> — {_scope_msg} "
+                                  f"(Top Range {_top_range} needs at least that many matches). Skipping this cycle."),
                             parse_mode="HTML")
                         for _ in range(interval_secs):
                             if not _ad_running(sess, slot_idx): break
@@ -8072,6 +8108,9 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         # 100-150, 150-200, 200-250, 250-300 — same window set for both
         # BTC and USDT.
         RANGE_OPTIONS = [(1, 50), (50, 100), (100, 150), (150, 200), (200, 250), (250, 300)]
+        # BTC/NGN only — extends the manual viewer just past 300, matching
+        # the territory Merchant Watch itself falls back to.
+        EXTENDED_RANGE_OPTIONS_BTC_NGN = [(301, 350), (351, 400)]
         side_override, start_n, end_n, token_override = None, 1, 50, None
         if data.startswith("view_market_ads_"):
             for part in data[len("view_market_ads_"):].split("_"):
@@ -8192,6 +8231,16 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
                     callback_data=f"view_market_ads_s{want_side}_r{a}-{b}_t{want_token}"
                 )
                 for a, b in row_pair
+            ])
+        # Extra ranges beyond 300, BTC/NGN only — matches how deep
+        # Merchant Watch itself searches.
+        if want_token.upper() == "BTC" and want_currency.upper() == "NGN":
+            rows.append([
+                InlineKeyboardButton(
+                    ("✅ " if (a, b) == (start_n, end_n) else "") + f"{a}-{b}",
+                    callback_data=f"view_market_ads_s{want_side}_r{a}-{b}_t{want_token}"
+                )
+                for a, b in EXTENDED_RANGE_OPTIONS_BTC_NGN
             ])
         rows += back_section("section_ads")
         await edit_menu(query, txt, InlineKeyboardMarkup(rows))
