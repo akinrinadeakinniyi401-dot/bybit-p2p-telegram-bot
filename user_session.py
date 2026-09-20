@@ -54,6 +54,10 @@ def _default_settings() -> dict:
         # How many places down the ranked band to copy — 1 = leading
         # (highest) price in the band, 2 = second-highest, 3 = third, etc.
         "top_range": 1,
+        # BTC/NGN Ad Copy only — restrict the Close Price Range match to
+        # ONE specific merchant's ad(s) instead of the whole market.
+        # Empty = no restriction (search the whole market, as before).
+        "merchant_username": "",
     }
 
 
