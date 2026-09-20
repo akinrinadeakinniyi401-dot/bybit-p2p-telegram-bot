@@ -1934,6 +1934,11 @@ def ads_section_keyboard(uid: int = 0):
             rows.append([InlineKeyboardButton(
                 f"🏆 Top Range: {_top_range}", callback_data="set_top_range"
             )])
+            _merchant = (s.get("merchant_username") or "").strip()
+            rows.append([InlineKeyboardButton(
+                f"👤 Merchant Watch: {_merchant}" if _merchant else "👤 Set Merchant Watch",
+                callback_data="set_merchant_watch"
+            )])
             rows.append([InlineKeyboardButton("🔍 View Market Ads List (BTC/NGN)", callback_data="view_market_ads")])
         else:
             _range = s.get("ad_copy_range", "top10")
@@ -5711,19 +5716,45 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                     _win_items = await _fetch_market_ads_up_to(
                         ad_data.get("tokenId",""), ad_data.get("currencyId",""), _side, 300, creds
                     )
+                    _merchant = (s.get("merchant_username") or "").strip()
+                    if _merchant:
+                        # Restrict to just this merchant's ad(s) BEFORE the
+                        # prefix/rank matching below — same digit + Top
+                        # Range rule, just scoped to one seller instead of
+                        # the whole market.
+                        _search_items = [
+                            it for it in _win_items
+                            if str(it.get("nickName", "")).strip().lower() == _merchant.lower()
+                        ]
+                        if not _search_items:
+                            logger.info(f"[{label}] Ad Copy (BTC/NGN) Merchant Watch — '{_merchant}' not found in ranks 1-300 this cycle")
+                            await bot.send_message(chat_id=chat_id,
+                                text=(f"⚠️ {prefix}<b>Cycle {cycle}</b> — Merchant <code>{_esc(_merchant)}</code> "
+                                      f"not found in ranks 1-300 right now. Skipping this cycle."),
+                                parse_mode="HTML")
+                            for _ in range(interval_secs):
+                                if not _ad_running(sess, slot_idx): break
+                                await asyncio.sleep(1)
+                            continue
+                    else:
+                        _search_items = _win_items
                     _top_range = int(s.get("top_range", 1) or 1)
                     _btc_match_price, _btc_match_item = _pick_close_range_price(
-                        _win_items, _prefix, _own_ad_ids, top_range=_top_range
+                        _search_items, _prefix, _own_ad_ids, top_range=_top_range
                     )
                     logger.info(
-                        f"[{label}] Ad Copy (BTC/NGN) prefix={_prefix} top_range={_top_range} — fetched "
-                        f"{len(_win_items)} item(s), matched price: {_btc_match_price}"
+                        f"[{label}] Ad Copy (BTC/NGN) prefix={_prefix} top_range={_top_range}"
+                        + (f" merchant={_merchant}" if _merchant else "")
+                        + f" — fetched {len(_win_items)} item(s)"
+                        + (f", {len(_search_items)} from merchant" if _merchant else "")
+                        + f", matched price: {_btc_match_price}"
                     )
 
                     if not _btc_match_price:
+                        _scope = f"merchant <code>{_esc(_merchant)}</code>'s ads" if _merchant else "ranks 1-300"
                         await bot.send_message(chat_id=chat_id,
                             text=(f"⚠️ {prefix}<b>Cycle {cycle}</b> — Fewer than {_top_range} BTC/NGN ad(s) in "
-                                  f"ranks 1-300 match <code>{_esc(_prefix)}</code> right now (Top Range {_top_range} "
+                                  f"{_scope} match <code>{_esc(_prefix)}</code> right now (Top Range {_top_range} "
                                   f"needs at least that many matches). Skipping this cycle."),
                             parse_mode="HTML")
                         for _ in range(interval_secs):
@@ -7896,6 +7927,32 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             InlineKeyboardMarkup(back_section("section_ads"))
         )
 
+    # ── 👤 Set Merchant Watch (BTC/NGN Ad Copy) ──
+    elif data == "set_merchant_watch":
+        sess = _s(tuser.id)
+        slot_idx = sess.editing_slot
+        s = _ad_settings(sess, slot_idx)
+        ad_data = _ad_data_of(sess, slot_idx)
+        if not _is_btc_ngn_ad(ad_data):
+            await query.answer("Merchant Watch is for BTC/NGN Ad Copy ads only.", show_alert=True)
+            return
+        _btn_state["action"]       = "merchant_watch"
+        _btn_state["prev_section"] = "section_ads"
+        _cur = (s.get("merchant_username") or "").strip() or "— not set, whole market —"
+        await edit_menu(query,
+            f"👤 <b>Merchant Watch — {_ad_slot_label(slot_idx)}</b>\n\n"
+            f"Current: <code>{_esc(_cur)}</code>\n\n"
+            f"Send the exact Bybit nickname of the merchant to track.\n\n"
+            f"Once set, each cycle the bot fetches BTC/NGN market ads (ranks 1-300), keeps ONLY "
+            f"that merchant's ad(s), then matches your Close Price Range digits against them and "
+            f"copies whichever one sits at your Top Range position — the same rule as before, just "
+            f"restricted to this one merchant instead of the whole market.\n\n"
+            f"If the merchant isn't found that cycle, the bot skips and waits for the next one. "
+            f"If the price hasn't changed, it also skips — only a genuine change gets copied.\n\n"
+            f"Send <code>clear</code> to remove the restriction and go back to watching the whole market.",
+            InlineKeyboardMarkup(back_section("section_ads"))
+        )
+
     # ── 🎯 Set Close Price Range (BTC/NGN Ad Copy) ──
     elif data == "set_close_price_range":
         sess = _s(tuser.id)
@@ -9738,6 +9795,36 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ <b>{_ad_slot_label(slot_idx)} Top Range saved!</b>\n\n"
             f"Now copying the <b>{_ordinal}</b> price within the Close Price Range band."
         )
+
+    elif action == "merchant_watch":
+        sess = _s(uid)
+        slot_idx = sess.editing_slot
+        s = _ad_settings(sess, slot_idx)
+        cleared = text.strip().lower() in ("0", "clear", "none", "reset")
+        if cleared:
+            s["merchant_username"] = ""
+            _save_settings(uid)
+            _state["action"] = None
+            await reply_with_back(
+                f"✅ <b>{_ad_slot_label(slot_idx)} Merchant Watch cleared</b> — "
+                f"back to watching the whole market."
+            )
+        else:
+            nick = text.strip()
+            if not nick or len(nick) > 64:
+                await update.message.reply_text(
+                    "❌ Send a valid nickname (1-64 characters), or <code>clear</code> to remove it.",
+                    parse_mode="HTML"
+                )
+                return
+            s["merchant_username"] = nick
+            _save_settings(uid)   # persists to DB, so it survives redeploy + Auto Resume Agent
+            _state["action"] = None
+            await reply_with_back(
+                f"✅ <b>{_ad_slot_label(slot_idx)} Merchant Watch saved!</b>\n\n"
+                f"Now only tracking ad(s) from <code>{_esc(nick)}</code>, matched against your "
+                f"Close Price Range and Top Range settings."
+            )
 
     elif action == "close_price_range":
         digits = text.strip().replace(",", "").replace(".", "")
