@@ -8110,7 +8110,14 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         RANGE_OPTIONS = [(1, 50), (50, 100), (100, 150), (150, 200), (200, 250), (250, 300)]
         # BTC/NGN only — extends the manual viewer just past 300, matching
         # the territory Merchant Watch itself falls back to.
-        EXTENDED_RANGE_OPTIONS_BTC_NGN = [(301, 350), (351, 400)]
+        # BTC/NGN only — extends the manual viewer well past 300, up to
+        # Bybit's 900-deep territory, in the same 50-item windows as the
+        # rest of the viewer.
+        EXTENDED_RANGE_OPTIONS_BTC_NGN = [
+            (301, 350), (351, 400), (401, 450), (451, 500),
+            (501, 550), (551, 600), (601, 650), (651, 700),
+            (701, 750), (751, 800), (801, 850), (851, 900),
+        ]
         side_override, start_n, end_n, token_override = None, 1, 50, None
         if data.startswith("view_market_ads_"):
             for part in data[len("view_market_ads_"):].split("_"):
@@ -8233,15 +8240,18 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 for a, b in row_pair
             ])
         # Extra ranges beyond 300, BTC/NGN only — matches how deep
-        # Merchant Watch itself searches.
+        # Merchant Watch itself searches. 3 per row, same style as the
+        # base RANGE_OPTIONS above.
         if want_token.upper() == "BTC" and want_currency.upper() == "NGN":
-            rows.append([
-                InlineKeyboardButton(
-                    ("✅ " if (a, b) == (start_n, end_n) else "") + f"{a}-{b}",
-                    callback_data=f"view_market_ads_s{want_side}_r{a}-{b}_t{want_token}"
-                )
-                for a, b in EXTENDED_RANGE_OPTIONS_BTC_NGN
-            ])
+            for i in range(0, len(EXTENDED_RANGE_OPTIONS_BTC_NGN), 3):
+                row_pair = EXTENDED_RANGE_OPTIONS_BTC_NGN[i:i+3]
+                rows.append([
+                    InlineKeyboardButton(
+                        ("✅ " if (a, b) == (start_n, end_n) else "") + f"{a}-{b}",
+                        callback_data=f"view_market_ads_s{want_side}_r{a}-{b}_t{want_token}"
+                    )
+                    for a, b in row_pair
+                ])
         rows += back_section("section_ads")
         await edit_menu(query, txt, InlineKeyboardMarkup(rows))
 
