@@ -1,4 +1,5 @@
 import asyncio
+import os
 import random
 import json
 import re
@@ -48,6 +49,19 @@ import media_downloader as mediadl
 from config import REFERRAL_REWARD_NGN, BOT_OWNER_USERNAME, MIN_WITHDRAWAL_NGN, PUBLIC_BASE_URL
 
 logger = logging.getLogger(__name__)
+
+# ─────────────────────────────────────────
+# ⏳ Browserbase Market mode — cold-start grace period
+# ─────────────────────────────────────────
+# market_collector.py closes its shared Browserbase session the instant
+# demand hits zero (to conserve the free plan's hour budget), so every
+# start/restart of a browserbase_market ad pays a real ~10-15s cold start:
+# new session create + CDP connect + page nav + first Bybit XHR. That is
+# normal, not an error, so we don't alarm the user with a Telegram warning
+# during this window — instead we poll quickly and quietly until either
+# the price is ready or the grace period itself runs out.
+BB_WARMUP_GRACE_SECONDS = int(os.getenv("BB_WARMUP_GRACE_SECONDS", "20") or 20)
+BB_WARMUP_POLL_SECONDS  = 2
 
 # ─────────────────────────────────────────
 # 🖼️ Welcome banner image
@@ -6104,6 +6118,21 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
 
                 snap = get_market_snapshot(_pair_key)
                 if snap["status"] != "ok" or snap["latest_price"] is None:
+                    # Cold start is normal here: a fresh Browserbase session +
+                    # page nav + first Bybit response genuinely takes a few
+                    # seconds, and market_collector.py only just opened one
+                    # because register_demand() was called above. Within the
+                    # grace window we poll quietly and quickly instead of
+                    # sending a Telegram warning for something that's about
+                    # to resolve on its own.
+                    _elapsed = snap.get("starting_elapsed_secs")
+                    if snap["status"] == "starting" and _elapsed is not None \
+                            and _elapsed < BB_WARMUP_GRACE_SECONDS:
+                        for _ in range(BB_WARMUP_POLL_SECONDS):
+                            if not _ad_running(sess, slot_idx): break
+                            await asyncio.sleep(1)
+                        continue
+
                     _err_note = f" ({_esc(str(snap['last_error']))})" if snap.get("last_error") else ""
                     await bot.send_message(chat_id=chat_id,
                         text=(f"⚠️ {prefix}<b>Cycle {cycle}</b> — Browserbase market price not "
