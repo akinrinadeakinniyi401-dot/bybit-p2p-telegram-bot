@@ -111,6 +111,9 @@ def _empty_snapshot() -> dict:
         "fetched_at":          None,
         "last_error":          None,
         "status":              _STATUS_IDLE,
+        "since_mono":          None,   # time.monotonic() when this pair entered
+                                        # 'starting' — lets callers tell a normal
+                                        # cold-start apart from a stuck session
     }
 
 
@@ -158,19 +161,33 @@ def get_market_snapshot(pair_key: str) -> dict:
     (never raises). status is one of 'idle' | 'starting' | 'ok' | 'error'.
     'idle' means nobody has asked for this pair yet this run — reading it
     is itself harmless; register_demand() (done automatically by
-    auto_update_loop) is what actually wakes the collector up."""
+    auto_update_loop) is what actually wakes the collector up.
+
+    When status is 'starting', the returned dict also carries
+    'starting_elapsed_secs' — how long this pair has been warming up —
+    so a caller can tell a normal ~10-15s cold start (new Browserbase
+    session + page nav + first Bybit response) apart from something
+    that's actually stuck."""
     with _lock:
         snap = _snapshots.get(pair_key)
         if snap is None:
-            return _empty_snapshot()
-        return dict(snap)   # shallow copy — callers never mutate shared state
+            snap = _empty_snapshot()
+        else:
+            snap = dict(snap)   # shallow copy — callers never mutate shared state
+    since_mono = snap.get("since_mono")
+    snap["starting_elapsed_secs"] = (
+        (time.monotonic() - since_mono)
+        if (snap.get("status") == _STATUS_STARTING and since_mono is not None)
+        else None
+    )
+    return snap
 
 
 def _set_snapshot_starting(pair_key: str):
     with _lock:
         prev = _snapshots.get(pair_key, _empty_snapshot())
         if prev["status"] == _STATUS_IDLE:
-            _snapshots[pair_key] = {**prev, "status": _STATUS_STARTING}
+            _snapshots[pair_key] = {**prev, "status": _STATUS_STARTING, "since_mono": time.monotonic()}
 
 
 def _set_snapshot_ok(pair_key: str, price: Decimal, ad_id, nickname):
@@ -253,8 +270,32 @@ def _release_browserbase_session(session_id: str):
 async def _scrape_pair(browser, pair_key: str, cfg: dict):
     """Runs the verified 12-step workflow for one pair using an already-
     connected Browserbase browser, and writes the result into the shared
-    snapshot cache."""
+    snapshot cache.
+
+    Also measures the actual network bytes this one scrape cycle pulls
+    down (page navigation + every subresource + the Bybit XHR itself),
+    purely for bandwidth accounting — e.g. sizing a switch to a
+    bandwidth-billed (GB-based) hosting/proxy service instead of
+    Browserbase's hour-based free plan. This is a real, response-header
+    based measurement, not an estimate of Browserbase's own metering."""
     page = await browser.new_page()
+    _bw = {"bytes": 0, "responses": 0, "no_content_length": 0}
+
+    def _on_response(resp):
+        _bw["responses"] += 1
+        try:
+            cl = resp.headers.get("content-length")
+            if cl is not None:
+                _bw["bytes"] += int(cl)
+            else:
+                # Chunked/streamed responses (common for XHR/JSON) often
+                # omit content-length — counted separately below instead
+                # of silently under-reporting them.
+                _bw["no_content_length"] += 1
+        except Exception:
+            pass
+
+    page.on("response", _on_response)
     try:
         await page.goto(cfg["url"], wait_until="domcontentloaded", timeout=45000)
 
@@ -281,6 +322,16 @@ async def _scrape_pair(browser, pair_key: str, cfg: dict):
         ad_id = top.get("id")
         nickname = top.get("nickName")
 
+        # The Bybit XHR is the one response we already hold a reference
+        # to — if it had no content-length header, get its exact wire
+        # size directly from the body Playwright already buffered
+        # (no extra network round-trip; the bytes are already in memory).
+        if not response.headers.get("content-length"):
+            try:
+                _bw["bytes"] += len(await response.body())
+            except Exception:
+                pass
+
         _set_snapshot_ok(pair_key, price, ad_id, nickname)
         logger.info(
             f"[MarketCollector] {pair_key} refreshed — price={price} "
@@ -290,6 +341,15 @@ async def _scrape_pair(browser, pair_key: str, cfg: dict):
         _set_snapshot_error(pair_key, str(e))
         logger.warning(f"[MarketCollector] {pair_key} refresh failed: {e}")
     finally:
+        page.remove_listener("response", _on_response)
+        _mb = _bw["bytes"] / (1024 * 1024)
+        logger.info(
+            f"[MarketCollector] {pair_key} bandwidth this cycle ≈ {_bw['bytes']} bytes "
+            f"(~{_mb:.3f} MB) across {_bw['responses']} responses "
+            f"({_bw['no_content_length']} without a content-length header, "
+            "measured directly for the Bybit XHR only — others are a floor, "
+            "not exact)"
+        )
         await page.close()
 
 
