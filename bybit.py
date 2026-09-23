@@ -23,6 +23,7 @@ import json
 import logging
 import uuid
 import os
+import threading
 from decimal import Decimal
 from config import BYBIT_ACCOUNTS
 
@@ -203,19 +204,76 @@ def get_min_price_gap(currency_id: str, token_id: str = "", reference_price=None
 # existing per-user Permanent IP proxy mechanism (_resolve_proxies) is
 # still honored, so a user with an approved fixed-IP proxy uses it here
 # too, exactly like every other call in this file.
-WEB_MARKETPLACE_URL = "https://www.bybit.com/x-api/fiat/otc/item/online"
+#
+# WHY THIS NEEDS MORE THAN JUST A JSON POST:
+# The original capture came from a real Chromium/Playwright session — the
+# browser had first LOADED the OTC page itself (picking up whatever
+# CDN/bot-management cookies bybit.com's edge sets on a normal page visit:
+# Cloudflare-style __cf_bm/cf_clearance or Akamai-style bm_sz/ak_bmsc are
+# the usual suspects), and every fetch() call it made afterward carried
+# the browser's full header set (sec-ch-ua / sec-fetch-* / Accept-Language)
+# plus those cookies. A bare `requests.post()` with only Content-Type/
+# Accept/User-Agent has none of that — no cookies, no sec-fetch-* — which
+# is exactly the shape of request bybit.com's edge tends to 403. This
+# module now reproduces both pieces:
+#   1. A realistic full browser header set on every request.
+#   2. A one-time "warm-up" GET against the real OTC page first, so the
+#      session picks up whatever cookies the edge wants to see on the
+#      following POST — re-run periodically (cookies expire) and
+#      immediately on a 403 (session likely expired) before one retry.
+# This is NOT guaranteed to defeat every bot-detection signal a real
+# browser satisfies (e.g. TLS/JA3 fingerprint, which `requests` can't
+# spoof) — if 403s persist after this, the most likely remaining cause is
+# Render's outbound IP itself being in a datacenter range bybit.com's edge
+# blocks outright, independent of headers/cookies. The existing per-user
+# proxy plumbing (_resolve_proxies/BYBIT_PROXY_URL) already lets this
+# route through a different IP the same way every other call in this file
+# does — pointing it at a residential/non-datacenter proxy would be the
+# next lever to pull if the diagnostics below keep showing blocked_403.
+WEB_MARKETPLACE_URL      = "https://www.bybit.com/x-api/fiat/otc/item/online"
+WEB_MARKETPLACE_PAGE_URL = "https://www.bybit.com/fiat/trade/otc/buy/USDT/NGN"
 
-_WEB_MARKETPLACE_HEADERS = {
-    "Content-Type": "application/json;charset=UTF-8",
-    "Accept":       "application/json",
+_WEB_COMMON_HEADERS = {
     "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
-    "Origin":  "https://www.bybit.com",
-    "Referer": "https://www.bybit.com/fiat/trade/otc/",
+    "Accept-Language": "en-US,en;q=0.9",
+    "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+}
+
+# Headers for the warm-up GET (a normal top-level page navigation).
+_WEB_PAGE_HEADERS = {
+    **_WEB_COMMON_HEADERS,
+    "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+               "image/avif,image/webp,*/*;q=0.8"),
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Dest": "document",
+    "Upgrade-Insecure-Requests": "1",
+}
+
+# Headers for the actual API POST (an XHR/fetch made FROM that page).
+_WEB_API_HEADERS = {
+    **_WEB_COMMON_HEADERS,
+    "Content-Type": "application/json;charset=UTF-8",
+    "Accept":        "application/json, text/plain, */*",
+    "Origin":        "https://www.bybit.com",
+    "Referer":       WEB_MARKETPLACE_PAGE_URL,
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Dest": "empty",
 }
 
 _web_marketplace_session = requests.Session()
-_web_marketplace_session.headers.update(_WEB_MARKETPLACE_HEADERS)
+
+# Re-warm (re-fetch the real page to refresh CDN cookies) at most this
+# often on a normal schedule — cheap insurance against cookies quietly
+# expiring mid-session ("expired session" case below) — plus always
+# immediately after a 403, regardless of this timer.
+_WEB_SESSION_REWARM_SECS = 20 * 60
+_web_session_primed_at   = 0.0
+_web_session_lock        = threading.Lock()
 
 # Floor for the "Rank #1 Web Copy" ad mode's polling interval. This mode
 # only ever WRITES to Bybit (a modify_ad call) when the fetched Rank #1
@@ -224,6 +282,38 @@ _web_marketplace_session.headers.update(_WEB_MARKETPLACE_HEADERS)
 # tighter floor than the normal 2-minute one is safe here, for BOTH
 # BTC/NGN and USDT/USD.
 MIN_WEB_COPY_INTERVAL_SECONDS = 5
+
+
+def _warm_web_marketplace_session(creds: dict | None = None, force: bool = False) -> tuple[bool, str]:
+    """GET the real OTC page once to pick up whatever CDN/bot-management
+    cookies bybit.com's edge sets on a normal page visit, into the SAME
+    session the POST below reuses — mirroring what the original Chromium
+    capture did before it ever called the API. Thread-safe (multiple ad
+    slots can call get_web_marketplace_rank1 concurrently via the shared
+    executor) and cheap to skip when already warm — only actually fetches
+    when forced (called right after a 403) or the last warm-up has aged
+    past _WEB_SESSION_REWARM_SECS.
+
+    Returns (ok, diagnostic_str) — diagnostic_str is for logs only.
+    """
+    global _web_session_primed_at
+    with _web_session_lock:
+        age = time.monotonic() - _web_session_primed_at
+        if not force and age < _WEB_SESSION_REWARM_SECS:
+            return True, f"session already warm ({age:.0f}s old)"
+        try:
+            resp = _web_marketplace_session.get(
+                WEB_MARKETPLACE_PAGE_URL, headers=_WEB_PAGE_HEADERS,
+                timeout=10, proxies=_resolve_proxies(creds),
+            )
+        except requests.exceptions.Timeout:
+            return False, "warm-up GET timed out (network)"
+        except requests.exceptions.RequestException as e:
+            return False, f"warm-up GET network error: {e}"
+        _web_session_primed_at = time.monotonic()
+        cookie_names = sorted(_web_marketplace_session.cookies.keys())
+        return True, (f"warm-up GET HTTP {resp.status_code}, "
+                      f"{len(cookie_names)} cookie(s) set: {cookie_names}")
 
 
 def get_web_marketplace_rank1(token_id: str, currency_id: str, side: str = "0",
@@ -242,8 +332,19 @@ def get_web_marketplace_rank1(token_id: str, currency_id: str, side: str = "0",
 
     Returns:
         {"ok": True,  "price": "<str>", "item": {...raw Bybit item...}}
-        {"ok": False, "error": "<human-readable reason>"}
+        {"ok": False, "error": "<short reason, safe to show a user>",
+                       "error_category": "<one of: network | timeout |
+                       blocked_403 | http_error | invalid_response |
+                       api_error | empty_result>"}
+
+    Every failure path also logger.warning()'s a fuller diagnostic line
+    (status code, response headers of interest, a short body snippet,
+    cookie/session state) — that detail is for Render logs ONLY and is
+    never included in what's returned here, so callers can't accidentally
+    forward it to an end user.
     """
+    _warm_web_marketplace_session(creds=creds)   # no-op if already warm
+
     body = {
         "userId":             "",
         "tokenId":            str(token_id).upper(),
@@ -265,35 +366,76 @@ def get_web_marketplace_rank1(token_id: str, currency_id: str, side: str = "0",
         "countryCode":        "",
         "tradeWith":          False,
     }
-    try:
-        resp = _web_marketplace_session.post(
-            WEB_MARKETPLACE_URL, json=body, timeout=10,
-            proxies=_resolve_proxies(creds),
+    pair_label = f"{body['tokenId']}/{body['currencyId']}"
+
+    def _do_post():
+        return _web_marketplace_session.post(
+            WEB_MARKETPLACE_URL, json=body, headers=_WEB_API_HEADERS,
+            timeout=10, proxies=_resolve_proxies(creds),
         )
+
+    try:
+        resp = _do_post()
     except requests.exceptions.Timeout:
-        return {"ok": False, "error": "Request timed out"}
-    except Exception as e:
-        logger.error(f"[Bybit] Web marketplace fetch error: {e}")
-        return {"ok": False, "error": str(e)}
+        logger.warning(f"[WebRank1] {pair_label} — TIMEOUT (network) after 10s")
+        return {"ok": False, "error": "Request timed out", "error_category": "timeout"}
+    except requests.exceptions.RequestException as e:
+        logger.warning(f"[WebRank1] {pair_label} — NETWORK error: {type(e).__name__}: {e}")
+        return {"ok": False, "error": "Network error reaching Bybit", "error_category": "network"}
+
+    if resp.status_code == 403:
+        # Most likely an expired/never-primed session (missing or stale
+        # CDN cookies) — force a fresh warm-up and retry exactly once
+        # before giving up. If it 403s again right after a fresh warm-up,
+        # that's a much stronger signal of outright IP/fingerprint
+        # blocking rather than a simple expired cookie.
+        ok_warm, warm_diag = _warm_web_marketplace_session(creds=creds, force=True)
+        logger.warning(
+            f"[WebRank1] {pair_label} — HTTP 403 on first attempt "
+            f"(cf-ray={resp.headers.get('cf-ray','—')} server={resp.headers.get('server','—')}) "
+            f"— forcing session re-warm ({warm_diag}) and retrying once"
+        )
+        if ok_warm:
+            try:
+                resp = _do_post()
+            except requests.exceptions.Timeout:
+                logger.warning(f"[WebRank1] {pair_label} — TIMEOUT (network) on 403-retry")
+                return {"ok": False, "error": "Request timed out", "error_category": "timeout"}
+            except requests.exceptions.RequestException as e:
+                logger.warning(f"[WebRank1] {pair_label} — NETWORK error on 403-retry: {type(e).__name__}: {e}")
+                return {"ok": False, "error": "Network error reaching Bybit", "error_category": "network"}
 
     if resp.status_code != 200:
-        return {"ok": False, "error": f"HTTP {resp.status_code}"}
+        snippet = (resp.text or "")[:300].replace("\n", " ")
+        logger.warning(
+            f"[WebRank1] {pair_label} — HTTP {resp.status_code} "
+            f"(cf-ray={resp.headers.get('cf-ray','—')} server={resp.headers.get('server','—')} "
+            f"cookies={sorted(_web_marketplace_session.cookies.keys())}) body[:300]={snippet!r}"
+        )
+        category = "blocked_403" if resp.status_code == 403 else "http_error"
+        return {"ok": False, "error": f"HTTP {resp.status_code}", "error_category": category}
 
     try:
         data = resp.json()
     except Exception as e:
-        return {"ok": False, "error": f"JSON error: {e}"}
+        snippet = (resp.text or "")[:300].replace("\n", " ")
+        logger.warning(f"[WebRank1] {pair_label} — JSON parse failed: {e} — body[:300]={snippet!r}")
+        return {"ok": False, "error": "Unreadable response from Bybit", "error_category": "invalid_response"}
 
     ret_code = data.get("ret_code", data.get("retCode", -1))
     if ret_code != 0:
-        return {"ok": False, "error": str(data.get("ret_msg", data.get("retMsg", "Unknown error")))}
+        ret_msg = str(data.get("ret_msg", data.get("retMsg", "Unknown error")))
+        logger.warning(f"[WebRank1] {pair_label} — API ret_code={ret_code} ret_msg={ret_msg!r}")
+        return {"ok": False, "error": "Bybit rejected the request", "error_category": "api_error"}
 
     items = ((data.get("result") or {}).get("items")) or []
     for item in items:
         price = str(item.get("price", "") or "").strip()
         if price:
             return {"ok": True, "price": price, "item": item}
-    return {"ok": False, "error": "No valid items returned"}
+    logger.warning(f"[WebRank1] {pair_label} — 200 OK but 0 usable items "
+                   f"(result.count={((data.get('result') or {}).get('count'))})")
+    return {"ok": False, "error": "No valid items returned", "error_category": "empty_result"}
 
 
 # ─────────────────────────────────────────
