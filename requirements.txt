@@ -7,4 +7,3 @@ paga-business-client
 openpyxl
 yt-dlp
 imageio-ffmpeg
-playwright==1.56.0
