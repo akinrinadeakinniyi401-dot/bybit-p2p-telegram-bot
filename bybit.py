@@ -319,9 +319,19 @@ def _warm_web_marketplace_session(creds: dict | None = None, force: bool = False
 def get_web_marketplace_rank1(token_id: str, currency_id: str, side: str = "0",
                                creds: dict | None = None) -> dict:
     """
+    ⚠️ SUPERSEDED for production use by web_marketplace.fetch_rank1()
+    (browser-backed, via a persistent Playwright/Chromium session) — bot.py's
+    'web_copy' ad mode calls that instead. Confirmed in production that
+    Bybit's edge (Akamai) 403s this plain server-side requests.post(),
+    regardless of how browser-like its headers/cookies are made — the
+    endpoint only actually works when the request is issued from inside
+    a real browser page. Left here for reference / as a manual diagnostic
+    (e.g. `python -c "import bybit; print(bybit.get_web_marketplace_rank1('BTC','NGN'))"`
+    is a quick way to check from a shell whether Bybit has relaxed this
+    for a given IP) — do not wire this back into the scheduled loop.
+
     Fetch Bybit's WEB marketplace listing for (token_id, currency_id) and
-    return ONLY the Rank #1 (first valid) item's price. Powers the
-    'web_copy' ad mode exclusively — never used by any other mode.
+    return ONLY the Rank #1 (first valid) item's price.
 
     The request body mirrors exactly what bybit.com's own P2P page sends,
     including leaving "amount" empty (a non-empty amount was observed to
