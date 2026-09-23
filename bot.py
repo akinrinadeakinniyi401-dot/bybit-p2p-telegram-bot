@@ -31,6 +31,11 @@ from bybit import (
     get_min_price_gap,
 )
 from fraud_check import check_buyer_name, load_scammers, get_scammer_count, get_last_updated
+from market_collector import (
+    get_market_snapshot, browserbase_pair_key, start_market_collector,
+    register_demand as _bb_register_demand,
+    unregister_demand as _bb_unregister_demand,
+)
 import db
 import subscription as sub
 from admin_commands import (
@@ -960,7 +965,7 @@ def _interval_floor_secs(s: dict, ad_data: dict):
     """
     if _is_usdt_usd_ad(ad_data):
         return bybit.MIN_USDT_INTERVAL_SECONDS
-    if _is_btc_ngn_ad(ad_data) and s.get("mode") == "ad_copy":
+    if _is_btc_ngn_ad(ad_data) and s.get("mode") in ("ad_copy", "browserbase_market"):
         return bybit.MIN_BTC_NGN_ADCOPY_INTERVAL_SECONDS
     return None
 
@@ -5693,12 +5698,22 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
         return
 
     cycle = 0
-    while _ad_running(sess, slot_idx):
+    try:
+      while _ad_running(sess, slot_idx):
         try:
             cycle += 1
             now  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             mode = s.get("mode","fixed")
             prefix = f"[{label}] " if sess.total_ad_slots() > 1 else ""
+
+            # Demand for the shared Browserbase collector is driven purely
+            # off this registry (see market_collector.py) — default to
+            # "not currently wanting it" every cycle; the browserbase_market
+            # branch below re-registers it the moment it knows this cycle's
+            # pair. This keeps the collector idle (zero Browserbase usage)
+            # the instant every ad using this mode is stopped or switched
+            # to something else, without needing to hook every stop path.
+            _bb_unregister_demand(chat_id, slot_idx)
 
             if mode == "fixed":
                 new_p    = _ad_current_price(sess, slot_idx) + increment
@@ -6057,6 +6072,56 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                             await asyncio.sleep(1)
                         continue
 
+            elif mode == "browserbase_market":
+                # ── Browserbase Market Price mode (BTC/NGN + USDT/USD only) ──
+                # Every edit reads the shared Rank #1 snapshot that
+                # market_collector.py's background loop refreshes — this
+                # loop never talks to Browserbase itself, never scrapes
+                # Bybit's website, and never touches bybit.get_market_ads.
+                # It only reads the cache and, further below, calls the
+                # SAME existing modify_ad() path every other mode uses.
+                _pair_key = browserbase_pair_key(ad_data.get("tokenId",""), ad_data.get("currencyId",""))
+                if _pair_key:
+                    # This is what actually wakes the shared collector up
+                    # (or keeps it awake) — see market_collector.py's
+                    # demand registry. Registered BEFORE the "not ready
+                    # yet" check below so the very first cycle after a
+                    # user starts this mode already triggers the
+                    # collector to open a session, instead of waiting a
+                    # full extra cycle.
+                    _bb_register_demand(chat_id, slot_idx, _pair_key)
+                if not _pair_key:
+                    await bot.send_message(chat_id=chat_id,
+                        text=(
+                            f"❌ <b>{label} Browserbase Market mode stopped</b>\n\n"
+                            "This mode only supports BTC/NGN and USDT/USD ads.\n"
+                            "Switch this ad to a different mode, or point it at one of those pairs."
+                        ),
+                        parse_mode="HTML")
+                    _set_ad_running(sess, slot_idx, False)
+                    _set_ad_task(sess, slot_idx, None)
+                    return
+
+                snap = get_market_snapshot(_pair_key)
+                if snap["status"] != "ok" or snap["latest_price"] is None:
+                    _err_note = f" ({_esc(str(snap['last_error']))})" if snap.get("last_error") else ""
+                    await bot.send_message(chat_id=chat_id,
+                        text=(f"⚠️ {prefix}<b>Cycle {cycle}</b> — Browserbase market price not "
+                              f"ready yet (status: {snap['status']}){_err_note}. Skipping this cycle."),
+                        parse_mode="HTML")
+                    for _ in range(interval_secs):
+                        if not _ad_running(sess, slot_idx): break
+                        await asyncio.sleep(1)
+                    continue
+
+                new_p  = snap["latest_price"]
+                _quant = Decimal("0.01") if _pair_key == "USDT_USD" else Decimal("0.01")
+                chase_ceiling = False   # not applicable — this mode always targets a specific real price
+                logger.info(
+                    f"[{label}] Browserbase Market ({_pair_key}) rank #1 price {new_p} "
+                    f"from {snap.get('latest_nickname','?')} (fetched_at={snap.get('fetched_at')})"
+                )
+
             else:
                 try:
                     float_pct = float(s.get("float_pct") or 0)
@@ -6104,7 +6169,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
             # were silently burning through this ad's modify-rate budget,
             # which then made LATER cycles appear to "do nothing" while they
             # were actually just waiting for that budget to free up.
-            if sess.total_ad_slots() > 1 and mode != "ad_copy":
+            if sess.total_ad_slots() > 1 and mode not in ("ad_copy", "browserbase_market"):
                 new_p, _cycle_collided = _resolve_price_collision(
                     sess, slot_idx,
                     ad_data.get("currencyId",""), ad_data.get("tokenId",""),
@@ -6303,23 +6368,24 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                         return
 
 
-            elif ret_code == 90043 and mode == "ad_copy":
+            elif ret_code == 90043 and mode in ("ad_copy", "browserbase_market"):
                 # For every OTHER mode this means "the computed price
                 # happens to round to what's already live — nudge off it".
-                # For Ad Copy it means something different and much
-                # simpler: the ad is ALREADY sitting at the exact market
-                # price we just discovered and tried to (re)post. That's
-                # not a problem to nudge away from — nudging here would
-                # actively move this ad OFF the real market price it's
-                # supposed to be mirroring, for no reason at all. Treat it
-                # as confirmation of success.
+                # For Ad Copy (and, for the same reason, Browserbase Market)
+                # it means something different and much simpler: the ad is
+                # ALREADY sitting at the exact market price we just
+                # discovered and tried to (re)post. That's not a problem to
+                # nudge away from — nudging here would actively move this ad
+                # OFF the real market price it's supposed to be mirroring,
+                # for no reason at all. Treat it as confirmation of success.
                 _reset_ad_failures(sess, slot_idx)
                 _set_ad_current_price(sess, slot_idx, new_p)
-                if _is_btc_ngn_ad(ad_data):
-                    s["close_range_last_price"] = str(new_p)
-                elif _is_usdt_usd_ad(ad_data):
-                    s["ad_copy_last_price"] = str(new_p)
-                logger.info(f"[{label}] Cycle {cycle} — 90043 (already at {new_p}) treated as success for Ad Copy, no nudge")
+                if mode == "ad_copy":
+                    if _is_btc_ngn_ad(ad_data):
+                        s["close_range_last_price"] = str(new_p)
+                    elif _is_usdt_usd_ad(ad_data):
+                        s["ad_copy_last_price"] = str(new_p)
+                logger.info(f"[{label}] Cycle {cycle} — 90043 (already at {new_p}) treated as success for {mode}, no nudge")
                 await bot.send_message(chat_id=chat_id,
                     text=(
                         f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n"
@@ -6535,6 +6601,15 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                 exc_info=True
             )
             await asyncio.sleep(2)   # brief backoff so a persistent error can't hot-loop
+    finally:
+        # Always release this slot's Browserbase demand registration when
+        # the loop stops — however it stops (normal stop, auto-stop after
+        # repeated failures, cancellation, or an unexpected crash) — so a
+        # slot that was using browserbase_market mode can never leave a
+        # phantom "still active" entry behind that would keep the shared
+        # collector's Browserbase session open (and burning the free
+        # plan's monthly hour budget) after nothing is actually using it.
+        _bb_unregister_demand(chat_id, slot_idx)
 
     logger.info(f"🛑 PRICE LOOP STOPPED ({label}) for user {chat_id}")
 
@@ -7959,6 +8034,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         ]
         if is_usdt_usd or is_btc_ngn:
             rows.append([InlineKeyboardButton(("✅ " if cur_mode == "ad_copy" else "") + "🪞 Ad Copy", callback_data="set_mode_ad_copy")])
+            rows.append([InlineKeyboardButton(("✅ " if cur_mode == "browserbase_market" else "") + "🌐 Browserbase Market", callback_data="set_mode_browserbase_market")])
         rows += back_section("section_ads")
         txt = (
             f"🔀 <b>{_ad_slot_label(slot_idx)} — Choose Mode</b>\n\n"
@@ -7973,9 +8049,15 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 "market ad sharing it (BTC/NGN).\n\n"
                 "<i>Only one ad on the bot can use Ad Copy for BTC/NGN at a time.</i>\n"
             )
+        if is_usdt_usd or is_btc_ngn:
+            txt += (
+                "🌐 <b>Browserbase Market</b> — every edit copies Bybit's live Rank #1 "
+                f"{'BTC/NGN' if is_btc_ngn else 'USDT/USD'} price, read from a shared browser-based "
+                "price feed (BTC/NGN and USDT/USD only).\n"
+            )
         await edit_menu(query, txt, InlineKeyboardMarkup(rows))
 
-    elif data in ("set_mode_fixed", "set_mode_floating", "set_mode_ad_copy"):
+    elif data in ("set_mode_fixed", "set_mode_floating", "set_mode_ad_copy", "set_mode_browserbase_market"):
         sess = _s(tuser.id)
         slot_idx = sess.editing_slot
         if slot_idx in (-2, -3):
@@ -7984,6 +8066,13 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         s = _ad_settings(sess, slot_idx)
         ad_data = _ad_data_of(sess, slot_idx)
         new_mode = data[len("set_mode_"):]
+        if new_mode == "browserbase_market":
+            _is_usdt = (ad_data.get("currencyId","").upper() == "USD"
+                        and ad_data.get("tokenId","").upper() == "USDT")
+            _is_btc_ngn = _is_btc_ngn_ad(ad_data)
+            if not (_is_usdt or _is_btc_ngn):
+                await query.answer("Browserbase Market is only available for USD/USDT and BTC/NGN ads.", show_alert=True)
+                return
         if new_mode == "ad_copy":
             _is_usdt = (ad_data.get("currencyId","").upper() == "USD"
                         and ad_data.get("tokenId","").upper() == "USDT")
@@ -11490,6 +11579,14 @@ def start_bot():
 
         # Background upgrade request notifier (polls DB, notifies admins)
         asyncio.create_task(_upgrade_notifier_loop(app.bot))
+
+        # Shared Browserbase market-price collector (BTC/NGN + USDT/USD
+        # Rank #1 price). ONE shared background task, independent of how
+        # many users/ads exist or what interval each one runs on — the
+        # per-user auto_update_loop scheduler just reads the cached result
+        # via get_market_snapshot() when a user's ad is in
+        # "browserbase_market" mode. Never creates a session per user.
+        asyncio.create_task(start_market_collector())
 
         # ── Set admin-scoped bot commands so only current ADMIN_IDS see admin cmds ──
         # This re-syncs on every deploy, so removed admin IDs lose the menu immediately.
