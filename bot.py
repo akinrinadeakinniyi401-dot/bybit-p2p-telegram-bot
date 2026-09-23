@@ -6096,20 +6096,25 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                     # Bybit, so this must never count toward this ad's
                     # 2-consecutive-failures auto-stop (that machinery
                     # only applies once modify_ad has actually been
-                    # called). Just log/notify sparingly and retry next
-                    # cycle. At a 5s floor, notifying on EVERY failed
-                    # fetch would flood the chat, so only the first
-                    # failure and then every 12th (~1 min at the floor)
-                    # actually message the user.
+                    # called). Log the full diagnostic (category + reason
+                    # + whatever get_web_marketplace_rank1 already wrote
+                    # to Render's own logs) for whoever's watching the
+                    # deploy, but tell the user only that it's retrying —
+                    # HTTP codes / bot-detection details aren't meaningful
+                    # to them and shouldn't go out as a chat notification.
                     _fail_n = int(s.get("web_copy_fail_count", 0)) + 1
                     s["web_copy_fail_count"] = _fail_n
-                    logger.warning(f"[{label}] Web Rank#1 fetch failed (attempt {_fail_n}): {_web.get('error')}")
+                    _err_cat = _web.get("error_category", "unknown")
+                    logger.warning(
+                        f"[{label}] Web Rank#1 fetch failed (attempt {_fail_n}, "
+                        f"category={_err_cat}): {_web.get('error')}"
+                    )
                     if _fail_n == 1 or _fail_n % 12 == 0:
                         await bot.send_message(chat_id=chat_id,
                             text=(
-                                f"⚠️ {prefix}<b>Cycle {cycle}</b> — Rank #1 Web Copy couldn't reach "
-                                f"Bybit's web marketplace (<code>{_esc(str(_web.get('error','unknown error')))}</code>). "
-                                f"Retrying automatically."
+                                f"⚠️ {prefix}<b>Cycle {cycle}</b> — Rank #1 Web Copy is temporarily "
+                                f"unable to reach Bybit's marketplace. Retrying automatically — "
+                                f"no action needed unless this keeps happening."
                             ), parse_mode="HTML")
                     for _ in range(interval_secs):
                         if not _ad_running(sess, slot_idx): break
