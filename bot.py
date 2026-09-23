@@ -29,11 +29,11 @@ from bybit import (
     review_seller_cancel,
     validate_interval, validate_interval_seconds, validate_float_pct, MAX_ADS_PER_USER,
     get_min_price_gap,
-    get_web_marketplace_rank1,
 )
 from fraud_check import check_buyer_name, load_scammers, get_scammer_count, get_last_updated
 import db
 import subscription as sub
+import web_marketplace
 from admin_commands import (
     cmd_upgrade, cmd_downgrade, cmd_requests, cmd_listusers, cmd_userdata,
     cmd_awardref, cmd_addbalance, cmd_deductbalance, cmd_referrals,
@@ -6075,19 +6075,29 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                 # ── 🚀 Rank #1 Web Copy ──
                 # Independent price source from ad_copy above: instead of
                 # the documented/authenticated P2P API, this hits Bybit's
-                # own WEB marketplace endpoint (see bybit.
-                # get_web_marketplace_rank1) and copies ONLY the price of
-                # whatever sits at Rank #1 there. Deliberately ignores
-                # every ad_copy setting (merchant watch, close price
-                # range, top range) — there is exactly one target: the #1
-                # item's price, for BTC/NGN or USDT/USD.
+                # own WEB marketplace endpoint through a persistent,
+                # browser-backed session (see web_marketplace.py) and
+                # copies ONLY the price of whatever sits at Rank #1
+                # there. Deliberately ignores every ad_copy setting
+                # (merchant watch, close price range, top range) — there
+                # is exactly one target: the #1 item's price, for BTC/NGN
+                # or USDT/USD.
                 _quant = Decimal("0.0001")
                 chase_ceiling = False   # not applicable — straight copy, no ceiling probing
                 _side = _market_ads_query_side(ad_data)
 
-                _web = await asyncio.get_event_loop().run_in_executor(
-                    _ad_executor, get_web_marketplace_rank1,
-                    ad_data.get("tokenId",""), ad_data.get("currencyId",""), _side, creds
+                # Fetched through a persistent, shared, browser-backed
+                # session (see web_marketplace.py) — NOT a server-side
+                # requests.post(). Bybit's edge (Akamai) 403s a direct
+                # HTTP client no matter how browser-like its headers are;
+                # this instead runs the same fetch() from inside a real,
+                # already-navigated Bybit page, which is what actually
+                # gets through. It's async I/O against a long-lived
+                # browser process, so it's awaited directly here — no
+                # thread executor needed, and it never blocks the event
+                # loop for longer than the in-page fetch itself takes.
+                _web = await web_marketplace.fetch_rank1(
+                    ad_data.get("tokenId",""), ad_data.get("currencyId",""), _side
                 )
 
                 if not _web.get("ok"):
@@ -6097,11 +6107,12 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                     # 2-consecutive-failures auto-stop (that machinery
                     # only applies once modify_ad has actually been
                     # called). Log the full diagnostic (category + reason
-                    # + whatever get_web_marketplace_rank1 already wrote
-                    # to Render's own logs) for whoever's watching the
-                    # deploy, but tell the user only that it's retrying —
-                    # HTTP codes / bot-detection details aren't meaningful
-                    # to them and shouldn't go out as a chat notification.
+                    # + whatever web_marketplace.fetch_rank1 already
+                    # wrote to Render's own logs) for whoever's watching
+                    # the deploy, but tell the user only that it's
+                    # retrying — HTTP codes / bot-detection details
+                    # aren't meaningful to them and shouldn't go out as a
+                    # chat notification.
                     _fail_n = int(s.get("web_copy_fail_count", 0)) + 1
                     s["web_copy_fail_count"] = _fail_n
                     _err_cat = _web.get("error_category", "unknown")
@@ -11571,6 +11582,21 @@ def start_bot():
         _paga_queue       = asyncio.Queue()
         _paga_worker_task = asyncio.create_task(_paga_queue_worker())
 
+        # Persistent, shared, browser-backed Bybit WEB marketplace
+        # fetcher — powers 'Rank #1 Web Copy' mode for EVERY user's
+        # independent scheduler. One Chromium instance for the whole
+        # process, launched once here and closed once in _post_shutdown
+        # below — never per cycle, never per user. Awaited (not just
+        # fired as a background task) so it's already primed before
+        # the startup Auto Resume Agent pass (15s below) can hit it.
+        # Never raises — a failed/missing Playwright install just leaves
+        # this mode without a price source until fixed, it doesn't crash
+        # the bot's other features.
+        try:
+            await web_marketplace.start()
+        except Exception as e:
+            logger.error(f"[Init] web_marketplace.start() failed: {e}", exc_info=True)
+
         # Pre-load scammer list — run_in_executor returns a Future not a coroutine,
         # so wrap it in an async helper before passing to create_task.
         async def _preload_scammers():
@@ -11643,5 +11669,16 @@ def start_bot():
         logger.info("🟡 Paga queue + session manager + upgrade notifier started")
 
     application.post_init = _post_init
+
+    async def _post_shutdown(app):
+        # Mirror image of _post_init's web_marketplace.start() — closes
+        # the shared Chromium instance and every pooled page/context
+        # cleanly on process exit (normal shutdown OR a Render redeploy).
+        try:
+            await web_marketplace.stop()
+        except Exception as e:
+            logger.warning(f"[Shutdown] web_marketplace.stop() error (non-fatal): {e}")
+
+    application.post_shutdown = _post_shutdown
     logger.info("🤖 Bot handlers registered")
     return application
