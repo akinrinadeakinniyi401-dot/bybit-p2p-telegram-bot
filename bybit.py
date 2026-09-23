@@ -184,6 +184,118 @@ def get_min_price_gap(currency_id: str, token_id: str = "", reference_price=None
     return MIN_PRICE_GAP.get(currency_id.upper(), DEFAULT_MIN_PRICE_GAP)
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# 🚀 Rank #1 Web Copy — Bybit WEB marketplace price source
+# ─────────────────────────────────────────────────────────────────────────
+# This is a SEPARATE price source from everything else in this file. Every
+# other function above/below talks to Bybit's documented, authenticated
+# P2P API (api.bybit.com, HMAC-signed). This one instead mirrors the exact
+# request the bybit.com WEBSITE itself fires to render its own P2P
+# marketplace page (www.bybit.com/x-api/...). The two have been observed
+# to return different rankings/prices for the same pair, and the "Rank #1
+# Web Copy" ad mode exists specifically to follow the WEB one.
+#
+# No API key/signing is involved — this mirrors an unauthenticated public
+# page request (the captured body's "userId" is blank), so there is
+# nothing secret to hard-code here. A single pooled requests.Session is
+# reused for every call, for every user, for the life of the process —
+# never spin up a new HTTP client (let alone a browser) per cycle. The
+# existing per-user Permanent IP proxy mechanism (_resolve_proxies) is
+# still honored, so a user with an approved fixed-IP proxy uses it here
+# too, exactly like every other call in this file.
+WEB_MARKETPLACE_URL = "https://www.bybit.com/x-api/fiat/otc/item/online"
+
+_WEB_MARKETPLACE_HEADERS = {
+    "Content-Type": "application/json;charset=UTF-8",
+    "Accept":       "application/json",
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+    "Origin":  "https://www.bybit.com",
+    "Referer": "https://www.bybit.com/fiat/trade/otc/",
+}
+
+_web_marketplace_session = requests.Session()
+_web_marketplace_session.headers.update(_WEB_MARKETPLACE_HEADERS)
+
+# Floor for the "Rank #1 Web Copy" ad mode's polling interval. This mode
+# only ever WRITES to Bybit (a modify_ad call) when the fetched Rank #1
+# price actually changed from the last one it copied — every other cycle
+# is a cheap read against a public, unauthenticated endpoint — so a much
+# tighter floor than the normal 2-minute one is safe here, for BOTH
+# BTC/NGN and USDT/USD.
+MIN_WEB_COPY_INTERVAL_SECONDS = 5
+
+
+def get_web_marketplace_rank1(token_id: str, currency_id: str, side: str = "0",
+                               creds: dict | None = None) -> dict:
+    """
+    Fetch Bybit's WEB marketplace listing for (token_id, currency_id) and
+    return ONLY the Rank #1 (first valid) item's price. Powers the
+    'web_copy' ad mode exclusively — never used by any other mode.
+
+    The request body mirrors exactly what bybit.com's own P2P page sends,
+    including leaving "amount" empty (a non-empty amount was observed to
+    collapse the result set to 0 items during testing) and the sort
+    parameters that make the page's own default ranking ("Overall
+    Ranking" / "Default Buy") the order items[] comes back in — item 0 is
+    therefore already Rank #1, with no local re-sorting.
+
+    Returns:
+        {"ok": True,  "price": "<str>", "item": {...raw Bybit item...}}
+        {"ok": False, "error": "<human-readable reason>"}
+    """
+    body = {
+        "userId":             "",
+        "tokenId":            str(token_id).upper(),
+        "currencyId":         str(currency_id).upper(),
+        "payment":            [],
+        "side":               str(side),
+        "size":               "10",
+        "page":               "1",
+        "amount":             "",
+        "vaMaker":            True,
+        "authMaker":          False,
+        "bulkMaker":          True,
+        "canTrade":           True,
+        "verificationFilter": 0,
+        "sortType":           "OVERALL_RANKING",
+        "sortStrategyCode":   "DEFAULT_BUY",
+        "paymentPeriod":      [],
+        "itemRegion":         1,
+        "countryCode":        "",
+        "tradeWith":          False,
+    }
+    try:
+        resp = _web_marketplace_session.post(
+            WEB_MARKETPLACE_URL, json=body, timeout=10,
+            proxies=_resolve_proxies(creds),
+        )
+    except requests.exceptions.Timeout:
+        return {"ok": False, "error": "Request timed out"}
+    except Exception as e:
+        logger.error(f"[Bybit] Web marketplace fetch error: {e}")
+        return {"ok": False, "error": str(e)}
+
+    if resp.status_code != 200:
+        return {"ok": False, "error": f"HTTP {resp.status_code}"}
+
+    try:
+        data = resp.json()
+    except Exception as e:
+        return {"ok": False, "error": f"JSON error: {e}"}
+
+    ret_code = data.get("ret_code", data.get("retCode", -1))
+    if ret_code != 0:
+        return {"ok": False, "error": str(data.get("ret_msg", data.get("retMsg", "Unknown error")))}
+
+    items = ((data.get("result") or {}).get("items")) or []
+    for item in items:
+        price = str(item.get("price", "") or "").strip()
+        if price:
+            return {"ok": True, "price": price, "item": item}
+    return {"ok": False, "error": "No valid items returned"}
+
+
 # ─────────────────────────────────────────
 # Multi-ad safety validation (up to 3 ads per user)
 # ─────────────────────────────────────────
