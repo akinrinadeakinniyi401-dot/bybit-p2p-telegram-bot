@@ -29,6 +29,7 @@ from bybit import (
     review_seller_cancel,
     validate_interval, validate_interval_seconds, validate_float_pct, MAX_ADS_PER_USER,
     get_min_price_gap,
+    get_web_marketplace_rank1,
 )
 from fraud_check import check_buyer_name, load_scammers, get_scammer_count, get_last_updated
 import db
@@ -952,12 +953,19 @@ def _is_usdt_usd_ad(ad_data: dict) -> bool:
 def _interval_floor_secs(s: dict, ad_data: dict):
     """The seconds-level interval floor for this ad, or None if this ad
     uses the normal whole-minutes floor instead.
-      • USDT/USD               → 25s
-      • BTC/NGN in ad_copy mode → 10s
+      • web_copy mode (BTC/NGN or USDT/USD) → 5s
+      • USDT/USD                            → 25s
+      • BTC/NGN in ad_copy mode             → 10s
     Floating/fixed BTC/NGN ads are NOT included — they keep the 2-minute
     floor, since they submit an edit every cycle rather than only on a
     genuine price change.
     """
+    if s.get("mode") == "web_copy" and (_is_usdt_usd_ad(ad_data) or _is_btc_ngn_ad(ad_data)):
+        # Rank #1 Web Copy is a read-mostly loop against a public,
+        # unauthenticated endpoint — it only ever WRITES to Bybit when
+        # the fetched price actually changed, so a much tighter floor is
+        # safe for both pairs this mode supports.
+        return bybit.MIN_WEB_COPY_INTERVAL_SECONDS
     if _is_usdt_usd_ad(ad_data):
         return bybit.MIN_USDT_INTERVAL_SECONDS
     if _is_btc_ngn_ad(ad_data) and s.get("mode") == "ad_copy":
@@ -1895,7 +1903,7 @@ def ads_section_keyboard(uid: int = 0):
     s          = _ad_settings(sess, slot_idx) if sess else {}
     ad_data    = _ad_data_of(sess, slot_idx) if sess else {}
     mode       = s.get("mode", "fixed")
-    mode_icon  = {"fixed": "💲", "floating": "📈", "ad_copy": "🪞"}.get(mode, "💲")
+    mode_icon  = {"fixed": "💲", "floating": "📈", "ad_copy": "🪞", "web_copy": "🚀"}.get(mode, "💲")
     mode_label = f"{mode_icon} Mode: {mode.replace('_',' ').upper()}"
     ad_loaded  = bool(ad_data)
     running    = _ad_running(sess, slot_idx) if sess else False
@@ -1977,6 +1985,12 @@ def ads_section_keyboard(uid: int = 0):
             _range_label = _ad_copy_range_label(_range)
             rows.append([InlineKeyboardButton(f"🔝 Copy Range: {_range_label}", callback_data="set_ad_copy_range")])
             rows.append([InlineKeyboardButton("🔍 View Market Ads List", callback_data="view_market_ads")])
+    elif mode == "web_copy":
+        # No extra settings — Rank #1 Web Copy only needs the Interval
+        # (above) and doesn't use Copy Range, Close Price Range, Top
+        # Range, or Merchant Watch. It targets one thing only: the #1
+        # item on Bybit's WEB marketplace listing for this ad's pair.
+        pass
     else:
         rows.append([InlineKeyboardButton("📊 Set Float %",   callback_data="set_float_pct")])
         _cur = ad_data.get("currencyId","").upper()
@@ -6057,6 +6071,77 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                             await asyncio.sleep(1)
                         continue
 
+            elif mode == "web_copy":
+                # ── 🚀 Rank #1 Web Copy ──
+                # Independent price source from ad_copy above: instead of
+                # the documented/authenticated P2P API, this hits Bybit's
+                # own WEB marketplace endpoint (see bybit.
+                # get_web_marketplace_rank1) and copies ONLY the price of
+                # whatever sits at Rank #1 there. Deliberately ignores
+                # every ad_copy setting (merchant watch, close price
+                # range, top range) — there is exactly one target: the #1
+                # item's price, for BTC/NGN or USDT/USD.
+                _quant = Decimal("0.0001")
+                chase_ceiling = False   # not applicable — straight copy, no ceiling probing
+                _side = _market_ads_query_side(ad_data)
+
+                _web = await asyncio.get_event_loop().run_in_executor(
+                    _ad_executor, get_web_marketplace_rank1,
+                    ad_data.get("tokenId",""), ad_data.get("currencyId",""), _side, creds
+                )
+
+                if not _web.get("ok"):
+                    # A fetch failure here is a READ failure against a
+                    # public endpoint — nothing was ever submitted to
+                    # Bybit, so this must never count toward this ad's
+                    # 2-consecutive-failures auto-stop (that machinery
+                    # only applies once modify_ad has actually been
+                    # called). Just log/notify sparingly and retry next
+                    # cycle. At a 5s floor, notifying on EVERY failed
+                    # fetch would flood the chat, so only the first
+                    # failure and then every 12th (~1 min at the floor)
+                    # actually message the user.
+                    _fail_n = int(s.get("web_copy_fail_count", 0)) + 1
+                    s["web_copy_fail_count"] = _fail_n
+                    logger.warning(f"[{label}] Web Rank#1 fetch failed (attempt {_fail_n}): {_web.get('error')}")
+                    if _fail_n == 1 or _fail_n % 12 == 0:
+                        await bot.send_message(chat_id=chat_id,
+                            text=(
+                                f"⚠️ {prefix}<b>Cycle {cycle}</b> — Rank #1 Web Copy couldn't reach "
+                                f"Bybit's web marketplace (<code>{_esc(str(_web.get('error','unknown error')))}</code>). "
+                                f"Retrying automatically."
+                            ), parse_mode="HTML")
+                    for _ in range(interval_secs):
+                        if not _ad_running(sess, slot_idx): break
+                        await asyncio.sleep(1)
+                    continue
+                s["web_copy_fail_count"] = 0
+
+                _rank1_price = _web.get("price")
+                try:
+                    new_p = Decimal(str(_rank1_price))
+                except Exception:
+                    await bot.send_message(chat_id=chat_id,
+                        text=(f"⚠️ {prefix}<b>Cycle {cycle}</b> — Rank #1 Web Copy got an unreadable "
+                              f"price (<code>{_esc(str(_rank1_price))}</code>). Skipping this cycle."),
+                        parse_mode="HTML")
+                    for _ in range(interval_secs):
+                        if not _ad_running(sess, slot_idx): break
+                        await asyncio.sleep(1)
+                    continue
+
+                # Only submit an edit when the Rank #1 price actually
+                # changed since the last one this ad copied — this is
+                # what makes a 5-second interval practical (most cycles
+                # are a cheap read that ends here, not a Bybit write).
+                _prev_web_price = s.get("web_copy_last_price")
+                if _prev_web_price is not None and str(_prev_web_price) == str(_rank1_price):
+                    logger.debug(f"[{label}] Web Rank#1 price unchanged ({_rank1_price}) — skipping edit this cycle.")
+                    for _ in range(interval_secs):
+                        if not _ad_running(sess, slot_idx): break
+                        await asyncio.sleep(1)
+                    continue
+
             else:
                 try:
                     float_pct = float(s.get("float_pct") or 0)
@@ -6104,7 +6189,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
             # were silently burning through this ad's modify-rate budget,
             # which then made LATER cycles appear to "do nothing" while they
             # were actually just waiting for that budget to free up.
-            if sess.total_ad_slots() > 1 and mode != "ad_copy":
+            if sess.total_ad_slots() > 1 and mode not in ("ad_copy", "web_copy"):
                 new_p, _cycle_collided = _resolve_price_collision(
                     sess, slot_idx,
                     ad_data.get("currencyId",""), ad_data.get("tokenId",""),
@@ -6303,23 +6388,26 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                         return
 
 
-            elif ret_code == 90043 and mode == "ad_copy":
+            elif ret_code == 90043 and mode in ("ad_copy", "web_copy"):
                 # For every OTHER mode this means "the computed price
                 # happens to round to what's already live — nudge off it".
-                # For Ad Copy it means something different and much
-                # simpler: the ad is ALREADY sitting at the exact market
-                # price we just discovered and tried to (re)post. That's
-                # not a problem to nudge away from — nudging here would
-                # actively move this ad OFF the real market price it's
-                # supposed to be mirroring, for no reason at all. Treat it
-                # as confirmation of success.
+                # For Ad Copy / Rank #1 Web Copy it means something
+                # different and much simpler: the ad is ALREADY sitting at
+                # the exact market price we just discovered and tried to
+                # (re)post. That's not a problem to nudge away from —
+                # nudging here would actively move this ad OFF the real
+                # market price it's supposed to be mirroring, for no
+                # reason at all. Treat it as confirmation of success.
                 _reset_ad_failures(sess, slot_idx)
                 _set_ad_current_price(sess, slot_idx, new_p)
-                if _is_btc_ngn_ad(ad_data):
-                    s["close_range_last_price"] = str(new_p)
-                elif _is_usdt_usd_ad(ad_data):
-                    s["ad_copy_last_price"] = str(new_p)
-                logger.info(f"[{label}] Cycle {cycle} — 90043 (already at {new_p}) treated as success for Ad Copy, no nudge")
+                if mode == "ad_copy":
+                    if _is_btc_ngn_ad(ad_data):
+                        s["close_range_last_price"] = str(new_p)
+                    elif _is_usdt_usd_ad(ad_data):
+                        s["ad_copy_last_price"] = str(new_p)
+                else:
+                    s["web_copy_last_price"] = str(new_p)
+                logger.info(f"[{label}] Cycle {cycle} — 90043 (already at {new_p}) treated as success for {mode}, no nudge")
                 await bot.send_message(chat_id=chat_id,
                     text=(
                         f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n"
@@ -6477,6 +6565,8 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                             s["close_range_last_price"] = submit_str
                         elif _is_usdt_usd_ad(ad_data):
                             s["ad_copy_last_price"] = submit_str
+                    elif mode == "web_copy":
+                        s["web_copy_last_price"] = submit_str
                     await bot.send_message(chat_id=chat_id,
                         text=f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n💲 <code>{submit_str}</code> ({mode.upper()})",
                         parse_mode="HTML")
@@ -7959,6 +8049,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         ]
         if is_usdt_usd or is_btc_ngn:
             rows.append([InlineKeyboardButton(("✅ " if cur_mode == "ad_copy" else "") + "🪞 Ad Copy", callback_data="set_mode_ad_copy")])
+            rows.append([InlineKeyboardButton(("✅ " if cur_mode == "web_copy" else "") + "🚀 Rank #1 Web Copy", callback_data="set_mode_web_copy")])
         rows += back_section("section_ads")
         txt = (
             f"🔀 <b>{_ad_slot_label(slot_idx)} — Choose Mode</b>\n\n"
@@ -7973,9 +8064,16 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 "market ad sharing it (BTC/NGN).\n\n"
                 "<i>Only one ad on the bot can use Ad Copy for BTC/NGN at a time.</i>\n"
             )
+        if is_usdt_usd or is_btc_ngn:
+            txt += (
+                "🚀 <b>Rank #1 Web Copy</b> — copies ONLY the price of the #1 ad on Bybit's "
+                "WEB marketplace listing (bybit.com itself, not the documented API). Ignores "
+                "merchant name, close price range, and top range — always just the #1 price. "
+                "Supports intervals as low as 5 seconds.\n"
+            )
         await edit_menu(query, txt, InlineKeyboardMarkup(rows))
 
-    elif data in ("set_mode_fixed", "set_mode_floating", "set_mode_ad_copy"):
+    elif data in ("set_mode_fixed", "set_mode_floating", "set_mode_ad_copy", "set_mode_web_copy"):
         sess = _s(tuser.id)
         slot_idx = sess.editing_slot
         if slot_idx in (-2, -3):
@@ -8003,6 +8101,17 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
                         show_alert=True
                     )
                     return
+        if new_mode == "web_copy":
+            _is_usdt = (ad_data.get("currencyId","").upper() == "USD"
+                        and ad_data.get("tokenId","").upper() == "USDT")
+            _is_btc_ngn = _is_btc_ngn_ad(ad_data)
+            if not (_is_usdt or _is_btc_ngn):
+                await query.answer("Rank #1 Web Copy is only available for USD/USDT and BTC/NGN ads.", show_alert=True)
+                return
+            # No single-slot restriction here (unlike BTC/NGN Ad Copy) —
+            # Rank #1 Web Copy always targets the same external #1 price
+            # regardless of how many ads copy it, so multiple ads on this
+            # mode never fight each other over ranking.
         s["mode"] = new_mode
         next_hint = ""
         if slot_idx == -1:
