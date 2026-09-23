@@ -60,6 +60,7 @@ PUBLIC API (all async)
 
 import asyncio
 import logging
+import os
 import time
 
 logger = logging.getLogger(__name__)
@@ -101,6 +102,94 @@ _start_lock = asyncio.Lock()
 _keepwarm_task = None
 
 
+def _log_browsers_path_env():
+    """Startup diagnostic (item 7): print, without exposing any secrets,
+    where Playwright is CONFIGURED to look for its browsers at runtime —
+    i.e. exactly the env vars/paths that decide the answer to 'does the
+    runtime container even agree with the build container about where
+    the browser lives'. This runs unconditionally, before we ever try to
+    launch anything, so it shows up in Render's logs even if launch()
+    later fails."""
+    env_override = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    home = os.environ.get("HOME", "<unset>")
+    default_cache_dir = os.path.expanduser("~/.cache/ms-playwright")
+    effective_dir = env_override if env_override else default_cache_dir
+
+    logger.info(
+        "[WebMarketplace][diag] PLAYWRIGHT_BROWSERS_PATH env var = %r "
+        "(if this is unset, Playwright falls back to '~/.cache/ms-playwright' "
+        "using whatever HOME resolves to AT RUNTIME — if the build step ran "
+        "as a different user/HOME than the running process, this alone "
+        "explains a 'downloaded successfully but missing at runtime' error)",
+        env_override,
+    )
+    logger.info("[WebMarketplace][diag] HOME env var (runtime) = %r", home)
+    logger.info("[WebMarketplace][diag] Effective browsers directory Playwright will use = %r", effective_dir)
+
+    if os.path.isdir(effective_dir):
+        try:
+            entries = sorted(os.listdir(effective_dir))
+        except Exception as e:
+            entries = [f"<could not list dir: {e}>"]
+        logger.info(
+            "[WebMarketplace][diag] Effective browsers directory EXISTS at runtime. Contents: %s",
+            entries,
+        )
+    else:
+        logger.error(
+            "[WebMarketplace][diag] Effective browsers directory DOES NOT EXIST at runtime: %r — "
+            "this means whatever 'playwright install chromium' wrote during the build is not "
+            "visible to the running process at all (separate build/runtime filesystem, a build "
+            "cache volume that isn't mounted at runtime, or a different HOME at runtime). This is "
+            "an environment/deploy issue, not something this module's code can work around by "
+            "picking a different path.",
+            effective_dir,
+        )
+
+
+def _verify_chromium_executable(playwright_instance) -> bool:
+    """Startup diagnostic (item 7, continued): ask Playwright itself which
+    executable `chromium.launch()` is actually going to try to run, and
+    check it on disk BEFORE we call launch() — so a missing binary produces
+    one clear, actionable log line instead of a raw BrowserType.launch
+    traceback. Returns True if the executable is present, False otherwise.
+    Never raises."""
+    try:
+        exe_path = playwright_instance.chromium.executable_path
+    except Exception as e:
+        logger.warning(f"[WebMarketplace][diag] Could not read chromium.executable_path from Playwright: {e}")
+        return True  # unknown — don't block launch on a diagnostic failure
+
+    logger.info("[WebMarketplace][diag] Playwright's resolved chromium executable_path = %r", exe_path)
+
+    if exe_path and os.path.exists(exe_path):
+        logger.info("[WebMarketplace][diag] Executable exists on disk — proceeding with launch().")
+        return True
+
+    logger.error(
+        "[WebMarketplace][diag] Executable does NOT exist on disk at runtime: %r", exe_path
+    )
+    # Show what IS actually there, one level up, so it's obvious at a
+    # glance whether the dir is empty, has a different build/version
+    # folder, or is missing just this one sub-package (e.g. the full
+    # 'chromium-<ver>' folder is present but 'chromium_headless_shell-<ver>'
+    # is not, or vice versa).
+    parent = os.path.dirname(os.path.dirname(exe_path)) if exe_path else None
+    grandparent = os.path.dirname(parent) if parent else None
+    for label, path in (("parent", parent), ("browsers root", grandparent)):
+        if path and os.path.isdir(path):
+            try:
+                logger.error(
+                    "[WebMarketplace][diag] Contents of %s (%r): %s",
+                    label, path, sorted(os.listdir(path)),
+                )
+            except Exception as e:
+                logger.error(f"[WebMarketplace][diag] Could not list {label} dir {path!r}: {e}")
+        elif path:
+            logger.error("[WebMarketplace][diag] %s directory %r does not exist either.", label, path)
+    return False
+
+
 async def start():
     """Launch the persistent browser and prime the page pool. Safe to
     call more than once — every call after the first is a no-op. Never
@@ -116,9 +205,29 @@ async def start():
     async with _start_lock:
         if _started:
             return
+        _log_browsers_path_env()
         try:
             logger.info("[WebMarketplace] Launching persistent headless Chromium...")
             _playwright = await async_playwright().start()
+
+            if not _verify_chromium_executable(_playwright):
+                logger.error(
+                    "[WebMarketplace] Aborting launch — Playwright's managed Chromium binary is "
+                    "missing at runtime (see [diag] lines above for exactly which path/dir is "
+                    "empty). 'Rank #1 Web Copy' has no price source until the runtime environment "
+                    "actually has this binary; NOT working around this by pointing at a "
+                    "hard-coded/alternate executable path."
+                )
+                try:
+                    await _playwright.stop()
+                except Exception:
+                    pass
+                _playwright = None
+                return
+
+            # Normal managed-executable launch — no executable_path override.
+            # Let Playwright resolve its own binary; we only verified above
+            # that the resolved path exists, we never redirect it.
             _browser = await _playwright.chromium.launch(
                 headless=True,
                 args=[
