@@ -243,6 +243,16 @@ def _set_ip_error_notified(sess, slot_idx: int, val: bool):
         sess.ip_error_notified_by_slot = store
     store[slot_idx] = val
 
+def _fiat_amount_error_already_notified(sess, slot_idx: int) -> bool:
+    return getattr(sess, "fiat_amount_error_notified_by_slot", {}).get(slot_idx, False)
+
+def _set_fiat_amount_error_notified(sess, slot_idx: int, val: bool):
+    store = getattr(sess, "fiat_amount_error_notified_by_slot", None)
+    if store is None:
+        store = {}
+        sess.fiat_amount_error_notified_by_slot = store
+    store[slot_idx] = val
+
 async def _handle_ad_ip_error(bot, chat_id: int, sess, slot_idx: int, ret_code, ret_msg) -> bool:
     """Detects Bybit's "Unmatched IP" rejection (10010) for the ad price
     bot — fast-chase and the scheduled cycle both hit this identically
@@ -861,9 +871,11 @@ async def _usdt_triad_loop(bot, chat_id: int):
                             staying.add(idx)
                             break
 
-                movers       = [idx for idx in participants if idx not in staying]
-                vacant_ranks = [i for i in range(len(ranked_prices)) if i not in claimed_ranks]
-                moved_ok     = set()   # movers that actually succeeded this cycle
+                movers        = [idx for idx in participants if idx not in staying]
+                vacant_ranks  = [i for i in range(len(ranked_prices)) if i not in claimed_ranks]
+                moved_ok      = set()   # movers that actually succeeded this cycle
+                move_fail     = {}      # mover_idx -> (ret_code, ret_msg) for movers that did NOT succeed
+                auto_stopped  = set()   # movers stopped this cycle after 2 failures in a row
 
                 if not movers:
                     logger.info(
@@ -878,6 +890,7 @@ async def _usdt_triad_loop(bot, chat_id: int):
                             new_p = Decimal(price)
                         except Exception:
                             logger.warning(f"{label} unreadable price {price!r} for {_ad_slot_label(mover_idx)} — skipping")
+                            move_fail[mover_idx] = (-1, f"Unreadable market price {price!r}")
                             continue
                         s       = _ad_settings(sess, mover_idx)
                         ad_data = _ad_data_of(sess, mover_idx)
@@ -885,6 +898,7 @@ async def _usdt_triad_loop(bot, chat_id: int):
                             _ad_executor, modify_ad, s["ad_id"], str(new_p), ad_data, creds
                         )
                         ret_code = result.get("retCode", result.get("ret_code", -1))
+                        ret_msg  = result.get("retMsg",  result.get("ret_msg", "Unknown"))
                         if ret_code == 0:
                             ad_data["price"] = str(new_p)
                             _set_ad_current_price(sess, mover_idx, new_p)
@@ -893,11 +907,34 @@ async def _usdt_triad_loop(bot, chat_id: int):
                             moved_ok.add(mover_idx)
                             logger.info(f"{label} {_ad_slot_label(mover_idx)} PRICE CHANGED — moved to rank {rank_i+1}: {new_p}")
                         else:
+                            move_fail[mover_idx] = (ret_code, ret_msg)
                             n = _increment_ad_failures(sess, mover_idx)
                             logger.warning(
                                 f"{label} {_ad_slot_label(mover_idx)} move to rank {rank_i+1} failed "
-                                f"({result.get('retMsg', result.get('ret_msg',''))}) — failures={n}"
+                                f"({ret_msg}) — failures={n}"
                             )
+                            # Same 2-in-a-row threshold auto_update_loop's
+                            # _handle_ad_cycle_failure uses elsewhere — this
+                            # loop previously counted failures but never
+                            # acted on them, so an ad could sit here failing
+                            # every single cycle indefinitely while looking
+                            # identical to "nothing needed to change" in the
+                            # notification below.
+                            if n >= 2:
+                                _set_ad_running(sess, mover_idx, False)
+                                _set_ad_task(sess, mover_idx, None)
+                                auto_stopped.add(mover_idx)
+                                try:
+                                    await bot.send_message(chat_id=chat_id,
+                                        text=(
+                                            f"🛑 <b>{_ad_slot_label(mover_idx)} auto-stopped</b>\n\n"
+                                            f"2 failed USDT/USD rank-move updates in a row.\n"
+                                            f"Last error: <code>{ret_code}</code> — <code>{_esc(str(ret_msg))}</code>\n\n"
+                                            f"Check/edit this ad directly on Bybit, then restart it from the bot."
+                                        ),
+                                        parse_mode="HTML")
+                                except Exception:
+                                    pass
 
                 # Record the final rank assignment (used purely for status
                 # messages — e.g. confirming "Ad 2 still in rank 2" the
@@ -915,6 +952,8 @@ async def _usdt_triad_loop(bot, chat_id: int):
                 # 2-minute check happens to run.
                 now = datetime.now()
                 for idx in participants:
+                    if idx in auto_stopped:
+                        continue   # already got its own dedicated auto-stop message above
                     own_interval_secs = _ad_interval_seconds(
                         _ad_settings(sess, idx), _ad_data_of(sess, idx)
                     )
@@ -927,6 +966,19 @@ async def _usdt_triad_loop(bot, chat_id: int):
                     rank_str = f"Rank {rank}" if rank else "Rank —"
                     if idx in moved_ok:
                         verdict = "🔄 <b>Price changed</b> — moved to a new rank this cycle."
+                    elif idx in move_fail:
+                        # This is the case that used to be misreported as
+                        # "No change — modify skipped": the ad WAS supposed
+                        # to move and Bybit's modify call was actually
+                        # attempted and rejected — this ad is stuck at its
+                        # old price/rank until that's resolved, which looks
+                        # nothing like "no change needed."
+                        _fc, _fm = move_fail[idx]
+                        verdict = (
+                            f"⚠️ <b>Move FAILED</b> — Bybit rejected the edit: "
+                            f"<code>{_fc}</code> — <code>{_esc(str(_fm))}</code>. "
+                            f"Still at its previous price/rank."
+                        )
                     else:
                         verdict = "✅ <b>No change</b> — same price still holds this rank, modify skipped."
                     try:
@@ -1153,6 +1205,7 @@ def _reset_ad_failures(sess, slot_idx: int):
     # either way, a FUTURE ip error deserves a fresh notification, not
     # permanent silence from a stale flag set the last time this happened.
     _set_ip_error_notified(sess, slot_idx, False)
+    _set_fiat_amount_error_notified(sess, slot_idx, False)
 
 
 # ─────────────────────────────────────────
@@ -1914,7 +1967,7 @@ def ads_section_keyboard(uid: int = 0):
     s          = _ad_settings(sess, slot_idx) if sess else {}
     ad_data    = _ad_data_of(sess, slot_idx) if sess else {}
     mode       = s.get("mode", "fixed")
-    mode_icon  = {"fixed": "💲", "floating": "📈", "ad_copy": "🪞"}.get(mode, "💲")
+    mode_icon  = {"fixed": "💲", "floating": "📈", "ad_copy": "🪞", "browserbase_market": "🌐"}.get(mode, "💲")
     mode_label = f"{mode_icon} Mode: {mode.replace('_',' ').upper()}"
     ad_loaded  = bool(ad_data)
     running    = _ad_running(sess, slot_idx) if sess else False
@@ -1996,6 +2049,15 @@ def ads_section_keyboard(uid: int = 0):
             _range_label = _ad_copy_range_label(_range)
             rows.append([InlineKeyboardButton(f"🔝 Copy Range: {_range_label}", callback_data="set_ad_copy_range")])
             rows.append([InlineKeyboardButton("🔍 View Market Ads List", callback_data="view_market_ads")])
+    elif mode == "browserbase_market":
+        # Copies Bybit's live rank-1 price directly from the shared
+        # Browserbase feed — same idea as Ad Copy, just a different price
+        # source. It has NO settings of its own: Set Float %, the
+        # NGN/USDT ref, and manual Nudge Amount are all floating-mode-only
+        # concepts and must never appear (or be interacted with) here —
+        # showing them previously was a bug (this mode fell through to
+        # the floating-mode `else` branch below by accident).
+        pass
     else:
         rows.append([InlineKeyboardButton("📊 Set Float %",   callback_data="set_float_pct")])
         _cur = ad_data.get("currencyId","").upper()
@@ -2094,6 +2156,8 @@ def ads_section_text(uid: int = 0) -> str:
 
     if mode == "fixed":
         mode_info = f"  ➕ Increment: `+{increment}` per cycle"
+    elif mode == "browserbase_market":
+        mode_info = "  🌐 Copies Bybit's live Rank #1 price via Browserbase"
     else:
         mode_info = f"  📊 Float: `{float_pct}%`"
         if ad_data.get("currencyId","").upper() == "NGN":
@@ -5597,6 +5661,43 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                                     f"{tag} skipped — Bybit's real ceiling hasn't risen enough above what's "
                                     f"already live (candidate-cur={candidate - cur_p} < {gap}, or budget exhausted)"
                                 )
+                    elif last_code == 912300014:
+                        # "Error retrieving fiat amount parameter" — seen on
+                        # the 50x-inflated PROBE price itself, not on a real
+                        # target price. This isn't Bybit telling us the price
+                        # is out of range (that's 912120022, handled above);
+                        # it's Bybit's backend failing to compute this ad's
+                        # min/maxAmount fiat bounds against such an extreme
+                        # price at all, which points at the ad's own
+                        # minAmount/maxAmount/quantity combination being at
+                        # or near Bybit's own limits — the 50x probe just
+                        # happens to be what exposes it. No boundary can be
+                        # discovered from this response, so nothing is
+                        # posted this cycle, but it's surfaced to the user
+                        # (once, not every poll) since it otherwise looks
+                        # identical to "nothing happened" in the logs while
+                        # actually meaning fast-chase can't probe this ad at
+                        # all until its amount range is fixed on Bybit.
+                        logger.warning(
+                            f"{tag} probe hit fiat-amount-parameter error (912300014) at probe price "
+                            f"{probe_price} — likely this ad's minAmount/maxAmount/quantity can't be "
+                            f"validated against such an inflated price; no boundary discovered this cycle"
+                        )
+                        if not _fiat_amount_error_already_notified(sess, slot_idx):
+                            _set_fiat_amount_error_notified(sess, slot_idx, True)
+                            await bot.send_message(chat_id=chat_id,
+                                text=(
+                                    f"⚠️ <b>{_ad_slot_label(slot_idx)} — fast-chase probe error (912300014)</b>\n\n"
+                                    f"Bybit rejected fast-chase's price probe with "
+                                    f"<code>Error retrieving fiat amount parameter</code>, not a normal "
+                                    f"out-of-range rejection. This usually means this ad's Min/Max "
+                                    f"transaction amount (or quantity) is set in a way Bybit can't validate "
+                                    f"against fast-chase's probe price.\n\n"
+                                    f"👉 Check/adjust this ad's Min/Max Amount directly on Bybit — fast-chase "
+                                    f"will keep skipping this ceiling-discovery step until it's resolved.\n"
+                                    f"<i>(This notice only shows once per run for this ad.)</i>"
+                                ),
+                                parse_mode="HTML")
                     else:
                         logger.warning(f"{tag} probe returned an unexpected code={last_code} msg={last_msg!r}")
 
