@@ -78,9 +78,13 @@ MARKETPLACE_API_URL  = "https://www.bybit.com/x-api/fiat/otc/item/online"
 # browser context (its own cookie jar), all navigated to the real OTC
 # page. This is the concurrency ceiling for simultaneous fetches across
 # ALL users' web_copy ads combined — raise it only if many users are
-# genuinely running web_copy at once and start() logs show the pool
-# saturating (fetch_rank1 returning "pool_exhausted").
-_POOL_SIZE = 3
+# genuinely running web_copy at once, start() logs show the pool
+# saturating (fetch_rank1 returning "pool_exhausted"), AND the host has
+# headroom to spare. Lowered from 3 to 1: a full Chromium process plus
+# multiple primed tabs is memory-heavy, and on a memory-constrained host
+# this is a likely contributor to OOM-triggered restarts. Raise this back
+# only after confirming (Render's Metrics tab) that memory has headroom.
+_POOL_SIZE = 1
 
 # Re-navigate a pooled page proactively after this long, even if it never
 # hit an error — cheap insurance against a session quietly going stale.
