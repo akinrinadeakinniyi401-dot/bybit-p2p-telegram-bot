@@ -228,12 +228,25 @@ async def start():
             # Normal managed-executable launch — no executable_path override.
             # Let Playwright resolve its own binary; we only verified above
             # that the resolved path exists, we never redirect it.
+            #
+            # --disable-http2: on Render, every pooled page's very first
+            # navigation to bybit.com was dying immediately with
+            # net::ERR_HTTP2_PROTOCOL_ERROR — consistent with an edge/WAF
+            # (Akamai, per this module's own docstring) issuing a deliberate
+            # RST_STREAM at the HTTP/2 framing layer as an anti-automation
+            # response. Forcing HTTP/1.1 here sidesteps that specific layer.
+            # If pages STILL fail to navigate after this, that points away
+            # from an HTTP/2-specific block and toward a flat IP/ASN-level
+            # block of Render's outbound range — which this flag can't fix
+            # and which would need to be confirmed with a plain `curl -v
+            # https://www.bybit.com` from Render's Shell tab.
             _browser = await _playwright.chromium.launch(
                 headless=True,
                 args=[
                     "--disable-blink-features=AutomationControlled",
                     "--no-sandbox",
                     "--disable-dev-shm-usage",
+                    "--disable-http2",
                 ],
             )
             _pool_queue = asyncio.Queue()
