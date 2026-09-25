@@ -51,6 +51,15 @@ def _default_settings() -> dict:
         # a redeploy and the Auto Resume Agent.
         "close_price_range":     "",
         "close_range_last_price": "",
+        # "Quick Market" mode (backed by direct_market.py's always-on
+        # Decodo-proxy collector — the display name is deliberately
+        # generic so the underlying proxy vendor is never shown to the
+        # user) — the last price actually posted, so an unchanged
+        # snapshot price is skipped rather than re-posted every cycle
+        # (re-posting an unchanged price would reset this ad's
+        # first-come-first-served ranking position for nothing). Persisted
+        # the same way close_range_last_price is.
+        "quick_market_last_price": "",
         # How many places down the ranked band to copy — 1 = leading
         # (highest) price in the band, 2 = second-highest, 3 = third, etc.
         "top_range": 1,
