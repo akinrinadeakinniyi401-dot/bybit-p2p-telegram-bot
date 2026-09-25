@@ -6797,6 +6797,19 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                             s["close_range_last_price"] = submit_str
                         elif _is_usdt_usd_ad(ad_data):
                             s["ad_copy_last_price"] = submit_str
+                    elif mode == "decodo_market":
+                        # Same reasoning as ad_copy just above: only commit
+                        # the "last price" the skip-gate (further up, in the
+                        # decodo_market branch) compares against once Bybit
+                        # has actually confirmed this price went live. This
+                        # was previously only committed on the rare 90043
+                        # ("already at this price") path, so a normal
+                        # successful modify never updated it — meaning the
+                        # skip-gate compared against a stale/empty value
+                        # every cycle and NEVER matched, so Quick Market kept
+                        # re-submitting the identical price every single
+                        # cycle instead of skipping until it truly changed.
+                        s["quick_market_last_price"] = submit_str
                     await bot.send_message(chat_id=chat_id,
                         text=f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n💲 <code>{submit_str}</code> ({_mode_display_label(mode)})",
                         parse_mode="HTML")
