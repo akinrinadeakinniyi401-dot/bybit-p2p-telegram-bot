@@ -1032,13 +1032,16 @@ def _is_usdt_usd_ad(ad_data: dict) -> bool:
 def _interval_floor_secs(s: dict, ad_data: dict):
     """The seconds-level interval floor for this ad, or None if this ad
     uses the normal whole-minutes floor instead.
-      • USDT/USD               → 25s
-      • BTC/NGN in ad_copy mode → 10s
+      • USDT/USD in ad_copy/browserbase_market mode → 25s
+      • USDT/USD in decodo_market (Quick Market) mode → 5s
+      • BTC/NGN in ad_copy/browserbase_market/decodo_market mode → 3s
     Floating/fixed BTC/NGN ads are NOT included — they keep the 2-minute
     floor, since they submit an edit every cycle rather than only on a
     genuine price change.
     """
     if _is_usdt_usd_ad(ad_data):
+        if s.get("mode") == "decodo_market":
+            return bybit.MIN_USDT_QUICKMARKET_INTERVAL_SECONDS
         return bybit.MIN_USDT_INTERVAL_SECONDS
     if _is_btc_ngn_ad(ad_data) and s.get("mode") in ("ad_copy", "browserbase_market", "decodo_market"):
         return bybit.MIN_BTC_NGN_ADCOPY_INTERVAL_SECONDS
@@ -6367,7 +6370,14 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                     continue
 
                 new_p  = _dm_new_p
-                _quant = Decimal("0.01")
+                # BTC/NGN prices are 2dp; USDT/USD needs finer precision
+                # (matches Ad Copy's own USDT/USD quant a bit further up).
+                # This was previously hardcoded to Decimal("0.01") for BOTH
+                # pairs, which silently rounded a real USDT/USD snapshot
+                # price like 1.018 up to 1.02 before it was ever submitted
+                # to Bybit — the bot wasn't reading the wrong number, it was
+                # quantizing the right one down to the wrong precision.
+                _quant = Decimal("0.01") if _dm_pair_key == "BTC_NGN" else Decimal("0.0001")
                 chase_ceiling = False   # not applicable — this mode always targets a specific real price
                 logger.info(
                     f"[{label}] Quick Market ({_dm_pair_key}) rank #1 price {new_p} "
