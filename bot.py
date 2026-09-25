@@ -37,6 +37,9 @@ from market_collector import (
     register_demand as _bb_register_demand,
     unregister_demand as _bb_unregister_demand,
 )
+from direct_market import (
+    get_direct_market_snapshot, direct_market_pair_key, start_direct_market_collector,
+)
 import db
 import subscription as sub
 from admin_commands import (
@@ -51,7 +54,7 @@ from config import REFERRAL_REWARD_NGN, BOT_OWNER_USERNAME, MIN_WITHDRAWAL_NGN, 
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────
-# ⏳ Browserbase Market mode — cold-start grace period
+# ⏳ Browserbase/Decodo Market modes — cold-start grace period
 # ─────────────────────────────────────────
 # market_collector.py closes its shared Browserbase session the instant
 # demand hits zero (to conserve the free plan's hour budget), so every
@@ -60,6 +63,10 @@ logger = logging.getLogger(__name__)
 # normal, not an error, so we don't alarm the user with a Telegram warning
 # during this window — instead we poll quickly and quietly until either
 # the price is ready or the grace period itself runs out.
+# direct_market.py's collector (decodo_market mode) is always-on rather
+# than demand-gated, but still has a short cold start right after the bot
+# boots (first fetch per pair hasn't completed yet) — these same
+# constants cover that window too.
 BB_WARMUP_GRACE_SECONDS = int(os.getenv("BB_WARMUP_GRACE_SECONDS", "20") or 20)
 BB_WARMUP_POLL_SECONDS  = 2
 
@@ -1031,7 +1038,7 @@ def _interval_floor_secs(s: dict, ad_data: dict):
     """
     if _is_usdt_usd_ad(ad_data):
         return bybit.MIN_USDT_INTERVAL_SECONDS
-    if _is_btc_ngn_ad(ad_data) and s.get("mode") in ("ad_copy", "browserbase_market"):
+    if _is_btc_ngn_ad(ad_data) and s.get("mode") in ("ad_copy", "browserbase_market", "decodo_market"):
         return bybit.MIN_BTC_NGN_ADCOPY_INTERVAL_SECONDS
     return None
 
@@ -1967,7 +1974,7 @@ def ads_section_keyboard(uid: int = 0):
     s          = _ad_settings(sess, slot_idx) if sess else {}
     ad_data    = _ad_data_of(sess, slot_idx) if sess else {}
     mode       = s.get("mode", "fixed")
-    mode_icon  = {"fixed": "💲", "floating": "📈", "ad_copy": "🪞", "browserbase_market": "🌐"}.get(mode, "💲")
+    mode_icon  = {"fixed": "💲", "floating": "📈", "ad_copy": "🪞", "browserbase_market": "🌐", "decodo_market": "⚡"}.get(mode, "💲")
     mode_label = f"{mode_icon} Mode: {mode.replace('_',' ').upper()}"
     ad_loaded  = bool(ad_data)
     running    = _ad_running(sess, slot_idx) if sess else False
@@ -2057,6 +2064,13 @@ def ads_section_keyboard(uid: int = 0):
         # concepts and must never appear (or be interacted with) here —
         # showing them previously was a bug (this mode fell through to
         # the floating-mode `else` branch below by accident).
+        pass
+    elif mode == "decodo_market":
+        # Same idea as Browserbase Market — copies Bybit's live Rank #1
+        # price every edit — just backed by direct_market.py's lighter
+        # always-on direct-HTTP collector (Decodo ISP proxy) instead of a
+        # Browserbase/Playwright session. No settings of its own for the
+        # same reason Browserbase Market has none.
         pass
     else:
         rows.append([InlineKeyboardButton("📊 Set Float %",   callback_data="set_float_pct")])
@@ -2158,6 +2172,8 @@ def ads_section_text(uid: int = 0) -> str:
         mode_info = f"  ➕ Increment: `+{increment}` per cycle"
     elif mode == "browserbase_market":
         mode_info = "  🌐 Copies Bybit's live Rank #1 price via Browserbase"
+    elif mode == "decodo_market":
+        mode_info = "  ⚡ Copies Bybit's live Rank #1 price via Decodo"
     else:
         mode_info = f"  📊 Float: `{float_pct}%`"
         if ad_data.get("currencyId","").upper() == "NGN":
@@ -6252,6 +6268,62 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                     f"from {snap.get('latest_nickname','?')} (fetched_at={snap.get('fetched_at')})"
                 )
 
+            elif mode == "decodo_market":
+                # ── Decodo Market Price mode (BTC/NGN + USDT/USD only) ──
+                # Same idea as Browserbase Market mode — every edit copies
+                # Bybit's live Rank #1 price — but backed by
+                # direct_market.py's lightweight always-on collector
+                # (plain requests through a Decodo ISP proxy) instead of a
+                # per-demand Browserbase/Playwright session. No demand
+                # registration call needed here: direct_market.py's loop
+                # runs continuously regardless of how many ads use this
+                # mode, so there's nothing to wake up or keep alive.
+                _dm_pair_key = direct_market_pair_key(ad_data.get("tokenId",""), ad_data.get("currencyId",""))
+                if not _dm_pair_key:
+                    await bot.send_message(chat_id=chat_id,
+                        text=(
+                            f"❌ <b>{label} Decodo Market mode stopped</b>\n\n"
+                            "This mode only supports BTC/NGN and USDT/USD ads.\n"
+                            "Switch this ad to a different mode, or point it at one of those pairs."
+                        ),
+                        parse_mode="HTML")
+                    _set_ad_running(sess, slot_idx, False)
+                    _set_ad_task(sess, slot_idx, None)
+                    return
+
+                dm_snap = get_direct_market_snapshot(_dm_pair_key)
+                if dm_snap["status"] != "ok" or dm_snap["latest_price"] is None:
+                    # Same cold-start reasoning as Browserbase Market: right
+                    # after the bot boots, direct_market.py's loop hasn't
+                    # completed its first fetch for this pair yet. Poll
+                    # quietly instead of alarming the user during that
+                    # normal startup window.
+                    _dm_elapsed = dm_snap.get("starting_elapsed_secs")
+                    if dm_snap["status"] == "starting" and _dm_elapsed is not None \
+                            and _dm_elapsed < BB_WARMUP_GRACE_SECONDS:
+                        for _ in range(BB_WARMUP_POLL_SECONDS):
+                            if not _ad_running(sess, slot_idx): break
+                            await asyncio.sleep(1)
+                        continue
+
+                    _dm_err_note = f" ({_esc(str(dm_snap['last_error']))})" if dm_snap.get("last_error") else ""
+                    await bot.send_message(chat_id=chat_id,
+                        text=(f"⚠️ {prefix}<b>Cycle {cycle}</b> — Decodo market price not "
+                              f"ready yet (status: {dm_snap['status']}){_dm_err_note}. Skipping this cycle."),
+                        parse_mode="HTML")
+                    for _ in range(interval_secs):
+                        if not _ad_running(sess, slot_idx): break
+                        await asyncio.sleep(1)
+                    continue
+
+                new_p  = dm_snap["latest_price"]
+                _quant = Decimal("0.01")
+                chase_ceiling = False   # not applicable — this mode always targets a specific real price
+                logger.info(
+                    f"[{label}] Decodo Market ({_dm_pair_key}) rank #1 price {new_p} "
+                    f"from {dm_snap.get('latest_nickname','?')} (fetched_at={dm_snap.get('fetched_at')})"
+                )
+
             else:
                 try:
                     float_pct = float(s.get("float_pct") or 0)
@@ -6299,7 +6371,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
             # were silently burning through this ad's modify-rate budget,
             # which then made LATER cycles appear to "do nothing" while they
             # were actually just waiting for that budget to free up.
-            if sess.total_ad_slots() > 1 and mode not in ("ad_copy", "browserbase_market"):
+            if sess.total_ad_slots() > 1 and mode not in ("ad_copy", "browserbase_market", "decodo_market"):
                 new_p, _cycle_collided = _resolve_price_collision(
                     sess, slot_idx,
                     ad_data.get("currencyId",""), ad_data.get("tokenId",""),
@@ -6498,7 +6570,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                         return
 
 
-            elif ret_code == 90043 and mode in ("ad_copy", "browserbase_market"):
+            elif ret_code == 90043 and mode in ("ad_copy", "browserbase_market", "decodo_market"):
                 # For every OTHER mode this means "the computed price
                 # happens to round to what's already live — nudge off it".
                 # For Ad Copy (and, for the same reason, Browserbase Market)
@@ -8165,6 +8237,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         if is_usdt_usd or is_btc_ngn:
             rows.append([InlineKeyboardButton(("✅ " if cur_mode == "ad_copy" else "") + "🪞 Ad Copy", callback_data="set_mode_ad_copy")])
             rows.append([InlineKeyboardButton(("✅ " if cur_mode == "browserbase_market" else "") + "🌐 Browserbase Market", callback_data="set_mode_browserbase_market")])
+            rows.append([InlineKeyboardButton(("✅ " if cur_mode == "decodo_market" else "") + "⚡ Decodo Market", callback_data="set_mode_decodo_market")])
         rows += back_section("section_ads")
         txt = (
             f"🔀 <b>{_ad_slot_label(slot_idx)} — Choose Mode</b>\n\n"
@@ -8184,10 +8257,13 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 "🌐 <b>Browserbase Market</b> — every edit copies Bybit's live Rank #1 "
                 f"{'BTC/NGN' if is_btc_ngn else 'USDT/USD'} price, read from a shared browser-based "
                 "price feed (BTC/NGN and USDT/USD only).\n"
+                "⚡ <b>Decodo Market</b> — same idea as Browserbase Market (copies Bybit's live "
+                "Rank #1 price every edit), but reads from a lighter always-on direct-HTTP feed "
+                "instead of a browser session.\n"
             )
         await edit_menu(query, txt, InlineKeyboardMarkup(rows))
 
-    elif data in ("set_mode_fixed", "set_mode_floating", "set_mode_ad_copy", "set_mode_browserbase_market"):
+    elif data in ("set_mode_fixed", "set_mode_floating", "set_mode_ad_copy", "set_mode_browserbase_market", "set_mode_decodo_market"):
         sess = _s(tuser.id)
         slot_idx = sess.editing_slot
         if slot_idx in (-2, -3):
@@ -8202,6 +8278,13 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             _is_btc_ngn = _is_btc_ngn_ad(ad_data)
             if not (_is_usdt or _is_btc_ngn):
                 await query.answer("Browserbase Market is only available for USD/USDT and BTC/NGN ads.", show_alert=True)
+                return
+        if new_mode == "decodo_market":
+            _is_usdt = (ad_data.get("currencyId","").upper() == "USD"
+                        and ad_data.get("tokenId","").upper() == "USDT")
+            _is_btc_ngn = _is_btc_ngn_ad(ad_data)
+            if not (_is_usdt or _is_btc_ngn):
+                await query.answer("Decodo Market is only available for USD/USDT and BTC/NGN ads.", show_alert=True)
                 return
         if new_mode == "ad_copy":
             _is_usdt = (ad_data.get("currencyId","").upper() == "USD"
@@ -11717,6 +11800,14 @@ def start_bot():
         # via get_market_snapshot() when a user's ad is in
         # "browserbase_market" mode. Never creates a session per user.
         asyncio.create_task(start_market_collector())
+
+        # Shared Decodo market-price collector (BTC/NGN + USDT/USD Rank #1
+        # price) — same shared-cache idea as the Browserbase collector
+        # above, but plain HTTP requests through a Decodo ISP proxy
+        # instead of a browser session, and always-on rather than demand-
+        # gated (see direct_market.py's module docstring). Reads via
+        # get_direct_market_snapshot() when an ad is in "decodo_market" mode.
+        asyncio.create_task(start_direct_market_collector())
 
         # ── Set admin-scoped bot commands so only current ADMIN_IDS see admin cmds ──
         # This re-syncs on every deploy, so removed admin IDs lose the menu immediately.
