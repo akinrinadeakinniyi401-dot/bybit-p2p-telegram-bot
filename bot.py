@@ -37,6 +37,11 @@ from market_collector import (
     register_demand as _bb_register_demand,
     unregister_demand as _bb_unregister_demand,
 )
+from direct_market import (
+    get_direct_market_snapshot, direct_market_pair_key, start_direct_market_collector,
+    register_demand as _dm_register_demand,
+    unregister_demand as _dm_unregister_demand,
+)
 import db
 import subscription as sub
 from admin_commands import (
@@ -51,7 +56,7 @@ from config import REFERRAL_REWARD_NGN, BOT_OWNER_USERNAME, MIN_WITHDRAWAL_NGN, 
 logger = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────
-# ⏳ Browserbase Market mode — cold-start grace period
+# ⏳ Browserbase/Decodo Market modes — cold-start grace period
 # ─────────────────────────────────────────
 # market_collector.py closes its shared Browserbase session the instant
 # demand hits zero (to conserve the free plan's hour budget), so every
@@ -60,6 +65,10 @@ logger = logging.getLogger(__name__)
 # normal, not an error, so we don't alarm the user with a Telegram warning
 # during this window — instead we poll quickly and quietly until either
 # the price is ready or the grace period itself runs out.
+# direct_market.py's collector (decodo_market mode) is always-on rather
+# than demand-gated, but still has a short cold start right after the bot
+# boots (first fetch per pair hasn't completed yet) — these same
+# constants cover that window too.
 BB_WARMUP_GRACE_SECONDS = int(os.getenv("BB_WARMUP_GRACE_SECONDS", "20") or 20)
 BB_WARMUP_POLL_SECONDS  = 2
 
@@ -1031,7 +1040,7 @@ def _interval_floor_secs(s: dict, ad_data: dict):
     """
     if _is_usdt_usd_ad(ad_data):
         return bybit.MIN_USDT_INTERVAL_SECONDS
-    if _is_btc_ngn_ad(ad_data) and s.get("mode") in ("ad_copy", "browserbase_market"):
+    if _is_btc_ngn_ad(ad_data) and s.get("mode") in ("ad_copy", "browserbase_market", "decodo_market"):
         return bybit.MIN_BTC_NGN_ADCOPY_INTERVAL_SECONDS
     return None
 
@@ -1961,13 +1970,24 @@ def _has_usdt_usd_ad_configured(sess) -> bool:
     return False
 
 
+def _mode_display_label(mode: str) -> str:
+    """User-facing mode name for Telegram messages. Deliberately generic
+    for decodo_market — its DISPLAY name is "QUICK MARKET" everywhere the
+    user sees it, even though the setting is still stored internally as
+    "decodo_market" (so nothing about already-saved settings needs to
+    change, and the Auto Resume Agent / disk persistence keep working
+    exactly as before). Never call mode.upper() directly in a string that
+    reaches the user — always go through this."""
+    return {"decodo_market": "QUICK MARKET"}.get(mode, (mode or "").upper())
+
+
 def ads_section_keyboard(uid: int = 0):
     sess       = _s(uid) if uid else None
     slot_idx   = sess.editing_slot if sess else -1
     s          = _ad_settings(sess, slot_idx) if sess else {}
     ad_data    = _ad_data_of(sess, slot_idx) if sess else {}
     mode       = s.get("mode", "fixed")
-    mode_icon  = {"fixed": "💲", "floating": "📈", "ad_copy": "🪞", "browserbase_market": "🌐"}.get(mode, "💲")
+    mode_icon  = {"fixed": "💲", "floating": "📈", "ad_copy": "🪞", "browserbase_market": "🌐", "decodo_market": "⚡"}.get(mode, "💲")
     mode_label = f"{mode_icon} Mode: {mode.replace('_',' ').upper()}"
     ad_loaded  = bool(ad_data)
     running    = _ad_running(sess, slot_idx) if sess else False
@@ -2057,6 +2077,13 @@ def ads_section_keyboard(uid: int = 0):
         # concepts and must never appear (or be interacted with) here —
         # showing them previously was a bug (this mode fell through to
         # the floating-mode `else` branch below by accident).
+        pass
+    elif mode == "decodo_market":
+        # Same idea as Browserbase Market — copies Bybit's live Rank #1
+        # price every edit — just backed by direct_market.py's lighter
+        # always-on direct-HTTP collector (Decodo ISP proxy) instead of a
+        # Browserbase/Playwright session. No settings of its own for the
+        # same reason Browserbase Market has none.
         pass
     else:
         rows.append([InlineKeyboardButton("📊 Set Float %",   callback_data="set_float_pct")])
@@ -2158,6 +2185,8 @@ def ads_section_text(uid: int = 0) -> str:
         mode_info = f"  ➕ Increment: `+{increment}` per cycle"
     elif mode == "browserbase_market":
         mode_info = "  🌐 Copies Bybit's live Rank #1 price via Browserbase"
+    elif mode == "decodo_market":
+        mode_info = "  ⚡ Copies Bybit's live Rank #1 price (Quick Market)"
     else:
         mode_info = f"  📊 Float: `{float_pct}%`"
         if ad_data.get("currencyId","").upper() == "NGN":
@@ -2196,7 +2225,7 @@ def ads_dashboard_text(uid: int) -> str:
             price = ad_data.get("price", "—")
         else:
             pair, price = "not loaded yet", "—"
-        mode = s.get("mode", "fixed").upper()
+        mode = _mode_display_label(s.get("mode", "fixed"))
         lines.append(f"{icon} <b>{_ad_slot_label(i)}</b> — {pair} | 💲{price} | {mode} | {'Running' if running else 'Stopped'}")
     return "\n".join(lines)
 
@@ -5829,6 +5858,12 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
             # the instant every ad using this mode is stopped or switched
             # to something else, without needing to hook every stop path.
             _bb_unregister_demand(chat_id, slot_idx)
+            # Same idea for the Quick Market (direct_market.py/Decodo)
+            # collector — default to "not wanting it" every cycle too, so
+            # it makes zero requests the instant nothing needs this pair
+            # anymore (see direct_market.py's IDLE_GRACE_SECONDS for the
+            # short buffer before it actually treats a pair as idle).
+            _dm_unregister_demand(chat_id, slot_idx)
 
             if mode == "fixed":
                 new_p    = _ad_current_price(sess, slot_idx) + increment
@@ -6252,6 +6287,93 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                     f"from {snap.get('latest_nickname','?')} (fetched_at={snap.get('fetched_at')})"
                 )
 
+            elif mode == "decodo_market":
+                # ── Quick Market mode (BTC/NGN + USDT/USD only) ──
+                # Same idea as Browserbase Market mode — every edit copies
+                # Bybit's live Rank #1 price — but backed by
+                # direct_market.py's lightweight collector (plain requests
+                # through a proxy) instead of a Browserbase/Playwright
+                # session. Demand-driven exactly like Browserbase Market:
+                # register BEFORE checking the snapshot so the very first
+                # cycle after this mode starts already wakes the collector
+                # up, instead of waiting a full extra cycle.
+                _dm_pair_key = direct_market_pair_key(ad_data.get("tokenId",""), ad_data.get("currencyId",""))
+                if not _dm_pair_key:
+                    await bot.send_message(chat_id=chat_id,
+                        text=(
+                            f"❌ <b>{label} Quick Market mode stopped</b>\n\n"
+                            "This mode only supports BTC/NGN and USDT/USD ads.\n"
+                            "Switch this ad to a different mode, or point it at one of those pairs."
+                        ),
+                        parse_mode="HTML")
+                    _set_ad_running(sess, slot_idx, False)
+                    _set_ad_task(sess, slot_idx, None)
+                    return
+                _dm_register_demand(chat_id, slot_idx, _dm_pair_key)
+
+                dm_snap = get_direct_market_snapshot(_dm_pair_key)
+                if dm_snap["status"] != "ok" or dm_snap["latest_price"] is None:
+                    # Same cold-start reasoning as Browserbase Market: the
+                    # collector was idle (zero requests) until the
+                    # register_demand() call just above woke it up, and its
+                    # very first fetch for this pair genuinely takes a
+                    # moment. Poll quietly instead of alarming the user
+                    # during that normal startup window — by the NEXT
+                    # scheduled cycle it's already caught up and fast.
+                    _dm_elapsed = dm_snap.get("starting_elapsed_secs")
+                    if dm_snap["status"] == "starting" and _dm_elapsed is not None \
+                            and _dm_elapsed < BB_WARMUP_GRACE_SECONDS:
+                        for _ in range(BB_WARMUP_POLL_SECONDS):
+                            if not _ad_running(sess, slot_idx): break
+                            await asyncio.sleep(1)
+                        continue
+
+                    _dm_err_note = f" ({_esc(str(dm_snap['last_error']))})" if dm_snap.get("last_error") else ""
+                    await bot.send_message(chat_id=chat_id,
+                        text=(f"⚠️ {prefix}<b>Cycle {cycle}</b> — Quick Market price not "
+                              f"ready yet (status: {dm_snap['status']}){_dm_err_note}. Skipping this cycle."),
+                        parse_mode="HTML")
+                    for _ in range(interval_secs):
+                        if not _ad_running(sess, slot_idx): break
+                        await asyncio.sleep(1)
+                    continue
+
+                # ── Skip-until-price-actually-changes gate ──
+                # Same reasoning as Ad Copy's own gate a bit further up:
+                # Bybit's ranking rewards whichever ad edited to a given
+                # price FIRST. Re-submitting the identical price every
+                # scheduled cycle — even though nothing changed — still
+                # counts as a fresh edit, which resets THIS ad's own
+                # position and can push it down behind ads that were
+                # genuinely edited more recently. So once a price has been
+                # posted, do nothing more until the snapshot's rank #1
+                # price actually changes to something new.
+                _dm_new_p = dm_snap["latest_price"]
+                _dm_prev_price = s.get("quick_market_last_price")
+                if _dm_prev_price is not None and str(_dm_prev_price) == str(_dm_new_p):
+                    logger.info(
+                        f"[{label}] Quick Market ({_dm_pair_key}) price unchanged "
+                        f"({_dm_new_p}) since last copy — skipping edit this cycle"
+                    )
+                    await bot.send_message(chat_id=chat_id,
+                        text=(
+                            f"⏭ {prefix}<b>Cycle {cycle}</b> — Rank #1 price is still "
+                            f"<code>{_esc(str(_dm_new_p))}</code> (no change since last copy) — "
+                            f"skipping this edit to avoid resetting {label}'s ranking position."
+                        ), parse_mode="HTML")
+                    for _ in range(interval_secs):
+                        if not _ad_running(sess, slot_idx): break
+                        await asyncio.sleep(1)
+                    continue
+
+                new_p  = _dm_new_p
+                _quant = Decimal("0.01")
+                chase_ceiling = False   # not applicable — this mode always targets a specific real price
+                logger.info(
+                    f"[{label}] Quick Market ({_dm_pair_key}) rank #1 price {new_p} "
+                    f"from {dm_snap.get('latest_nickname','?')} (fetched_at={dm_snap.get('fetched_at')})"
+                )
+
             else:
                 try:
                     float_pct = float(s.get("float_pct") or 0)
@@ -6299,7 +6421,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
             # were silently burning through this ad's modify-rate budget,
             # which then made LATER cycles appear to "do nothing" while they
             # were actually just waiting for that budget to free up.
-            if sess.total_ad_slots() > 1 and mode not in ("ad_copy", "browserbase_market"):
+            if sess.total_ad_slots() > 1 and mode not in ("ad_copy", "browserbase_market", "decodo_market"):
                 new_p, _cycle_collided = _resolve_price_collision(
                     sess, slot_idx,
                     ad_data.get("currencyId",""), ad_data.get("tokenId",""),
@@ -6482,7 +6604,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                             text=(
                                 f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n"
                                 f"🏔 Chasing Bybit's live ceiling (max float {float_pct}%)\n"
-                                f"💲 Posted at Bybit's real-time max: <code>{posted_price}</code> ({mode.upper()})"
+                                f"💲 Posted at Bybit's real-time max: <code>{posted_price}</code> ({_mode_display_label(mode)})"
                             ),
                             parse_mode="HTML")
                     else:
@@ -6490,7 +6612,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                             text=(
                                 f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n"
                                 f"⚠️ Original <code>{new_p_str}</code> was out of range\n"
-                                f"💲 Posted within Bybit's limit: <code>{posted_price}</code> ({mode.upper()})"
+                                f"💲 Posted within Bybit's limit: <code>{posted_price}</code> ({_mode_display_label(mode)})"
                             ),
                             parse_mode="HTML")
                 else:
@@ -6498,7 +6620,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                         return
 
 
-            elif ret_code == 90043 and mode in ("ad_copy", "browserbase_market"):
+            elif ret_code == 90043 and mode in ("ad_copy", "browserbase_market", "decodo_market"):
                 # For every OTHER mode this means "the computed price
                 # happens to round to what's already live — nudge off it".
                 # For Ad Copy (and, for the same reason, Browserbase Market)
@@ -6515,12 +6637,14 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                         s["close_range_last_price"] = str(new_p)
                     elif _is_usdt_usd_ad(ad_data):
                         s["ad_copy_last_price"] = str(new_p)
+                elif mode == "decodo_market":
+                    s["quick_market_last_price"] = str(new_p)
                 logger.info(f"[{label}] Cycle {cycle} — 90043 (already at {new_p}) treated as success for {mode}, no nudge")
                 await bot.send_message(chat_id=chat_id,
                     text=(
                         f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n"
                         f"Already at the target price — no change needed\n"
-                        f"💲 <code>{new_p}</code> ({mode.upper()})"
+                        f"💲 <code>{new_p}</code> ({_mode_display_label(mode)})"
                     ),
                     parse_mode="HTML")
 
@@ -6595,7 +6719,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                         text=(
                             f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n"
                             f"⚠️ Price unchanged from last post — nudged\n"
-                            f"💲 <code>{posted_price}</code> ({mode.upper()})"
+                            f"💲 <code>{posted_price}</code> ({_mode_display_label(mode)})"
                         ),
                         parse_mode="HTML")
                 else:
@@ -6674,7 +6798,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                         elif _is_usdt_usd_ad(ad_data):
                             s["ad_copy_last_price"] = submit_str
                     await bot.send_message(chat_id=chat_id,
-                        text=f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n💲 <code>{submit_str}</code> ({mode.upper()})",
+                        text=f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n💲 <code>{submit_str}</code> ({_mode_display_label(mode)})",
                         parse_mode="HTML")
             else:
                 if await _handle_ad_cycle_failure(bot, chat_id, sess, slot_idx, label, cycle, ret_code, ret_msg, ad_data):
@@ -6740,6 +6864,11 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
         # collector's Browserbase session open (and burning the free
         # plan's monthly hour budget) after nothing is actually using it.
         _bb_unregister_demand(chat_id, slot_idx)
+        # Same for Quick Market — otherwise a phantom demand entry would
+        # keep direct_market.py's collector refreshing this pair (and
+        # spending Decodo bandwidth) for up to IDLE_GRACE_SECONDS after
+        # this ad has actually stopped.
+        _dm_unregister_demand(chat_id, slot_idx)
 
     logger.info(f"🛑 PRICE LOOP STOPPED ({label}) for user {chat_id}")
 
@@ -8165,6 +8294,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         if is_usdt_usd or is_btc_ngn:
             rows.append([InlineKeyboardButton(("✅ " if cur_mode == "ad_copy" else "") + "🪞 Ad Copy", callback_data="set_mode_ad_copy")])
             rows.append([InlineKeyboardButton(("✅ " if cur_mode == "browserbase_market" else "") + "🌐 Browserbase Market", callback_data="set_mode_browserbase_market")])
+            rows.append([InlineKeyboardButton(("✅ " if cur_mode == "decodo_market" else "") + "⚡ Quick Market", callback_data="set_mode_decodo_market")])
         rows += back_section("section_ads")
         txt = (
             f"🔀 <b>{_ad_slot_label(slot_idx)} — Choose Mode</b>\n\n"
@@ -8184,10 +8314,13 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 "🌐 <b>Browserbase Market</b> — every edit copies Bybit's live Rank #1 "
                 f"{'BTC/NGN' if is_btc_ngn else 'USDT/USD'} price, read from a shared browser-based "
                 "price feed (BTC/NGN and USDT/USD only).\n"
+                "⚡ <b>Quick Market</b> — same idea as Browserbase Market (copies Bybit's live "
+                "Rank #1 price every edit), but reads from a lighter always-on direct-HTTP feed "
+                "instead of a browser session.\n"
             )
         await edit_menu(query, txt, InlineKeyboardMarkup(rows))
 
-    elif data in ("set_mode_fixed", "set_mode_floating", "set_mode_ad_copy", "set_mode_browserbase_market"):
+    elif data in ("set_mode_fixed", "set_mode_floating", "set_mode_ad_copy", "set_mode_browserbase_market", "set_mode_decodo_market"):
         sess = _s(tuser.id)
         slot_idx = sess.editing_slot
         if slot_idx in (-2, -3):
@@ -8202,6 +8335,13 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             _is_btc_ngn = _is_btc_ngn_ad(ad_data)
             if not (_is_usdt or _is_btc_ngn):
                 await query.answer("Browserbase Market is only available for USD/USDT and BTC/NGN ads.", show_alert=True)
+                return
+        if new_mode == "decodo_market":
+            _is_usdt = (ad_data.get("currencyId","").upper() == "USD"
+                        and ad_data.get("tokenId","").upper() == "USDT")
+            _is_btc_ngn = _is_btc_ngn_ad(ad_data)
+            if not (_is_usdt or _is_btc_ngn):
+                await query.answer("Quick Market is only available for USD/USDT and BTC/NGN ads.", show_alert=True)
                 return
         if new_mode == "ad_copy":
             _is_usdt = (ad_data.get("currencyId","").upper() == "USD"
@@ -8655,7 +8795,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 InlineKeyboardMarkup(back_section("section_ads")))
             return
         mode = _s(tuser.id).settings.get("mode","fixed")
-        await edit_menu(query, f"⏳ Updating ({mode} mode)...", ads_section_keyboard(tuser.id))
+        await edit_menu(query, f"⏳ Updating ({_mode_display_label(mode)} mode)...", ads_section_keyboard(tuser.id))
         if mode == "fixed":
             # ── FIX: always compute the NEXT price (base + increment), not the last applied price.
             # current_price is 0 if the auto-loop has never run, so we start from ad_data["price"].
@@ -11717,6 +11857,15 @@ def start_bot():
         # via get_market_snapshot() when a user's ad is in
         # "browserbase_market" mode. Never creates a session per user.
         asyncio.create_task(start_market_collector())
+
+        # Shared "Quick Market" price collector (direct_market.py) —
+        # BTC/NGN + USDT/USD Rank #1 price via plain HTTP requests through
+        # a proxy instead of a browser session. Demand-driven exactly like
+        # the Browserbase collector above: makes ZERO requests until an ad
+        # actually switches into "decodo_market" mode, and goes back to
+        # idle ~60s after the last one stops (see direct_market.py's
+        # module docstring for the full idle/wake behavior).
+        asyncio.create_task(start_direct_market_collector())
 
         # ── Set admin-scoped bot commands so only current ADMIN_IDS see admin cmds ──
         # This re-syncs on every deploy, so removed admin IDs lose the menu immediately.
