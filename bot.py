@@ -6819,7 +6819,18 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                         # every cycle and NEVER matched, so Quick Market kept
                         # re-submitting the identical price every single
                         # cycle instead of skipping until it truly changed.
-                        s["quick_market_last_price"] = submit_str
+                        #
+                        # Store the RAW snapshot price (new_p), NOT the
+                        # quantized submit_str. The gate above compares
+                        # against dm_snap["latest_price"] fresh off the
+                        # snapshot every cycle (e.g. "1.018"), but submit_str
+                        # is quantized to this pair's posting precision
+                        # (e.g. "1.0180" for USDT/USD's 4dp). Storing the
+                        # quantized/padded form made the two never match —
+                        # the gate always saw "1.0180" != "1.018" and
+                        # re-submitted every cycle even though the snapshot
+                        # price hadn't moved at all.
+                        s["quick_market_last_price"] = str(new_p)
                     await bot.send_message(chat_id=chat_id,
                         text=f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n💲 <code>{submit_str}</code> ({_mode_display_label(mode)})",
                         parse_mode="HTML")
