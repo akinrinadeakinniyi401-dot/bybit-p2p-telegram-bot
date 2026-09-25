@@ -217,6 +217,18 @@ MAX_ADS_PER_USER = 3
 #      rare — polling often mostly confirms "nothing changed, skip".
 MIN_USDT_INTERVAL_SECONDS = 25
 
+# USDT/USD in QUICK MARKET (decodo_market) mode only. Same reasoning as
+# BTC/NGN's own Quick Market floor below: this mode copies a shared,
+# already-cached snapshot (direct_market.py) instead of hitting Bybit's
+# market-ads listing itself, and only ever submits an edit when that
+# snapshot's price actually changes (see bot.py's Quick Market
+# skip-until-changed gate) — so a fast poll here is mostly a cheap local
+# cache read, not a write, and doesn't touch the 10-edits-per-5-minutes
+# write limit any harder than the slower floor did. Ad Copy and
+# Browserbase Market for USDT/USD are UNCHANGED and still use the 25s
+# floor above — this only loosens the floor for Quick Market specifically.
+MIN_USDT_QUICKMARKET_INTERVAL_SECONDS = 5
+
 # BTC/NGN in AD COPY mode only. Same reasoning as USDT/USD above — it's a
 # copy mode, so a fast cycle is mostly reads and it only submits an edit
 # when a new leading price actually appears in the tracked band. Floating
