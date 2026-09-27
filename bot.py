@@ -6633,6 +6633,13 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                 if posted_price is not None:
                     _reset_ad_failures(sess, slot_idx)
                     _set_ad_current_price(sess, slot_idx, posted_price)
+                    if mode == "ad_copy":
+                        if _is_btc_ngn_ad(ad_data):
+                            s["close_range_last_price"] = str(posted_price)
+                        elif _is_usdt_usd_ad(ad_data):
+                            s["ad_copy_last_price"] = str(posted_price)
+                    elif mode == "decodo_market":
+                        s["quick_market_last_price"] = str(posted_price)
                     if chase_ceiling:
                         await bot.send_message(chat_id=chat_id,
                             text=(
@@ -6831,6 +6838,8 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                             s["close_range_last_price"] = submit_str
                         elif _is_usdt_usd_ad(ad_data):
                             s["ad_copy_last_price"] = submit_str
+                    elif mode == "decodo_market":
+                        s["quick_market_last_price"] = submit_str
                     await bot.send_message(chat_id=chat_id,
                         text=f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n💲 <code>{submit_str}</code> ({_mode_display_label(mode)})",
                         parse_mode="HTML")
