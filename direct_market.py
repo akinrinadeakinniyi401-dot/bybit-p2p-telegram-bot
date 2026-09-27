@@ -59,7 +59,7 @@ DECODO ENV VARS (required):
     DECODO_HOST       — the host/IP Decodo gave you for this proxy
     DECODO_PORT       — the port Decodo gave you for this proxy
 Optional:
-    DIRECT_MARKET_REFRESH_SECONDS     — default 10 (active-pair cadence)
+    DIRECT_MARKET_REFRESH_SECONDS     — default 5 (active-pair cadence)
     DIRECT_MARKET_IDLE_POLL_SECONDS   — default 3  (idle-check cadence
                                          while NOTHING has demand)
     DIRECT_MARKET_IDLE_GRACE_SECONDS  — default 60 (how long a pair keeps
@@ -139,7 +139,7 @@ PAIR_CONFIGS = {
     },
 }
 
-REFRESH_SECONDS    = int(os.getenv("DIRECT_MARKET_REFRESH_SECONDS", "10") or 10)
+REFRESH_SECONDS    = int(os.getenv("DIRECT_MARKET_REFRESH_SECONDS", "5") or 5)
 IDLE_POLL_SECONDS  = int(os.getenv("DIRECT_MARKET_IDLE_POLL_SECONDS", "3") or 3)
 IDLE_GRACE_SECONDS = int(os.getenv("DIRECT_MARKET_IDLE_GRACE_SECONDS", "60") or 60)
 
