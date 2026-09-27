@@ -1058,7 +1058,7 @@ async def _usdt_triad_loop(bot, chat_id: int):
 
 def _is_usdt_usd_ad(ad_data: dict) -> bool:
     """True if this ad's pair is USDT/USD — the one pair allowed to run on
-    a seconds-level interval (floor 25s, see MIN_USDT_INTERVAL_SECONDS)."""
+    a seconds-level interval (floor 5s, see MIN_USDT_INTERVAL_SECONDS)."""
     return (ad_data.get("tokenId", "").upper() == "USDT"
             and ad_data.get("currencyId", "").upper() == "USD")
 
@@ -1066,7 +1066,7 @@ def _is_usdt_usd_ad(ad_data: dict) -> bool:
 def _interval_floor_secs(s: dict, ad_data: dict):
     """The seconds-level interval floor for this ad, or None if this ad
     uses the normal whole-minutes floor instead.
-      • USDT/USD               → 25s
+      • USDT/USD               → 5s
       • BTC/NGN in ad_copy mode → 10s
     Floating/fixed BTC/NGN ads are NOT included — they keep the 2-minute
     floor, since they submit an edit every cycle rather than only on a
@@ -5842,7 +5842,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
     interval  = s.get("interval", 2)
     # Seconds-resolution interval. Non-USDT ads resolve to interval*60
     # exactly as before; USDT/USD ads may carry a finer interval_secs
-    # (floor 25s). Every wait below uses this instead of interval*60.
+    # (floor 5s). Every wait below uses this instead of interval*60.
     interval_secs = _ad_interval_seconds(s, ad_data)
     increment = Decimal(str(s.get("increment","0.05")))
     # Sync our tracked state to Bybit's REAL live price for this ad the
@@ -6461,7 +6461,15 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                     ad_data.get("currencyId",""), ad_data.get("tokenId",""),
                     new_p
                 )
-            new_p_str = str(new_p.quantize(_quant, rounding=ROUND_HALF_UP))
+            if mode in ("ad_copy", "browserbase_market", "decodo_market"):
+                # Copy modes post EXACTLY what the market/snapshot gave —
+                # no rounding. Forcing these through the same 2-decimal
+                # quantize() used by fixed/floating mode was silently
+                # turning e.g. "1.015" into "1.02", which isn't the price
+                # that was actually copied.
+                new_p_str = str(new_p)
+            else:
+                new_p_str = str(new_p.quantize(_quant, rounding=ROUND_HALF_UP))
 
             # ── Live-ceiling chase (max floating %) ──
             # At the top float % for this pair, submit a price deliberately
@@ -9604,7 +9612,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 return
             # ── Interval floor — defense in depth (already enforced when the
             # value was entered, but re-checked here in case of stale state) ──
-            # USDT/USD runs on a seconds-level floor (25s) rather than the
+            # USDT/USD runs on a seconds-level floor (5s) rather than the
             # 2-minute one, so it must be checked against its own rule —
             # otherwise its synced-down minutes value would fail the
             # minutes floor and block the ad from ever starting.
