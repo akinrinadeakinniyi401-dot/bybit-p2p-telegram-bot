@@ -6053,7 +6053,18 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                     # Only move when a genuinely NEW price appears at this
                     # rank — re-posting an unchanged price would just reset
                     # this ad's own position for nothing.
-                    _prev = s.get("close_range_last_price")
+                    #
+                    # Compares against the ad's ACTUAL live price
+                    # (ad_data["price"], kept fresh below on every
+                    # successful post AND refreshed by "Fetch Ad Details")
+                    # rather than only our own memory of what we last
+                    # posted — that memory alone goes stale the moment the
+                    # ad is edited some other way (manually on Bybit, or
+                    # from a previous bot run) while this bot wasn't the
+                    # one doing it, which used to make the bot wrongly
+                    # "confirm" no change was needed against a price the
+                    # ad was never actually at.
+                    _prev = ad_data.get("price")
                     if _prev is not None and _price_str_equal(_prev, _btc_match_price):
                         logger.info(
                             f"[{label}] Ad Copy (BTC/NGN) rank {_top_range} price unchanged "
@@ -6155,7 +6166,11 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                     # CHANGES to something new — only then is there a real
                     # reason to move and it's worth re-claiming a fresh
                     # "first" position at the new price.
-                    _prev_price = s.get("ad_copy_last_price")
+                    # Compares against the ad's ACTUAL live price
+                    # (ad_data["price"]) rather than only our own memory of
+                    # what we last posted — see the identical fix and full
+                    # explanation on the BTC/NGN Ad Copy check above.
+                    _prev_price = ad_data.get("price")
                     if _prev_price is not None and _price_str_equal(_prev_price, _chosen_price):
                         logger.info(
                             f"[{label}] Ad Copy (USDT/USD) highest-common price unchanged "
@@ -6382,8 +6397,21 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                 # genuinely edited more recently. So once a price has been
                 # posted, do nothing more until the snapshot's rank #1
                 # price actually changes to something new.
+                #
+                # Compares against the ad's ACTUAL live price
+                # (ad_data["price"]) rather than only the bot's own memory
+                # of what it last posted — that memory alone goes stale
+                # the instant the ad is changed some other way (manually
+                # on Bybit's app, or a previous bot run) while auto-update
+                # is stopped: the bot would otherwise still think "already
+                # there" against a price the ad was never actually
+                # returned to, and silently never re-sync it. ad_data
+                # itself is refreshed either by "Fetch Ad Details" or by
+                # this same mode's own successful posts below, so it's
+                # always the true current state, not just this bot's
+                # memory of its own actions.
                 _dm_new_p = dm_snap["latest_price"]
-                _dm_prev_price = s.get("quick_market_last_price")
+                _dm_prev_price = ad_data.get("price")
                 if _dm_prev_price is not None and _price_str_equal(_dm_prev_price, _dm_new_p):
                     logger.info(
                         f"[{label}] Quick Market ({_dm_pair_key}) price unchanged "
@@ -6641,6 +6669,12 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                 if posted_price is not None:
                     _reset_ad_failures(sess, slot_idx)
                     _set_ad_current_price(sess, slot_idx, posted_price)
+                    if mode in ("ad_copy", "decodo_market"):
+                        # ad_data["price"] is the actual source of truth the
+                        # skip-checks above compare against — keep it in
+                        # sync immediately rather than waiting for the next
+                        # manual "Fetch Ad Details".
+                        ad_data["price"] = str(posted_price)
                     if mode == "ad_copy":
                         if _is_btc_ngn_ad(ad_data):
                             s["close_range_last_price"] = str(posted_price)
@@ -6681,6 +6715,8 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                 # for no reason at all. Treat it as confirmation of success.
                 _reset_ad_failures(sess, slot_idx)
                 _set_ad_current_price(sess, slot_idx, new_p)
+                if mode in ("ad_copy", "decodo_market"):
+                    ad_data["price"] = str(new_p)
                 if mode == "ad_copy":
                     if _is_btc_ngn_ad(ad_data):
                         s["close_range_last_price"] = str(new_p)
@@ -6841,6 +6877,8 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                     # actually moved to, and kept "confirming" no change was
                     # needed forever while the real ad sat frozen at its old
                     # price on Bybit.
+                    if mode in ("ad_copy", "decodo_market"):
+                        ad_data["price"] = submit_str
                     if mode == "ad_copy":
                         if _is_btc_ngn_ad(ad_data):
                             s["close_range_last_price"] = submit_str
