@@ -6,7 +6,7 @@ import re
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 import logging
-from decimal import Decimal, ROUND_HALF_UP, ROUND_FLOOR, ROUND_CEILING
+from decimal import Decimal, ROUND_HALF_UP, ROUND_FLOOR, ROUND_CEILING, InvalidOperation
 from datetime import datetime
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.error import RetryAfter, Forbidden
@@ -662,24 +662,58 @@ async def _fetch_market_ads_range(token: str, currency: str, side: str,
     return items[max(offset_start, 0):offset_end]
 
 
+def _price_str_equal(a, b) -> bool:
+    """True if two price-like values represent the SAME number, even if
+    their exact text differs (trailing zeros, '1200' vs '1200.00', etc).
+    Comparing prices as raw text is what caused USDT AD2/AD3 to get
+    re-edited every single cycle even though the price hadn't actually
+    changed: different competing ads (or the same ad reported with
+    different formatting between polls) can list numerically-identical
+    prices with cosmetically different strings, and a raw `==` treats
+    those as a real change. Falls back to exact string equality only if
+    either value truly isn't parseable as a number."""
+    if a is None or b is None:
+        return False
+    try:
+        return Decimal(str(a)) == Decimal(str(b))
+    except (InvalidOperation, ValueError, TypeError):
+        return str(a) == str(b)
+
+
 def _rank_ad_copy_prices(combined: list, top_n: int) -> list:
     """Like _pick_ad_copy_price_windowed but returns up to `top_n` DISTINCT
     non-junk prices, ranked by occurrence count (highest first, ties
     broken by earliest occurrence in `combined`). Used by the USDT triad
     coordinator, which needs the whole top-N ranking at once (not just
     #1) to decide which participant holds which rank.
+
+    Groups by NUMERIC VALUE (Decimal), not raw string — two ads listing
+    the "same" price with different formatting (e.g. "1200" vs "1200.00")
+    are the same price on Bybit and must be counted together, or a
+    genuinely-leading price can get split across its cosmetic variants
+    and under-counted/mis-ranked.
     """
     if not combined:
         return []
     from collections import Counter
-    prices = [str(it.get("price", "")) for it in combined]
-    counts = Counter(prices)
+    raw_prices  = [str(it.get("price", "")) for it in combined]
+    decimal_of  = {}   # Decimal value -> first raw string seen for it (kept for display/posting)
+    values      = []
+    for p in raw_prices:
+        try:
+            d = Decimal(p)
+        except (InvalidOperation, ValueError):
+            continue
+        values.append(d)
+        decimal_of.setdefault(d, p)
+    counts = Counter(values)
     first_seen = {}
-    for idx, p in enumerate(prices):
-        first_seen.setdefault(p, idx)
-    ranked = sorted(counts.keys(), key=lambda p: (-counts[p], first_seen[p]))
+    for idx, d in enumerate(values):
+        first_seen.setdefault(d, idx)
+    ranked = sorted(counts.keys(), key=lambda d: (-counts[d], first_seen[d]))
     result = []
-    for p in ranked:
+    for d in ranked:
+        p = decimal_of[d]
         if _is_ad_copy_junk_price(p):
             continue
         result.append(p)
@@ -875,7 +909,7 @@ async def _usdt_triad_loop(bot, chat_id: int):
                     for idx in participants:
                         if idx in staying:
                             continue
-                        if current_prices.get(idx) == price:
+                        if _price_str_equal(current_prices.get(idx), price):
                             claimed_ranks[rank_i] = idx
                             staying.add(idx)
                             break
@@ -1032,16 +1066,13 @@ def _is_usdt_usd_ad(ad_data: dict) -> bool:
 def _interval_floor_secs(s: dict, ad_data: dict):
     """The seconds-level interval floor for this ad, or None if this ad
     uses the normal whole-minutes floor instead.
-      • USDT/USD in ad_copy/browserbase_market mode → 25s
-      • USDT/USD in decodo_market (Quick Market) mode → 5s
-      • BTC/NGN in ad_copy/browserbase_market/decodo_market mode → 3s
+      • USDT/USD               → 25s
+      • BTC/NGN in ad_copy mode → 10s
     Floating/fixed BTC/NGN ads are NOT included — they keep the 2-minute
     floor, since they submit an edit every cycle rather than only on a
     genuine price change.
     """
     if _is_usdt_usd_ad(ad_data):
-        if s.get("mode") == "decodo_market":
-            return bybit.MIN_USDT_QUICKMARKET_INTERVAL_SECONDS
         return bybit.MIN_USDT_INTERVAL_SECONDS
     if _is_btc_ngn_ad(ad_data) and s.get("mode") in ("ad_copy", "browserbase_market", "decodo_market"):
         return bybit.MIN_BTC_NGN_ADCOPY_INTERVAL_SECONDS
@@ -6023,7 +6054,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                     # rank — re-posting an unchanged price would just reset
                     # this ad's own position for nothing.
                     _prev = s.get("close_range_last_price")
-                    if _prev is not None and str(_prev) == str(_btc_match_price):
+                    if _prev is not None and _price_str_equal(_prev, _btc_match_price):
                         logger.info(
                             f"[{label}] Ad Copy (BTC/NGN) rank {_top_range} price unchanged "
                             f"({_btc_match_price}) — skipping edit this cycle"
@@ -6125,7 +6156,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                     # reason to move and it's worth re-claiming a fresh
                     # "first" position at the new price.
                     _prev_price = s.get("ad_copy_last_price")
-                    if _prev_price is not None and str(_prev_price) == str(_chosen_price):
+                    if _prev_price is not None and _price_str_equal(_prev_price, _chosen_price):
                         logger.info(
                             f"[{label}] Ad Copy (USDT/USD) highest-common price unchanged "
                             f"({_chosen_price}) since last copy — skipping edit this cycle "
@@ -6353,7 +6384,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                 # price actually changes to something new.
                 _dm_new_p = dm_snap["latest_price"]
                 _dm_prev_price = s.get("quick_market_last_price")
-                if _dm_prev_price is not None and str(_dm_prev_price) == str(_dm_new_p):
+                if _dm_prev_price is not None and _price_str_equal(_dm_prev_price, _dm_new_p):
                     logger.info(
                         f"[{label}] Quick Market ({_dm_pair_key}) price unchanged "
                         f"({_dm_new_p}) since last copy — skipping edit this cycle"
@@ -6370,14 +6401,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                     continue
 
                 new_p  = _dm_new_p
-                # BTC/NGN prices are 2dp; USDT/USD needs finer precision
-                # (matches Ad Copy's own USDT/USD quant a bit further up).
-                # This was previously hardcoded to Decimal("0.01") for BOTH
-                # pairs, which silently rounded a real USDT/USD snapshot
-                # price like 1.018 up to 1.02 before it was ever submitted
-                # to Bybit — the bot wasn't reading the wrong number, it was
-                # quantizing the right one down to the wrong precision.
-                _quant = Decimal("0.01") if _dm_pair_key == "BTC_NGN" else Decimal("0.0001")
+                _quant = Decimal("0.01")
                 chase_ceiling = False   # not applicable — this mode always targets a specific real price
                 logger.info(
                     f"[{label}] Quick Market ({_dm_pair_key}) rank #1 price {new_p} "
@@ -6807,30 +6831,6 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                             s["close_range_last_price"] = submit_str
                         elif _is_usdt_usd_ad(ad_data):
                             s["ad_copy_last_price"] = submit_str
-                    elif mode == "decodo_market":
-                        # Same reasoning as ad_copy just above: only commit
-                        # the "last price" the skip-gate (further up, in the
-                        # decodo_market branch) compares against once Bybit
-                        # has actually confirmed this price went live. This
-                        # was previously only committed on the rare 90043
-                        # ("already at this price") path, so a normal
-                        # successful modify never updated it — meaning the
-                        # skip-gate compared against a stale/empty value
-                        # every cycle and NEVER matched, so Quick Market kept
-                        # re-submitting the identical price every single
-                        # cycle instead of skipping until it truly changed.
-                        #
-                        # Store the RAW snapshot price (new_p), NOT the
-                        # quantized submit_str. The gate above compares
-                        # against dm_snap["latest_price"] fresh off the
-                        # snapshot every cycle (e.g. "1.018"), but submit_str
-                        # is quantized to this pair's posting precision
-                        # (e.g. "1.0180" for USDT/USD's 4dp). Storing the
-                        # quantized/padded form made the two never match —
-                        # the gate always saw "1.0180" != "1.018" and
-                        # re-submitted every cycle even though the snapshot
-                        # price hadn't moved at all.
-                        s["quick_market_last_price"] = str(new_p)
                     await bot.send_message(chat_id=chat_id,
                         text=f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n💲 <code>{submit_str}</code> ({_mode_display_label(mode)})",
                         parse_mode="HTML")
