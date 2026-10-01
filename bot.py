@@ -1656,12 +1656,20 @@ def _save_settings(uid: int):
     delete multi-ad configuration that was never being saved before.
     Also persists the dedicated USDT AD2/USDT AD3 slots when present."""
     sess = get_session(uid)
-    db.save_settings(uid, sess.settings)
-    db.save_extra_slots(uid, [slot["settings"] for slot in sess.extra_ad_slots])
+
+    def _persistable(d: dict) -> dict:
+        # `_notify_last_*` are runtime-only notification throttles (see
+        # _should_notify_now) — no reason to write them to disk, and keeping
+        # them out guarantees a stray non-JSON value there can never block
+        # a save again.
+        return {k: v for k, v in d.items() if not str(k).startswith("_notify_last_")}
+
+    db.save_settings(uid, _persistable(sess.settings))
+    db.save_extra_slots(uid, [_persistable(slot["settings"]) for slot in sess.extra_ad_slots])
     if sess.usdt_ad2 is not None:
-        db.save_usdt_ad_slot(uid, "2", sess.usdt_ad2["settings"])
+        db.save_usdt_ad_slot(uid, "2", _persistable(sess.usdt_ad2["settings"]))
     if sess.usdt_ad3 is not None:
-        db.save_usdt_ad_slot(uid, "3", sess.usdt_ad3["settings"])
+        db.save_usdt_ad_slot(uid, "3", _persistable(sess.usdt_ad3["settings"]))
 
 def _load_settings_from_disk(uid: int):
     """Load persisted settings from disk into the user's session on first access.
@@ -2080,12 +2088,22 @@ def _should_notify_now(s: dict, key: str, cooldown_secs: int = None) -> bool:
     cycle regardless — this only throttles the Telegram message."""
     if cooldown_secs is None:
         cooldown_secs = _NOTIFY_COOLDOWN_SECONDS
-    now = datetime.now()
+    # IMPORTANT: `s` is the ad's SETTINGS dict, which db.save_settings()
+    # writes straight to disk as JSON. This used to store a datetime object
+    # here, and json.dump can't serialize one — so every save for that user
+    # failed with "Object of type datetime is not JSON serializable" (logged
+    # by db._write_json, but never raised), silently freezing ALL of that
+    # user's persisted settings (ad_id, mode, interval, slots...) at whatever
+    # was last saved before the first throttled notification fired. A plain
+    # epoch float is JSON-safe. Legacy/odd values (an old datetime, or a
+    # string left behind by a previous version) are treated as "never sent".
+    now_ts = datetime.now().timestamp()
     field = f"_notify_last_{key}"
     last = s.get(field)
-    if last is not None and (now - last).total_seconds() < cooldown_secs:
-        return False
-    s[field] = now
+    if isinstance(last, (int, float)) and not isinstance(last, bool):
+        if now_ts - last < cooldown_secs:
+            return False
+    s[field] = now_ts
     return True
 
 
@@ -7416,9 +7434,43 @@ async def ping_bybit_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             parse_mode="HTML"
         )
     else:
-        await _safe_reply(update.message,
-            f"❌ <b>API failed</b>\n<code>{_esc(result.get('retMsg',''))}</code>", parse_mode="HTML"
-        )
+        _msg = result.get("retMsg", "")
+        if ret_code == 10010 or "IP" in str(_msg).upper():
+            # Bybit only returns 10010 AFTER it has recognised the API key —
+            # a missing/wrong key gets a different error. So this is an IP
+            # mismatch, not a "bot can't read the key" problem. Show exactly
+            # which key was sent and which IP(s) this server is really using,
+            # so the user whitelists what Bybit actually sees.
+            src, tail = bybit.credential_source(creds)
+            ips = await asyncio.get_event_loop().run_in_executor(
+                None, partial(bybit.get_egress_ips, creds, 3)
+            )
+            logger.warning(f"[PingBybit] user={uid} 10010 | key=...{tail} ({src}) | egress IPs seen: {ips}")
+            via_proxy = bool(creds and creds.get("proxy_url"))
+            if len(ips) > 1:
+                ip_note = (
+                    "⚠️ This server is leaving from <b>more than one IP</b>:\n"
+                    + "\n".join(f"  • <code>{_esc(i)}</code>" for i in ips)
+                    + "\n\nWhitelisting just one of them will fail intermittently. Whitelist ALL of "
+                      "them, or use the Permanent IP option."
+                )
+            elif ips:
+                ip_note = f"🌍 Server IP right now: <code>{_esc(ips[0])}</code>"
+            else:
+                ip_note = "🌍 Couldn't determine the server's outbound IP."
+            await _safe_reply(update.message,
+                f"🚫 <b>Bybit rejected the IP (10010)</b>\n\n"
+                f"🔑 Key sent: <code>...{_esc(tail)}</code> — {_esc(src)}\n"
+                f"🛣 Route: {'Permanent IP relay' if via_proxy else 'direct (shared server IP)'}\n"
+                f"{ip_note}\n\n"
+                f"👉 On Bybit → API Management → <b>this exact key</b> → Edit → Bind IP, "
+                f"make sure the IP above is listed (and the key's IP-restriction is saved).",
+                parse_mode="HTML"
+            )
+        else:
+            await _safe_reply(update.message,
+                f"❌ <b>API failed</b>\n<code>{_esc(_msg)}</code>", parse_mode="HTML"
+            )
 
 
 async def ping_flutterwave_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
