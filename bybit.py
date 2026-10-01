@@ -396,6 +396,45 @@ def _get_auth(endpoint: str, params: dict | None = None,
 
 
 # ─────────────────────────────────────────
+# 🌍 Egress IP sampling (diagnostics)
+# ─────────────────────────────────────────
+def get_egress_ips(creds: dict | None = None, samples: int = 3) -> list:
+    """Return the DISTINCT public IPs outbound requests are leaving from,
+    using the SAME route a Bybit call for these creds would take (i.e. through
+    the Permanent-IP proxy if this user has it active, direct otherwise).
+
+    Sampled several times on purpose: on shared-egress hosts (Render's base
+    plan) consecutive requests can leave from DIFFERENT addresses in a pool.
+    If this returns more than one IP, whitelisting a single address can never
+    be reliable — that's the signature of the problem, not a DB/key issue.
+    """
+    proxies = _resolve_proxies(creds)
+    seen: list = []
+    for _ in range(max(1, samples)):
+        for svc in ("https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"):
+            try:
+                ip = requests.get(svc, timeout=5, proxies=proxies).text.strip()
+            except Exception:
+                continue
+            if ip:
+                if ip not in seen:
+                    seen.append(ip)
+                break
+    return seen
+
+
+def credential_source(creds: dict | None) -> tuple[str, str]:
+    """(source_label, key_tail) for the creds a call will actually use — so a
+    failed ping can say WHICH key was sent (per-user DB key vs. admin env
+    fallback) instead of leaving that as a guess."""
+    if creds and creds.get("key") and creds.get("secret"):
+        return "your saved key", creds["key"].strip()[-4:]
+    if BYBIT_ACCOUNTS:
+        return "server env key (no DB key found)", str(BYBIT_ACCOUNTS[_active_index].get("key", ""))[-4:]
+    return "no key", ""
+
+
+# ─────────────────────────────────────────
 # 🏓 Ping
 # ─────────────────────────────────────────
 def ping_api(creds: dict | None = None) -> dict:
