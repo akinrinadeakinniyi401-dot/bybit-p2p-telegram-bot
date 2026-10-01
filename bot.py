@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 import logging
 from decimal import Decimal, ROUND_HALF_UP, ROUND_FLOOR, ROUND_CEILING, InvalidOperation
-from datetime import datetime
+from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
 from telegram.error import RetryAfter, Forbidden
 from telegram.ext import (
@@ -795,7 +795,7 @@ async def _usdt_triad_reconcile(bot, chat_id: int, sess):
         # so a full bundled status here would just be a near-duplicate.
         try:
             note = "▶️ USDT/USD rank rotation engaged." if not _was_running else "🔁 USDT/USD rank rotation participant set changed."
-            await bot.send_message(chat_id=chat_id, text=note)
+            await _safe_send(bot, chat_id=chat_id, text=note)
         except Exception:
             pass
     else:
@@ -811,7 +811,7 @@ async def _usdt_triad_reconcile(bot, chat_id: int, sess):
             _set_ad_task(sess, solo_idx, task)
             logger.info(f"[USDT Triad] {_ad_slot_label(solo_idx)} handed back to solo Ad Copy loop")
             try:
-                await bot.send_message(
+                await _safe_send(bot, 
                     chat_id=chat_id,
                     text=(
                         f"⏸ USDT/USD rank rotation paused — only one participant left active.\n\n"
@@ -824,7 +824,7 @@ async def _usdt_triad_reconcile(bot, chat_id: int, sess):
                 pass
         else:
             try:
-                await bot.send_message(chat_id=chat_id, text="⏹ USDT/USD rank rotation stopped — no participants active.")
+                await _safe_send(bot, chat_id=chat_id, text="⏹ USDT/USD rank rotation stopped — no participants active.")
             except Exception:
                 pass
 
@@ -2002,6 +2002,118 @@ def _has_usdt_usd_ad_configured(sess) -> bool:
         if ad_data.get("tokenId","").upper() == "USDT" and ad_data.get("currencyId","").upper() == "USD":
             return True
     return False
+
+
+_flood_controlled_until: dict = {}   # chat_id -> datetime after which sends may be attempted again
+
+def _mark_flood_controlled(chat_id, retry_after_seconds):
+    _flood_controlled_until[chat_id] = datetime.now() + timedelta(seconds=(retry_after_seconds or 0) + 5)
+
+def _is_flood_controlled(chat_id) -> bool:
+    until = _flood_controlled_until.get(chat_id)
+    return until is not None and datetime.now() < until
+
+
+async def _safe_send(bot, **kwargs) -> bool:
+    """Drop-in replacement for `bot.send_message(...)` that NEVER raises.
+
+    This exists because of a real incident: auto_update_loop and the USDT
+    triad loop call bot.send_message on almost every cycle — every 5s in
+    Quick Market mode, across up to 3 ads. Once Telegram's flood control
+    kicks in for a chat (telegram.error.RetryAfter), EVERY subsequent
+    send_message to that chat raises the same exception until the
+    cooldown expires — observed in production at ~3997 seconds (over an
+    hour). Since none of these call sites were wrapped, that exception
+    propagated straight up and silently killed the whole asyncio task —
+    which is to say, that user's ad just stopped auto-updating with
+    nothing in the chat to explain why ("the bot suddenly stopped
+    working"). This wrapper catches that (and any other send failure),
+    logs it, and lets the loop continue normally on its next cycle
+    instead of dying.
+
+    Also remembers which chats are currently flood-controlled and skips
+    even ATTEMPTING a send during that window, rather than hitting the
+    exact same RetryAfter every single cycle for the next hour — that
+    both wastes an outbound call every cycle and spams the log.
+
+    Returns True if the message was actually sent, False otherwise —
+    callers that don't care can just ignore the return value, exactly
+    like the `await bot.send_message(...)` statements this replaces.
+    """
+    chat_id = kwargs.get("chat_id")
+    if chat_id is not None and _is_flood_controlled(chat_id):
+        return False
+    try:
+        await bot.send_message(**kwargs)
+        return True
+    except RetryAfter as e:
+        logger.warning(
+            f"[TelegramFlood] chat={chat_id} flood-controlled — "
+            f"retry_after={e.retry_after}s; suppressing further sends to "
+            f"this chat until then instead of hitting this on every cycle"
+        )
+        if chat_id is not None:
+            _mark_flood_controlled(chat_id, e.retry_after)
+        return False
+    except Forbidden:
+        logger.info(f"[Telegram] chat={chat_id} has blocked the bot or is unreachable — message dropped")
+        return False
+    except Exception as e:
+        logger.warning(f"[Telegram] send_message to {chat_id} failed: {e} — message dropped, loop continues")
+        return False
+
+
+_NOTIFY_COOLDOWN_SECONDS = int(os.getenv("AD_EDIT_NOTIFY_COOLDOWN_SECONDS", "300") or 300)
+
+def _should_notify_now(s: dict, key: str, cooldown_secs: int = None) -> bool:
+    """Throttles a repetitive per-cycle notification (e.g. "price
+    unchanged, skipping") to at most once per `cooldown_secs` (default 5
+    minutes) PER AD SLOT, regardless of how fast that ad's own interval
+    is. Without this, a fast-polling mode like Quick Market (5s interval)
+    sends the exact same "no change" message every single cycle — up to
+    720/hour per ad — which is what triggered Telegram's flood control in
+    production (a reported >3900 second, i.e. over an hour, lockout for
+    that chat). Always returns True the first time a given `key` is seen
+    for this ad, so the user still gets immediate confirmation the first
+    time something happens; only REPEATS of the same state are throttled.
+    The underlying event is still logged to Render's own logs every
+    cycle regardless — this only throttles the Telegram message."""
+    if cooldown_secs is None:
+        cooldown_secs = _NOTIFY_COOLDOWN_SECONDS
+    now = datetime.now()
+    field = f"_notify_last_{key}"
+    last = s.get(field)
+    if last is not None and (now - last).total_seconds() < cooldown_secs:
+        return False
+    s[field] = now
+    return True
+
+
+async def _safe_reply(message, text: str, **kwargs) -> bool:
+    """Drop-in replacement for `message.reply_text(...)` that never raises
+    — same reasoning as _safe_send above, applied to direct command
+    replies (ping_bybit_command, etc.) rather than the per-cycle loops.
+    A chat already flood-controlled (see _is_flood_controlled) would
+    otherwise make a command's FINAL reply vanish with no error shown —
+    the command actually ran and got a real result, but the user sees
+    nothing, indistinguishable from the bot hanging."""
+    chat_id = getattr(getattr(message, "chat", None), "id", None)
+    if chat_id is not None and _is_flood_controlled(chat_id):
+        return False
+    try:
+        await message.reply_text(text, **kwargs)
+        return True
+    except RetryAfter as e:
+        logger.warning(f"[TelegramFlood] chat={chat_id} flood-controlled on reply — retry_after={e.retry_after}s")
+        if chat_id is not None:
+            _mark_flood_controlled(chat_id, e.retry_after)
+        return False
+    except Forbidden:
+        logger.info(f"[Telegram] chat={chat_id} has blocked the bot or is unreachable — reply dropped")
+        return False
+    except Exception as e:
+        logger.warning(f"[Telegram] reply_text to {chat_id} failed: {e} — reply dropped")
+        return False
 
 
 def _mode_display_label(mode: str) -> str:
@@ -5865,7 +5977,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
     # Re-read from DB so any key updates take effect on next loop restart.
     creds = get_user_creds(chat_id)
     if not creds or not creds.get("key"):
-        await bot.send_message(chat_id=chat_id,
+        await _safe_send(bot, chat_id=chat_id,
             text=(
                 f"❌ <b>{label} Auto-Update stopped</b>\n\n"
                 "No Bybit API key found for your account.\n"
@@ -5935,7 +6047,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                     # re-posting the same number.
                     _prefix = (s.get("close_price_range") or "").strip()
                     if not _prefix:
-                        await bot.send_message(chat_id=chat_id,
+                        await _safe_send(bot, chat_id=chat_id,
                             text=(f"⚠️ {prefix}<b>Cycle {cycle}</b> — No Close Price Range set for "
                                   f"{label}. Set one in the ad menu to start copying. Skipping this cycle."),
                             parse_mode="HTML")
@@ -6001,7 +6113,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                             # retries the same (still most-likely) range
                             # first, rather than resetting back to 1-300.
                             logger.info(f"[{label}] Ad Copy (BTC/NGN) Merchant Watch — '{_merchant}' not found in ranks 1-300 or 301-600 this cycle")
-                            await bot.send_message(chat_id=chat_id,
+                            await _safe_send(bot, chat_id=chat_id,
                                 text=(f"⚠️ {prefix}<b>Cycle {cycle}</b> — Merchant <code>{_esc(_merchant)}</code> "
                                       f"not found in ranks 1-300 or 301-600 right now. Skipping this cycle."),
                                 parse_mode="HTML")
@@ -6041,7 +6153,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                                 f"Fewer than {_top_range} BTC/NGN ad(s) in ranks 1-300 "
                                 f"match <code>{_esc(_prefix)}</code> right now"
                             )
-                        await bot.send_message(chat_id=chat_id,
+                        await _safe_send(bot, chat_id=chat_id,
                             text=(f"⚠️ {prefix}<b>Cycle {cycle}</b> — {_scope_msg} "
                                   f"(Top Range {_top_range} needs at least that many matches). Skipping this cycle."),
                             parse_mode="HTML")
@@ -6070,11 +6182,12 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                             f"[{label}] Ad Copy (BTC/NGN) rank {_top_range} price unchanged "
                             f"({_btc_match_price}) — skipping edit this cycle"
                         )
-                        await bot.send_message(chat_id=chat_id,
-                            text=(f"⏭ {prefix}<b>Cycle {cycle}</b> — Band <code>{_esc(_prefix)}</code> "
-                                  f"rank {_top_range} still <code>{_esc(str(_btc_match_price))}</code> "
-                                  f"(no change) — skipping edit."),
-                            parse_mode="HTML")
+                        if _should_notify_now(s, "ad_copy_btc_unchanged"):
+                            await _safe_send(bot, chat_id=chat_id,
+                                text=(f"⏭ {prefix}<b>Cycle {cycle}</b> — Band <code>{_esc(_prefix)}</code> "
+                                      f"rank {_top_range} still <code>{_esc(str(_btc_match_price))}</code> "
+                                      f"(no change) — skipping edit."),
+                                parse_mode="HTML")
                         for _ in range(interval_secs):
                             if not _ad_running(sess, slot_idx): break
                             await asyncio.sleep(1)
@@ -6083,7 +6196,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                     try:
                         new_p = Decimal(_btc_match_price)
                     except Exception:
-                        await bot.send_message(chat_id=chat_id,
+                        await _safe_send(bot, chat_id=chat_id,
                             text=f"⚠️ {prefix}<b>Cycle {cycle}</b> — Unreadable price from the market listing. Skipping this cycle.",
                             parse_mode="HTML")
                         for _ in range(interval_secs):
@@ -6123,7 +6236,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                     )
 
                     if not _competing:
-                        await bot.send_message(chat_id=chat_id,
+                        await _safe_send(bot, chat_id=chat_id,
                             text=(
                                 f"⚠️ {prefix}<b>Cycle {cycle}</b> — Ad Copy found no other "
                                 f"{_want_currency}/{_want_token} ads in ranks 1-300 "
@@ -6137,7 +6250,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                     try:
                         _chosen_price, _chosen_item = _pick_ad_copy_price_windowed(_competing)
                     except Exception:
-                        await bot.send_message(chat_id=chat_id,
+                        await _safe_send(bot, chat_id=chat_id,
                             text=f"⚠️ {prefix}<b>Cycle {cycle}</b> — Ad Copy got an unreadable price from the market listing. Skipping this cycle.",
                             parse_mode="HTML")
                         for _ in range(interval_secs):
@@ -6177,13 +6290,14 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                             f"({_chosen_price}) since last copy — skipping edit this cycle "
                             f"to avoid resetting this ad's first-come-first-served queue position."
                         )
-                        await bot.send_message(chat_id=chat_id,
-                            text=(
-                                f"⏭ {prefix}<b>Cycle {cycle}</b> — Highest-common price is still "
-                                f"<code>{_esc(str(_chosen_price))}</code> (no change since last copy) — "
-                                f"skipping this edit. USDT/USD ranking is first-come-first-served, so "
-                                f"re-posting an unchanged price would only push {label} to the back of the queue."
-                            ), parse_mode="HTML")
+                        if _should_notify_now(s, "ad_copy_usdt_unchanged"):
+                            await _safe_send(bot, chat_id=chat_id,
+                                text=(
+                                    f"⏭ {prefix}<b>Cycle {cycle}</b> — Highest-common price is still "
+                                    f"<code>{_esc(str(_chosen_price))}</code> (no change since last copy) — "
+                                    f"skipping this edit. USDT/USD ranking is first-come-first-served, so "
+                                    f"re-posting an unchanged price would only push {label} to the back of the queue."
+                                ), parse_mode="HTML")
                         for _ in range(interval_secs):
                             if not _ad_running(sess, slot_idx): break
                             await asyncio.sleep(1)
@@ -6200,7 +6314,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                     try:
                         new_p = Decimal(_chosen_price)
                     except Exception:
-                        await bot.send_message(chat_id=chat_id,
+                        await _safe_send(bot, chat_id=chat_id,
                             text=f"⚠️ {prefix}<b>Cycle {cycle}</b> — Ad Copy got an unreadable price from the market listing. Skipping this cycle.",
                             parse_mode="HTML")
                         for _ in range(interval_secs):
@@ -6244,7 +6358,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                         and it.get("currencyId","").upper() == _want_currency
                     ][:_range_n]
                     if not _competing:
-                        await bot.send_message(chat_id=chat_id,
+                        await _safe_send(bot, chat_id=chat_id,
                             text=(
                                 f"⚠️ {prefix}<b>Cycle {cycle}</b> — Ad Copy found no other "
                                 f"{_want_currency}/{_want_token} ads to copy "
@@ -6263,7 +6377,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                             f"from {_chosen_item.get('nickName','?')}"
                         )
                     except Exception:
-                        await bot.send_message(chat_id=chat_id,
+                        await _safe_send(bot, chat_id=chat_id,
                             text=f"⚠️ {prefix}<b>Cycle {cycle}</b> — Ad Copy got an unreadable price from the market listing. Skipping this cycle.",
                             parse_mode="HTML")
                         for _ in range(interval_secs):
@@ -6290,7 +6404,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                     # full extra cycle.
                     _bb_register_demand(chat_id, slot_idx, _pair_key)
                 if not _pair_key:
-                    await bot.send_message(chat_id=chat_id,
+                    await _safe_send(bot, chat_id=chat_id,
                         text=(
                             f"❌ <b>{label} Browserbase Market mode stopped</b>\n\n"
                             "This mode only supports BTC/NGN and USDT/USD ads.\n"
@@ -6319,10 +6433,11 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                         continue
 
                     _err_note = f" ({_esc(str(snap['last_error']))})" if snap.get("last_error") else ""
-                    await bot.send_message(chat_id=chat_id,
-                        text=(f"⚠️ {prefix}<b>Cycle {cycle}</b> — Browserbase market price not "
-                              f"ready yet (status: {snap['status']}){_err_note}. Skipping this cycle."),
-                        parse_mode="HTML")
+                    if _should_notify_now(s, "browserbase_not_ready"):
+                        await _safe_send(bot, chat_id=chat_id,
+                            text=(f"⚠️ {prefix}<b>Cycle {cycle}</b> — Browserbase market price not "
+                                  f"ready yet (status: {snap['status']}){_err_note}. Skipping this cycle."),
+                            parse_mode="HTML")
                     for _ in range(interval_secs):
                         if not _ad_running(sess, slot_idx): break
                         await asyncio.sleep(1)
@@ -6348,7 +6463,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                 # up, instead of waiting a full extra cycle.
                 _dm_pair_key = direct_market_pair_key(ad_data.get("tokenId",""), ad_data.get("currencyId",""))
                 if not _dm_pair_key:
-                    await bot.send_message(chat_id=chat_id,
+                    await _safe_send(bot, chat_id=chat_id,
                         text=(
                             f"❌ <b>{label} Quick Market mode stopped</b>\n\n"
                             "This mode only supports BTC/NGN and USDT/USD ads.\n"
@@ -6378,10 +6493,11 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                         continue
 
                     _dm_err_note = f" ({_esc(str(dm_snap['last_error']))})" if dm_snap.get("last_error") else ""
-                    await bot.send_message(chat_id=chat_id,
-                        text=(f"⚠️ {prefix}<b>Cycle {cycle}</b> — Quick Market price not "
-                              f"ready yet (status: {dm_snap['status']}){_dm_err_note}. Skipping this cycle."),
-                        parse_mode="HTML")
+                    if _should_notify_now(s, "quick_market_not_ready"):
+                        await _safe_send(bot, chat_id=chat_id,
+                            text=(f"⚠️ {prefix}<b>Cycle {cycle}</b> — Quick Market price not "
+                                  f"ready yet (status: {dm_snap['status']}){_dm_err_note}. Skipping this cycle."),
+                            parse_mode="HTML")
                     for _ in range(interval_secs):
                         if not _ad_running(sess, slot_idx): break
                         await asyncio.sleep(1)
@@ -6417,12 +6533,13 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                         f"[{label}] Quick Market ({_dm_pair_key}) price unchanged "
                         f"({_dm_new_p}) since last copy — skipping edit this cycle"
                     )
-                    await bot.send_message(chat_id=chat_id,
-                        text=(
-                            f"⏭ {prefix}<b>Cycle {cycle}</b> — Rank #1 price is still "
-                            f"<code>{_esc(str(_dm_new_p))}</code> (no change since last copy) — "
-                            f"skipping this edit to avoid resetting {label}'s ranking position."
-                        ), parse_mode="HTML")
+                    if _should_notify_now(s, "quick_market_unchanged"):
+                        await _safe_send(bot, chat_id=chat_id,
+                            text=(
+                                f"⏭ {prefix}<b>Cycle {cycle}</b> — Rank #1 price is still "
+                                f"<code>{_esc(str(_dm_new_p))}</code> (no change since last copy) — "
+                                f"skipping this edit to avoid resetting {label}'s ranking position."
+                            ), parse_mode="HTML")
                     for _ in range(interval_secs):
                         if not _ad_running(sess, slot_idx): break
                         await asyncio.sleep(1)
@@ -6442,7 +6559,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                 except (TypeError, ValueError):
                     float_pct = 0
                 if float_pct <= 0:
-                    await bot.send_message(chat_id=chat_id,
+                    await _safe_send(bot, chat_id=chat_id,
                         text=(
                             f"⚠️ {prefix}<b>Cycle {cycle}</b> — Float % isn't set yet.\n"
                             f"Set it from the AD Price Bot menu, then restart {label}."
@@ -6459,7 +6576,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                     _ad_executor, calc_floating_price, ad_data, float_pct, local_usdt_ref
                 )
                 if err:
-                    await bot.send_message(chat_id=chat_id,
+                    await _safe_send(bot, chat_id=chat_id,
                         text=f"⚠️ {prefix}<b>Cycle {cycle} float error</b>\n<code>{_esc(str(err))}</code>", parse_mode="HTML")
                     for _ in range(interval_secs):
                         if not _ad_running(sess, slot_idx): break
@@ -6550,7 +6667,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                     if not _ad_running(sess, slot_idx):
                         return
                     if not _budget_wait_notified:
-                        await bot.send_message(chat_id=chat_id,
+                        await _safe_send(bot, chat_id=chat_id,
                             text=(
                                 f"⏳ {prefix}<b>Cycle {cycle}</b> <code>{datetime.now().strftime('%H:%M:%S')}</code>\n"
                                 f"Protecting Bybit's rate limit (too many recent edits) — retrying "
@@ -6683,7 +6800,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                     elif mode == "decodo_market":
                         s["quick_market_last_price"] = str(posted_price)
                     if chase_ceiling:
-                        await bot.send_message(chat_id=chat_id,
+                        await _safe_send(bot, chat_id=chat_id,
                             text=(
                                 f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n"
                                 f"🏔 Chasing Bybit's live ceiling (max float {float_pct}%)\n"
@@ -6691,7 +6808,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                             ),
                             parse_mode="HTML")
                     else:
-                        await bot.send_message(chat_id=chat_id,
+                        await _safe_send(bot, chat_id=chat_id,
                             text=(
                                 f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n"
                                 f"⚠️ Original <code>{new_p_str}</code> was out of range\n"
@@ -6725,7 +6842,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                 elif mode == "decodo_market":
                     s["quick_market_last_price"] = str(new_p)
                 logger.info(f"[{label}] Cycle {cycle} — 90043 (already at {new_p}) treated as success for {mode}, no nudge")
-                await bot.send_message(chat_id=chat_id,
+                await _safe_send(bot, chat_id=chat_id,
                     text=(
                         f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n"
                         f"Already at the target price — no change needed\n"
@@ -6800,7 +6917,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                 if posted_price is not None:
                     _reset_ad_failures(sess, slot_idx)
                     _set_ad_current_price(sess, slot_idx, posted_price)
-                    await bot.send_message(chat_id=chat_id,
+                    await _safe_send(bot, chat_id=chat_id,
                         text=(
                             f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n"
                             f"⚠️ Price unchanged from last post — nudged\n"
@@ -6835,7 +6952,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                         if correction_code == 0:
                             _reset_ad_failures(sess, slot_idx)
                             _set_ad_current_price(sess, slot_idx, new_p)
-                            await bot.send_message(chat_id=chat_id,
+                            await _safe_send(bot, chat_id=chat_id,
                                 text=(
                                     f"⚠️ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n"
                                     f"🏔 Live-ceiling probe was unexpectedly accepted at <code>{submit_str}</code> — "
@@ -6846,7 +6963,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                             # Correction itself failed — do NOT record the
                             # inflated price as current either way. Flag it
                             # loudly so a human checks Bybit directly.
-                            await bot.send_message(chat_id=chat_id,
+                            await _safe_send(bot, chat_id=chat_id,
                                 text=(
                                     f"🚨 {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n"
                                     f"Live-ceiling probe was unexpectedly accepted at <code>{submit_str}</code> and "
@@ -6856,7 +6973,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                                 ),
                                 parse_mode="HTML")
                     else:
-                        await bot.send_message(chat_id=chat_id,
+                        await _safe_send(bot, chat_id=chat_id,
                             text=(
                                 f"🚨 {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n"
                                 f"Live-ceiling probe was unexpectedly accepted at <code>{submit_str}</code> but there's "
@@ -6886,7 +7003,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                             s["ad_copy_last_price"] = submit_str
                     elif mode == "decodo_market":
                         s["quick_market_last_price"] = submit_str
-                    await bot.send_message(chat_id=chat_id,
+                    await _safe_send(bot, chat_id=chat_id,
                         text=f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n💲 <code>{submit_str}</code> ({_mode_display_label(mode)})",
                         parse_mode="HTML")
             else:
@@ -6974,7 +7091,7 @@ async def _handle_ad_cycle_failure(bot, chat_id, sess, slot_idx, label, cycle, r
         # Not a real Bybit-side failure — just this one cycle's post being
         # skipped to stay under the shared modify budget. Never counts
         # towards the 2-in-a-row auto-stop.
-        await bot.send_message(chat_id=chat_id,
+        await _safe_send(bot, chat_id=chat_id,
             text=(
                 f"⏳ {prefix}<b>Cycle {cycle}</b> <code>{datetime.now().strftime('%H:%M:%S')}</code>\n"
                 f"Skipped — protecting Bybit's rate limit (too many recent edits). "
@@ -6993,7 +7110,7 @@ async def _handle_ad_cycle_failure(bot, chat_id, sess, slot_idx, label, cycle, r
         if fail_count >= 2:
             _set_ad_running(sess, slot_idx, False)
             _set_ad_task(sess, slot_idx, None)
-            await bot.send_message(chat_id=chat_id,
+            await _safe_send(bot, chat_id=chat_id,
                 text=(
                     f"🛑 <b>{label} auto-stopped</b>\n\n"
                     f"2 failed updates in a row — likely too close to another ad's price, "
@@ -7004,7 +7121,7 @@ async def _handle_ad_cycle_failure(bot, chat_id, sess, slot_idx, label, cycle, r
                 parse_mode="HTML")
             return True
 
-    await bot.send_message(chat_id=chat_id,
+    await _safe_send(bot, chat_id=chat_id,
         text=f"❌ {prefix}<b>Cycle {cycle} failed</b>\n<code>{ret_code}</code> — <code>{_esc(str(ret_msg))}</code>{extra}",
         parse_mode="HTML")
     return False
@@ -7246,16 +7363,39 @@ async def ping_bybit_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     uid   = update.effective_user.id
     creds = get_user_creds(uid)
     if not is_admin(uid) and not creds.get("key"):
-        await update.message.reply_text(
+        await _safe_reply(update.message,
             "❌ *No Bybit API set.*\n\nGo to 🔑 *Set APIs* → Set Bybit Account 1 API first.",
             parse_mode="HTML"
         )
         return
     uid  = update.effective_user.id
     slot = _get_user_slot_str(uid)   # per-user slot
-    await update.message.reply_text(f"⏳ Testing Bybit Account {slot} API...")
+    await _safe_reply(update.message, f"⏳ Testing Bybit Account {slot} API...")
     from bybit import ping_api
-    result   = await asyncio.get_event_loop().run_in_executor(None, partial(ping_api, creds=creds))
+    try:
+        result = await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(None, partial(ping_api, creds=creds)),
+            timeout=20
+        )
+    except asyncio.TimeoutError:
+        # Without this bound, a hung proxy/network path (or Bybit itself
+        # being slow) left the user with the "⏳ Testing..." message and
+        # NOTHING after it — indistinguishable from the bot having frozen.
+        logger.warning(f"[PingBybit] user={uid} ping_api timed out after 20s")
+        await _safe_reply(update.message,
+            "⏱ <b>Bybit didn't respond in time.</b>\n\nThis can happen if Bybit or the "
+            "network path to it (including the Permanent IP relay, if that's active for "
+            "your account) is briefly slow. Please try again in a moment.",
+            parse_mode="HTML"
+        )
+        return
+    except Exception as e:
+        logger.error(f"[PingBybit] user={uid} ping_api raised: {e}")
+        await _safe_reply(update.message,
+            f"❌ <b>Something went wrong testing the API.</b>\n<code>{_esc(str(e))}</code>",
+            parse_mode="HTML"
+        )
+        return
     ret_code = result.get("retCode", -1)
     if ret_code == 0:
         info      = result.get("result", {})
@@ -7267,7 +7407,7 @@ async def ping_bybit_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         plines    = [f"  {'✅' if v else '➖'} {k}: {', '.join(v) if v else 'none'}" for k,v in perms.items()]
         ad_stat   = "✅ Can edit ads" if has_ads and not read_only else \
                     "⚠️ Read only"   if has_ads else "❌ No P2P permission"
-        await update.message.reply_text(
+        await _safe_reply(update.message,
             f"✅ <b>Bybit Account {slot} API connected!</b>\n\n"
             f"🔑 <code>...{info.get('apiKey','')[-6:]}</code>\n"
             f"🔒 Read only: <code>{'Yes' if read_only else 'No'}</code>\n"
@@ -7276,7 +7416,7 @@ async def ping_bybit_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             parse_mode="HTML"
         )
     else:
-        await update.message.reply_text(
+        await _safe_reply(update.message,
             f"❌ <b>API failed</b>\n<code>{_esc(result.get('retMsg',''))}</code>", parse_mode="HTML"
         )
 
@@ -8274,7 +8414,30 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             return
             return
         await edit_menu(query, "⏳ Fetching your ads...", ads_section_keyboard(tuser.id))
-        result   = await asyncio.get_event_loop().run_in_executor(None, partial(get_my_ads, creds=creds))
+        try:
+            result = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(None, partial(get_my_ads, creds=creds)),
+                timeout=20
+            )
+        except asyncio.TimeoutError:
+            # Bybit (or, if Permanent IP is active, the proxy relay) never
+            # responded — without this bound the user was left stuck on
+            # "⏳ Fetching your ads..." forever with no error shown,
+            # looking exactly like the bot had hung.
+            logger.warning(f"[MyAds] user={tuser.id} get_my_ads timed out after 20s")
+            await edit_menu(query,
+                "⏱ <b>Bybit didn't respond in time.</b>\n\nThis can happen if Bybit or the "
+                "network path to it is briefly slow. Please try again in a moment.",
+                InlineKeyboardMarkup(back_section("section_ads"))
+            )
+            return
+        except Exception as e:
+            logger.error(f"[MyAds] user={tuser.id} get_my_ads raised: {e}")
+            await edit_menu(query,
+                f"❌ <b>Something went wrong fetching your ads.</b>\n<code>{_esc(str(e))}</code>",
+                InlineKeyboardMarkup(back_section("section_ads"))
+            )
+            return
         ret_code = result.get("retCode", result.get("ret_code",-1))
         if ret_code == 0:
             items = result.get("result",{}).get("items",[])
