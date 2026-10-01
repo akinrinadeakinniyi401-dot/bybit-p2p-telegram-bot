@@ -102,15 +102,29 @@ def _read_json(path: Path, default=None):
         logger.error(f"[DB] Read error {path}: {e}")
         return _default
 
+def _json_fallback(obj):
+    """Safety net for json.dump: a single non-JSON value (e.g. a datetime that
+    leaked into a settings dict) used to make the WHOLE write fail, silently
+    discarding every other change in that save. Serialize it as text instead
+    and log loudly so the leak still gets found and fixed at its source."""
+    logger.warning(f"[DB] Non-JSON value of type {type(obj).__name__} coerced to string while saving — find who stored it")
+    if isinstance(obj, (datetime,)):
+        return obj.strftime("%Y-%m-%d %H:%M:%S")
+    return str(obj)
+
 def _write_json(path: Path, data):
+    tmp = path.with_suffix(".tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+            json.dump(data, f, indent=2, ensure_ascii=False, default=_json_fallback)
         tmp.replace(path)
     except Exception as e:
         logger.error(f"[DB] Write failed {path}: {e}")
+        try:
+            tmp.unlink(missing_ok=True)   # don't leave a half-written temp file behind
+        except Exception:
+            pass
 
 def _now() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
