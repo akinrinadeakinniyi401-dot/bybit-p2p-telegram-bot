@@ -220,6 +220,33 @@ def _ad_running(sess, slot_idx: int) -> bool:
         return sess.refresh_running
     return sess.extra_ad_slots[slot_idx]["running"]
 
+def _any_ad_running(sess) -> bool:
+    """True if ANY of this user's ad price bots is running — Ad 1, any extra
+    slot, or the dedicated USDT Ad 2 / Ad 3. The monitor/auto-pay start
+    guards must use THIS, not just `sess.refresh_running`, which only
+    reflects Ad 1 and let a user running only Ad 2/3 switch Order Monitor,
+    Chat Monitor or Auto-Pay on alongside it."""
+    if sess.refresh_running:
+        return True
+    if any(slot.get("running") for slot in sess.extra_ad_slots):
+        return True
+    for _u in (getattr(sess, "usdt_ad2", None), getattr(sess, "usdt_ad3", None)):
+        if _u is not None and _u.get("running"):
+            return True
+    return False
+
+def _autopay_on(sess) -> bool:
+    return bool(sess.auto_pay_enabled or sess.flw_pay_enabled or sess.paga_pay_enabled)
+
+def _active_monitor_names(sess) -> list:
+    """Names of the monitor-side features currently on. These are mutually
+    exclusive with the ad price bot (shared thread pool / event loop)."""
+    names = []
+    if sess.order_monitor_running: names.append("Order Monitor")
+    if sess.chat_monitor_enabled:  names.append("Chat Monitor")
+    if _autopay_on(sess):          names.append("Auto-Pay")
+    return names
+
 def _set_ad_running(sess, slot_idx: int, val: bool):
     slot_idx = _valid_slot(sess, slot_idx)
     _usdt = _usdt_dedicated_slot(sess, slot_idx)
@@ -895,12 +922,10 @@ async def _usdt_triad_loop(bot, chat_id: int):
 
             if not ranked_prices:
                 logger.warning(f"{label} no usable (non-junk) price found in ranks 1-300 for user {chat_id} — skipping this pass")
-                try:
-                    await bot.send_message(chat_id=chat_id,
+                if _should_notify_now(_ad_settings(sess, participants[0]), "usdt_no_usable_price"):
+                    await _safe_send(bot, chat_id=chat_id,
                         text="⚠️ <b>USDT/USD Rank Check</b> — no usable (non-junk) price found in ranks 1-300 this cycle. No changes made.",
                         parse_mode="HTML")
-                except Exception:
-                    pass
             else:
                 current_prices = {i: str(_ad_data_of(sess, i).get("price","")) for i in participants}
                 claimed_ranks  = {}
@@ -1023,6 +1048,10 @@ async def _usdt_triad_loop(bot, chat_id: int):
                             f"Still at its previous price/rank."
                         )
                     else:
+                        # Repeats of "no change" are pure noise on a fast interval — send
+                        # at most one per cooldown per ad (moves/failures always go out).
+                        if not _should_notify_now(_ad_settings(sess, idx), "usdt_rank_nochange"):
+                            continue
                         verdict = "✅ <b>No change</b> — same price still holds this rank, modify skipped."
                     try:
                         await bot.send_message(
@@ -1662,7 +1691,7 @@ def _save_settings(uid: int):
         # _should_notify_now) — no reason to write them to disk, and keeping
         # them out guarantees a stray non-JSON value there can never block
         # a save again.
-        return {k: v for k, v in d.items() if not str(k).startswith("_notify_last_")}
+        return {k: v for k, v in d.items() if not str(k).startswith(("_notify_last_", "_notify_count_"))}
 
     db.save_settings(uid, _persistable(sess.settings))
     db.save_extra_slots(uid, [_persistable(slot["settings"]) for slot in sess.extra_ad_slots])
@@ -2105,6 +2134,44 @@ def _should_notify_now(s: dict, key: str, cooldown_secs: int = None) -> bool:
             return False
     s[field] = now_ts
     return True
+
+
+# Successful-edit notices ("✅ Cycle N 💲 price", "⚡ Fast update") are the
+# highest-volume Telegram messages the bot sends. Quick Market polls every
+# 5s and USDT/USD ads can run at similar fine intervals, so a market that
+# keeps moving would otherwise produce up to 12 messages/minute per ad —
+# the same pattern that got a chat flood-locked for over an hour in
+# production. Cap them to one per AD_EDIT_SUCCESS_NOTIFY_SECONDS per ad
+# slot. Ads whose own interval is already >= that cap are NOT affected
+# (they naturally send at most one per cycle, exactly as before). The edit
+# itself is never skipped — only the Telegram message — and the next
+# message that does go out says how many edits it is summarising.
+_EDIT_NOTIFY_SECONDS = int(os.getenv("AD_EDIT_SUCCESS_NOTIFY_SECONDS", "60") or 60)
+
+def _edit_notice(s: dict, interval_secs: int):
+    """Decide whether a successful-edit notice should be sent now.
+    Returns (send, suppressed): `suppressed` is how many edit notices were
+    held back since the last one that was sent (0 if none)."""
+    count_key = "_notify_count_edit_ok"
+    try:
+        interval_secs = int(interval_secs)
+    except (TypeError, ValueError):
+        interval_secs = _EDIT_NOTIFY_SECONDS
+    if interval_secs >= _EDIT_NOTIFY_SECONDS:
+        return True, 0                       # slow ad — one per cycle, as always
+    if _should_notify_now(s, "edit_ok", _EDIT_NOTIFY_SECONDS):
+        held = int(s.get(count_key, 0) or 0)
+        s[count_key] = 0
+        return True, held
+    s[count_key] = int(s.get(count_key, 0) or 0) + 1
+    return False, 0
+
+def _edit_notice_suffix(suppressed: int) -> str:
+    if not suppressed:
+        return ""
+    return (f"\n<i>(+{suppressed} more edit{'s' if suppressed != 1 else ''} since the last "
+            f"message — notices are limited to one per {_EDIT_NOTIFY_SECONDS}s to protect your "
+            f"Telegram account from rate limits)</i>")
 
 
 async def _safe_reply(message, text: str, **kwargs) -> bool:
@@ -5932,7 +5999,9 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                         f"⚡ <b>Fast update — {label}</b> <code>{now}</code>\n"
                         f"💲 <code>{posted_price}</code> — price rose before the next scheduled cycle"
                     )
-                await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
+                _send_ok, _held = _edit_notice(s, _ad_interval_seconds(s, ad_data))
+                if _send_ok:
+                    await _safe_send(bot, chat_id=chat_id, text=text + _edit_notice_suffix(_held), parse_mode="HTML")
             else:
                 logger.info(f"{tag} poll complete — no update posted")
 
@@ -6684,7 +6753,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                 while not _can_modify_slot(sess, slot_idx, need=2 if chase_ceiling else 1):
                     if not _ad_running(sess, slot_idx):
                         return
-                    if not _budget_wait_notified:
+                    if not _budget_wait_notified and _should_notify_now(s, "budget_wait"):
                         await _safe_send(bot, chat_id=chat_id,
                             text=(
                                 f"⏳ {prefix}<b>Cycle {cycle}</b> <code>{datetime.now().strftime('%H:%M:%S')}</code>\n"
@@ -6935,13 +7004,16 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                 if posted_price is not None:
                     _reset_ad_failures(sess, slot_idx)
                     _set_ad_current_price(sess, slot_idx, posted_price)
-                    await _safe_send(bot, chat_id=chat_id,
-                        text=(
-                            f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n"
-                            f"⚠️ Price unchanged from last post — nudged\n"
-                            f"💲 <code>{posted_price}</code> ({_mode_display_label(mode)})"
-                        ),
-                        parse_mode="HTML")
+                    _send_ok, _held = _edit_notice(s, _ad_interval_seconds(s, ad_data))
+                    if _send_ok:
+                        await _safe_send(bot, chat_id=chat_id,
+                            text=(
+                                f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n"
+                                f"⚠️ Price unchanged from last post — nudged\n"
+                                f"💲 <code>{posted_price}</code> ({_mode_display_label(mode)})"
+                                + _edit_notice_suffix(_held)
+                            ),
+                            parse_mode="HTML")
                 else:
                     if await _handle_ad_cycle_failure(bot, chat_id, sess, slot_idx, label, cycle, last_code, last_msg, ad_data):
                         return
@@ -7021,9 +7093,12 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                             s["ad_copy_last_price"] = submit_str
                     elif mode == "decodo_market":
                         s["quick_market_last_price"] = submit_str
-                    await _safe_send(bot, chat_id=chat_id,
-                        text=f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n💲 <code>{submit_str}</code> ({_mode_display_label(mode)})",
-                        parse_mode="HTML")
+                    _send_ok, _held = _edit_notice(s, _ad_interval_seconds(s, ad_data))
+                    if _send_ok:
+                        await _safe_send(bot, chat_id=chat_id,
+                            text=(f"✅ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n💲 <code>{submit_str}</code> ({_mode_display_label(mode)})"
+                                  + _edit_notice_suffix(_held)),
+                            parse_mode="HTML")
             else:
                 if await _handle_ad_cycle_failure(bot, chat_id, sess, slot_idx, label, cycle, ret_code, ret_msg, ad_data):
                     return
@@ -7462,7 +7537,9 @@ async def ping_bybit_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 f"🚫 <b>Bybit rejected the IP (10010)</b>\n\n"
                 f"🔑 Key sent: <code>...{_esc(tail)}</code> — {_esc(src)}\n"
                 f"🛣 Route: {'Permanent IP relay' if via_proxy else 'direct (shared server IP)'}\n"
-                f"{ip_note}\n\n"
+                + ("ℹ️ Permanent IP is <b>approved</b> on this account, so Bybit only sees the relay IP below — "
+                   "the shared Render IP is NOT used while it's approved.\n" if via_proxy else "")
+                + f"{ip_note}\n\n"
                 f"👉 On Bybit → API Management → <b>this exact key</b> → Edit → Bind IP, "
                 f"make sure the IP above is listed (and the key's IP-restriction is saved).",
                 parse_mode="HTML"
@@ -8073,6 +8150,12 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
     # ── 💳 Toggle Auto-Pay ──
     elif data == "toggle_auto_pay":
+        if not _s(tuser.id).auto_pay_enabled and _any_ad_running(_s(tuser.id)):
+            await query.answer(
+                "⚠️ Ad Auto-Update is running. Stop it first — Auto-Pay can't run alongside the ad price bot.",
+                show_alert=True
+            )
+            return
         _s(tuser.id).auto_pay_enabled = not _s(tuser.id).auto_pay_enabled
         if _s(tuser.id).auto_pay_enabled and _s(tuser.id).flw_pay_enabled:
             _s(tuser.id).flw_pay_enabled = False
@@ -8083,6 +8166,12 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
     # ── 🟢 Toggle Flutterwave Pay ──
     elif data == "toggle_flw_pay":
+        if not _s(tuser.id).flw_pay_enabled and _any_ad_running(_s(tuser.id)):
+            await query.answer(
+                "⚠️ Ad Auto-Update is running. Stop it first — Auto-Pay can't run alongside the ad price bot.",
+                show_alert=True
+            )
+            return
         if not _s(tuser.id).flw_pay_enabled:
             # All users (including admin) must have all 3 FLW keys in DB
             _flw_ready = all(db.get_api(tuser.id, k) for k in (
@@ -8104,6 +8193,12 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
     # ── 🟡 Toggle Paga Pay ──
     elif data == "toggle_paga_pay":
+        if not _s(tuser.id).paga_pay_enabled and _any_ad_running(_s(tuser.id)):
+            await query.answer(
+                "⚠️ Ad Auto-Update is running. Stop it first — Auto-Pay can't run alongside the ad price bot.",
+                show_alert=True
+            )
+            return
         if not _s(tuser.id).paga_pay_enabled:
             _paga_key = db.get_api(tuser.id, "paga_principal")
             if not _paga_key:
@@ -8219,8 +8314,8 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 orders_section_keyboard(tuser.id)
             )
         else:
-            # Conflict guard: block chat monitor while auto-update is running
-            if _s(tuser.id).refresh_running:
+            # Conflict guard: block chat monitor while ANY ad auto-update is running
+            if _any_ad_running(_s(tuser.id)):
                 await edit_menu(query,
                     "⚠️ <b>Cannot start Chat Monitor</b>\n\n"
                     "<b>Ad Auto-Update</b> is currently running.\n\n"
@@ -8291,8 +8386,8 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 orders_section_keyboard(tuser.id)
             )
         else:
-            # Conflict guard: block order monitor while auto-update is running
-            if _s(tuser.id).refresh_running:
+            # Conflict guard: block order monitor while ANY ad auto-update is running
+            if _any_ad_running(_s(tuser.id)):
                 await edit_menu(query,
                     "⚠️ <b>Cannot start Order Monitor</b>\n\n"
                     "<b>Ad Auto-Update</b> is currently running.\n\n"
@@ -9893,16 +9988,14 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             # ── Conflict guard: block auto-update while order/chat monitor is running ──
             # Running both simultaneously saturates the shared thread pool and event loop,
             # causing Telegram timeouts for ALL users. Users must choose one or the other.
-            if sess.order_monitor_running or sess.chat_monitor_enabled:
-                active = []
-                if sess.order_monitor_running: active.append("Order Monitor")
-                if sess.chat_monitor_enabled:  active.append("Chat Monitor")
+            active = _active_monitor_names(sess)
+            if active:
                 await edit_menu(query,
                     "⚠️ <b>Cannot start Auto-Update</b>\n\n"
                     f"<b>{' and '.join(active)}</b> is currently active.\n\n"
-                    "Running Ad Auto-Update together with Order Monitor or Chat Monitor "
+                    "Running Ad Auto-Update together with Order Monitor, Chat Monitor or Auto-Pay "
                     "overloads the bot and causes delays for all users.\n\n"
-                    "Please stop your active monitors first, then start Auto-Update.",
+                    "Please turn those off first, then start Auto-Update.",
                     InlineKeyboardMarkup(back_section("section_ads"))
                 )
                 return
@@ -11345,6 +11438,8 @@ async def _resume_user_engines(bot, uid: int, snapshot: dict) -> list:
         "auto_pay_paga":    ("paga_pay_enabled",     "Auto-Pay (Paga)"),
     }
     for snap_key, (attr, label) in flag_map.items():
+        if any_ad_resumed and attr in ("auto_pay_enabled", "flw_pay_enabled", "paga_pay_enabled"):
+            continue   # ad price bot and Auto-Pay are mutually exclusive — ad bot wins
         if snapshot.get(snap_key) and not getattr(sess, attr):
             setattr(sess, attr, True)
             resumed.append(label)
