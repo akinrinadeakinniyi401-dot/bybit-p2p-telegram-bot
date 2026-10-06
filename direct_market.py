@@ -69,6 +69,8 @@ Optional:
     DIRECT_MARKET_BTC_NGN_AMOUNT      — default "200000" (matches the
                                          confirmed-working test payload)
     DIRECT_MARKET_USDT_USD_AMOUNT     — default "50"
+    DIRECT_MARKET_ETH_NGN_AMOUNT      — default "200000" (NGN trade-size
+                                         filter, same as BTC/NGN)
 Credentials are read from the environment only — never logged, never
 hardcoded.
 """
@@ -136,6 +138,16 @@ PAIR_CONFIGS = {
         "referer":     "https://www.bybit.com/en/p2p/sell/USDT/USD",
         "side":        "0",
         "amount":      os.getenv("DIRECT_MARKET_USDT_USD_AMOUNT", "50") or "50",
+    },
+    # ETH/NGN — same "sell" page convention (side="0") as BTC/NGN. `amount`
+    # is the NGN trade-size filter (same meaning as BTC/NGN's), so it
+    # defaults to the same 200000.
+    "ETH_NGN": {
+        "token_id":    "ETH",
+        "currency_id": "NGN",
+        "referer":     "https://www.bybit.com/en/p2p/sell/ETH/NGN",
+        "side":        "0",
+        "amount":      os.getenv("DIRECT_MARKET_ETH_NGN_AMOUNT", "200000") or "200000",
     },
 }
 
