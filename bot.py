@@ -1105,6 +1105,11 @@ def _interval_floor_secs(s: dict, ad_data: dict):
         return bybit.MIN_USDT_INTERVAL_SECONDS
     if _is_btc_ngn_ad(ad_data) and s.get("mode") in ("ad_copy", "browserbase_market", "decodo_market"):
         return bybit.MIN_BTC_NGN_ADCOPY_INTERVAL_SECONDS
+    # Quick Market on any OTHER pair the direct_market collector supports
+    # (e.g. ETH/NGN) — same 5s floor as USDT/USD.
+    if s.get("mode") == "decodo_market" and direct_market_pair_key(
+            ad_data.get("tokenId", ""), ad_data.get("currencyId", "")):
+        return bybit.MIN_USDT_INTERVAL_SECONDS
     return None
 
 
@@ -6553,8 +6558,9 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                     await _safe_send(bot, chat_id=chat_id,
                         text=(
                             f"❌ <b>{label} Quick Market mode stopped</b>\n\n"
-                            "This mode only supports BTC/NGN and USDT/USD ads.\n"
-                            "Switch this ad to a different mode, or point it at one of those pairs."
+                            "Quick Market isn't available for this ad's pair.\n"
+                            "Switch this ad to a different mode, or point it at a supported pair "
+                            "(BTC/NGN, ETH/NGN, USDT/USD)."
                         ),
                         parse_mode="HTML")
                     _set_ad_running(sess, slot_idx, False)
@@ -8694,6 +8700,10 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             rows.append([InlineKeyboardButton(("✅ " if cur_mode == "ad_copy" else "") + "🪞 Ad Copy", callback_data="set_mode_ad_copy")])
             rows.append([InlineKeyboardButton(("✅ " if cur_mode == "browserbase_market" else "") + "🌐 Browserbase Market", callback_data="set_mode_browserbase_market")])
             rows.append([InlineKeyboardButton(("✅ " if cur_mode == "decodo_market" else "") + "⚡ Quick Market", callback_data="set_mode_decodo_market")])
+        elif direct_market_pair_key(ad_data.get("tokenId",""), ad_data.get("currencyId","")):
+            # Any other pair the Quick Market collector supports (e.g. ETH/NGN) —
+            # Quick Market only; Ad Copy / Browserbase stay USDT/USD + BTC/NGN.
+            rows.append([InlineKeyboardButton(("✅ " if cur_mode == "decodo_market" else "") + "⚡ Quick Market", callback_data="set_mode_decodo_market")])
         rows += back_section("section_ads")
         txt = (
             f"🔀 <b>{_ad_slot_label(slot_idx)} — Choose Mode</b>\n\n"
@@ -8717,6 +8727,12 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 "Rank #1 price every edit), but reads from a lighter always-on direct-HTTP feed "
                 "instead of a browser session.\n"
             )
+        elif direct_market_pair_key(ad_data.get("tokenId",""), ad_data.get("currencyId","")):
+            txt += (
+                f"⚡ <b>Quick Market</b> — every edit copies Bybit's live Rank #1 "
+                f"{ad_data.get('tokenId','').upper()}/{ad_data.get('currencyId','').upper()} price, "
+                "read from a lightweight always-on direct-HTTP feed.\n"
+            )
         await edit_menu(query, txt, InlineKeyboardMarkup(rows))
 
     elif data in ("set_mode_fixed", "set_mode_floating", "set_mode_ad_copy", "set_mode_browserbase_market", "set_mode_decodo_market"):
@@ -8739,8 +8755,9 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             _is_usdt = (ad_data.get("currencyId","").upper() == "USD"
                         and ad_data.get("tokenId","").upper() == "USDT")
             _is_btc_ngn = _is_btc_ngn_ad(ad_data)
-            if not (_is_usdt or _is_btc_ngn):
-                await query.answer("Quick Market is only available for USD/USDT and BTC/NGN ads.", show_alert=True)
+            if not (_is_usdt or _is_btc_ngn
+                    or direct_market_pair_key(ad_data.get("tokenId",""), ad_data.get("currencyId",""))):
+                await query.answer("Quick Market isn't available for this ad's pair.", show_alert=True)
                 return
         if new_mode == "ad_copy":
             _is_usdt = (ad_data.get("currencyId","").upper() == "USD"
