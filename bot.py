@@ -2214,7 +2214,8 @@ def _mode_display_label(mode: str) -> str:
     change, and the Auto Resume Agent / disk persistence keep working
     exactly as before). Never call mode.upper() directly in a string that
     reaches the user — always go through this."""
-    return {"decodo_market": "QUICK MARKET"}.get(mode, (mode or "").upper())
+    return {"decodo_market": "QUICK MARKET"}.get(
+        mode, (mode or "").replace("_", " ").upper())
 
 
 def ads_section_keyboard(uid: int = 0):
@@ -2224,7 +2225,7 @@ def ads_section_keyboard(uid: int = 0):
     ad_data    = _ad_data_of(sess, slot_idx) if sess else {}
     mode       = s.get("mode", "fixed")
     mode_icon  = {"fixed": "💲", "floating": "📈", "ad_copy": "🪞", "browserbase_market": "🌐", "decodo_market": "⚡"}.get(mode, "💲")
-    mode_label = f"{mode_icon} Mode: {mode.replace('_',' ').upper()}"
+    mode_label = f"{mode_icon} Mode: {_mode_display_label(mode)}"
     ad_loaded  = bool(ad_data)
     running    = _ad_running(sess, slot_idx) if sess else False
     status     = "🟢 Stop Auto-Update" if running else "▶️ Start Auto-Update"
@@ -2439,7 +2440,7 @@ def ads_section_text(uid: int = 0) -> str:
         f"<i>{acct_label}</i>\n\n"
         f"🆔 Ad ID: <code>{ad_id}</code>\n"
         f"👤 UID (Acct {acct_slot}): <code>{bybit_uid}</code>\n"
-        f"🔀 Mode: <code>{mode.replace('_',' ').upper()}</code> | ⏱ Every <code>{_ad_interval_label(s, ad_data)}</code>\n"
+        f"🔀 Mode: <code>{_mode_display_label(mode)}</code> | ⏱ Every <code>{_ad_interval_label(s, ad_data)}</code>\n"
         f"{mode_info}\n"
         f"{ad_info}\n"
         f"📈 Session price: <code>{cur}</code> | {status}\n\n"
@@ -7199,6 +7200,22 @@ async def _handle_ad_cycle_failure(bot, chat_id, sess, slot_idx, label, cycle, r
             parse_mode="HTML")
         return False
 
+    if ret_code == 10006:
+        # Bybit's account-wide request-rate limit ("Too many visits"). Purely
+        # transient and not this ad's fault — it must NEVER count towards the
+        # 2-in-a-row auto-stop (that stopped users' ads for a momentary
+        # burst when several of their ads fired together). The loop simply
+        # tries again next cycle; the notice itself is throttled.
+        if _should_notify_now(_ad_settings(sess, slot_idx), "bybit_rate_limit"):
+            await _safe_send(bot, chat_id=chat_id,
+                text=(
+                    f"⏳ {prefix}<b>Cycle {cycle}</b> <code>{datetime.now().strftime('%H:%M:%S')}</code>\n"
+                    f"Bybit asked us to slow down (rate limit). Retrying next cycle automatically — "
+                    f"your ad has NOT been stopped."
+                ),
+                parse_mode="HTML")
+        return False
+
     extra = ""
     if ad_data:
         _ecur = ad_data.get("currencyId","").upper()
@@ -8022,7 +8039,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             f"💸 FLW Pay: {'ON' if _s(tuser.id).flw_pay_enabled else 'OFF'}\n"
             f"{bp_s} | {nm_s}\n\n"
             f"🆔 Ad: <code>{_s(tuser.id).settings.get('ad_id') or 'Not set'}</code>\n"
-            f"🔀 Mode: <code>{_s(tuser.id).settings.get('mode','fixed').replace('_',' ').upper()}</code>\n"
+            f"🔀 Mode: <code>{_mode_display_label(_s(tuser.id).settings.get('mode','fixed'))}</code>\n"
             f"⏱ Interval: <code>{_s(tuser.id).settings.get('interval',2)} min</code>\n\n"
             f"BUY seen: <code>{len(_s(tuser.id).seen_order_ids)}</code> | Paid: <code>{len(_s(tuser.id).paid_order_ids)}</code>\n"
             f"SELL seen: <code>{len(_s(tuser.id).seen_sell_ids)}</code> | Released: <code>{len(_s(tuser.id).released_ids)}</code>"
@@ -8787,7 +8804,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         _save_settings(tuser.id)   # persists Ad 1 AND any extra slots, regardless of which was just edited
         note = " (takes effect next cycle)" if _ad_running(sess, slot_idx) else ""
         await edit_menu(query,
-            f"🔀 <b>{_ad_slot_label(slot_idx)} switched to {new_mode.replace('_',' ').upper()}{note}</b>{next_hint}",
+            f"🔀 <b>{_ad_slot_label(slot_idx)} switched to {_mode_display_label(new_mode)}{note}</b>{next_hint}",
             InlineKeyboardMarkup(back_section("section_ads"))
         )
 
@@ -9292,7 +9309,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             # same fix as the scheduled-cycle staleness bug, applied here too.
             _set_ad_current_price(_s(tuser.id), -1, Decimal(str(price)))
             await edit_menu(query,
-                f"✅ <b>Updated!</b> Price: <code>{price}</code> ({mode.replace('_',' ').upper()})\n\n_{next_setup_hint(tuser.id)}_",
+                f"✅ <b>Updated!</b> Price: <code>{price}</code> ({_mode_display_label(mode)})\n\n_{next_setup_hint(tuser.id)}_",
                 InlineKeyboardMarkup(back_section("section_ads"))
             )
         else:
@@ -10072,7 +10089,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 _set_ad_task(sess, slot_idx, task)
             _maybe_snapshot_resume_state(tuser.id)
             await edit_menu(query,
-                f"🟢 <b>{label} price update started!</b>\n🔀 <code>{mode.replace('_',' ').upper()}</code> | ⏱ every <code>{_ad_interval_label(s, ad_data)}</code>\n\n"
+                f"🟢 <b>{label} price update started!</b>\n🔀 <code>{_mode_display_label(mode)}</code> | ⏱ every <code>{_ad_interval_label(s, ad_data)}</code>\n\n"
                 + ads_section_text(tuser.id),
                 ads_section_keyboard(tuser.id)
             )
