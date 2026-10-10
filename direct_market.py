@@ -16,7 +16,7 @@ ARCHITECTURE:
   1. ONE background asyncio loop (start_direct_market_collector), started
      once at bot startup — see bot.py's startup block. It does NOT start
      making requests immediately; see point 9 below.
-  2. While a pair has demand, every REFRESH_SECONDS (~10s) it makes ONE
+  2. While a pair has demand, every REFRESH_SECONDS (default 3s) it makes ONE
      request for that pair through the Decodo proxy.
   3-4. The latest result REPLACES that pair's snapshot in the shared
      in-memory cache below (guarded by _lock).
@@ -59,7 +59,7 @@ DECODO ENV VARS (required):
     DECODO_HOST       — the host/IP Decodo gave you for this proxy
     DECODO_PORT       — the port Decodo gave you for this proxy
 Optional:
-    DIRECT_MARKET_REFRESH_SECONDS     — default 5 (active-pair cadence)
+    DIRECT_MARKET_REFRESH_SECONDS     — default 3 (active-pair cadence)
     DIRECT_MARKET_IDLE_POLL_SECONDS   — default 3  (idle-check cadence
                                          while NOTHING has demand)
     DIRECT_MARKET_IDLE_GRACE_SECONDS  — default 60 (how long a pair keeps
@@ -151,7 +151,7 @@ PAIR_CONFIGS = {
     },
 }
 
-REFRESH_SECONDS    = int(os.getenv("DIRECT_MARKET_REFRESH_SECONDS", "5") or 5)
+REFRESH_SECONDS    = int(os.getenv("DIRECT_MARKET_REFRESH_SECONDS", "3") or 3)
 IDLE_POLL_SECONDS  = int(os.getenv("DIRECT_MARKET_IDLE_POLL_SECONDS", "3") or 3)
 IDLE_GRACE_SECONDS = int(os.getenv("DIRECT_MARKET_IDLE_GRACE_SECONDS", "60") or 60)
 
