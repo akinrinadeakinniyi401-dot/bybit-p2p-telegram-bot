@@ -859,7 +859,19 @@ def modify_ad(ad_id: str, new_price: str, ad_data: dict,
         "tradingPreferenceSet": trading_pref,
     }
     logger.info(f"[Bybit] MODIFY {ad_id} → price={new_price}")
-    return _post("/v5/p2p/item/update", body, creds=creds)
+    # 10006 "Too many visits" = Bybit's per-account request-rate limit. The
+    # request was REJECTED, not applied, so retrying is safe. Several of one
+    # user's ads (scheduled cycles + fast-chase) can fire in the same
+    # instant and trip it; a short backoff almost always clears it, which
+    # keeps a momentary burst from ever surfacing as a failed cycle.
+    result = _post("/v5/p2p/item/update", body, creds=creds)
+    for _delay in (1.0, 2.0):
+        if result.get("retCode", result.get("ret_code", -1)) != 10006:
+            break
+        logger.warning(f"[Bybit] MODIFY {ad_id} hit rate limit (10006) — retrying in {_delay}s")
+        time.sleep(_delay)
+        result = _post("/v5/p2p/item/update", body, creds=creds)
+    return result
 
 
 # ─────────────────────────────────────────
