@@ -223,6 +223,11 @@ MIN_USDT_INTERVAL_SECONDS = 5
 # BTC/NGN ads are unaffected and still sit behind the 2-minute floor.
 MIN_BTC_NGN_ADCOPY_INTERVAL_SECONDS = 3
 
+# QUICK MARKET mode only (BTC/NGN, ETH/NGN, USDT/USD). The loop reads the
+# in-memory Rank #1 snapshot (no network) and only calls edit when that
+# price differs from the ad's current price, so a 1s cycle is cheap.
+MIN_QUICK_MARKET_INTERVAL_SECONDS = 1
+
 
 def validate_interval(minutes) -> tuple[bool, str]:
     """Reject any update interval below the safe floor. Keeping this at
