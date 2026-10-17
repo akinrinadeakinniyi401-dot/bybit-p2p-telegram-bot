@@ -1095,21 +1095,22 @@ def _is_usdt_usd_ad(ad_data: dict) -> bool:
 def _interval_floor_secs(s: dict, ad_data: dict):
     """The seconds-level interval floor for this ad, or None if this ad
     uses the normal whole-minutes floor instead.
+      • Quick Market (BTC/NGN, ETH/NGN, USDT/USD) → 1s
       • USDT/USD               → 5s
-      • BTC/NGN in ad_copy mode → 10s
+      • BTC/NGN in ad_copy / browserbase mode → 3s
     Floating/fixed BTC/NGN ads are NOT included — they keep the 2-minute
     floor, since they submit an edit every cycle rather than only on a
     genuine price change.
     """
-    if _is_usdt_usd_ad(ad_data):
-        return bybit.MIN_USDT_INTERVAL_SECONDS
-    if _is_btc_ngn_ad(ad_data) and s.get("mode") in ("ad_copy", "browserbase_market", "decodo_market"):
-        return bybit.MIN_BTC_NGN_ADCOPY_INTERVAL_SECONDS
-    # Quick Market on any OTHER pair the direct_market collector supports
-    # (e.g. ETH/NGN) — same 5s floor as USDT/USD.
+    # Quick Market (BTC/NGN, ETH/NGN, USDT/USD) → 1s. Checked first so it
+    # overrides the per-pair floors below; every other mode is unchanged.
     if s.get("mode") == "decodo_market" and direct_market_pair_key(
             ad_data.get("tokenId", ""), ad_data.get("currencyId", "")):
+        return bybit.MIN_QUICK_MARKET_INTERVAL_SECONDS
+    if _is_usdt_usd_ad(ad_data):
         return bybit.MIN_USDT_INTERVAL_SECONDS
+    if _is_btc_ngn_ad(ad_data) and s.get("mode") in ("ad_copy", "browserbase_market"):
+        return bybit.MIN_BTC_NGN_ADCOPY_INTERVAL_SECONDS
     return None
 
 
