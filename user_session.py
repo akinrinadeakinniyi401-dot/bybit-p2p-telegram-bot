@@ -199,6 +199,21 @@ class SessionState:
         )
         self.sell_msg_count        = 1
 
+        # ── Ad Price Bot order engine (1-minute "safe mode") ──
+        # Two independent toggles inside the Ad Price Bot menu that share ONE
+        # light background task polling pending BUY orders once per minute:
+        #   • ad_autopay_enabled — send the new order to the user and mark it paid
+        #   • ad_sendmsg_enabled — send the user's saved message to the seller
+        # The message text lives in settings["ad_msg_text"] (persisted to the
+        # DB with the rest of settings); the toggles are replayed by the Auto
+        # Resume Agent via snapshot_active_engines(). Completely separate from
+        # the Order Monitor / main-menu Auto-Pay flags above.
+        self.ad_autopay_enabled    = False
+        self.ad_sendmsg_enabled    = False
+        self.ad_order_task         = None
+        self.ad_order_running      = False
+        self.ad_pay_fail: dict     = {}   # order_id -> failed auto-pay attempts (max 3)
+
         # ── Chat monitor ──
         self.chat_monitor_enabled  = False
         self.chat_monitor_task     = None
@@ -314,7 +329,7 @@ class SessionState:
         for task in [
             self.refresh_task, self.order_monitor_task,
             self.chat_monitor_task, self.paga_worker_task,
-            self.usdt_triad_task,
+            self.usdt_triad_task, self.ad_order_task,
         ] + [slot["task"] for slot in self.extra_ad_slots] \
           + [slot["task"] for slot in _usdt_slots]:
             if task and not task.done():
@@ -326,6 +341,8 @@ class SessionState:
         self.order_monitor_task    = None
         self.chat_monitor_task     = None
         self.paga_worker_task      = None
+        self.ad_order_task         = None
+        self.ad_order_running      = False
         self.usdt_triad_running    = False
         self.usdt_triad_task       = None
         for slot in self.extra_ad_slots:
@@ -416,12 +433,15 @@ class SessionState:
             "auto_pay_bybit":   self.auto_pay_enabled,
             "auto_pay_flw":     self.flw_pay_enabled,
             "auto_pay_paga":    self.paga_pay_enabled,
+            "ad_autopay":       self.ad_autopay_enabled,
+            "ad_sendmsg":       self.ad_sendmsg_enabled,
         }
         has_anything_on = bool(ad_slots) or any(
             snapshot[k] for k in (
                 "order_monitor", "chat_monitor", "sell_msg",
                 "buyer_protection", "name_match",
                 "auto_pay_bybit", "auto_pay_flw", "auto_pay_paga",
+                "ad_autopay", "ad_sendmsg",
             )
         )
         return snapshot if has_anything_on else {}
@@ -489,6 +509,8 @@ class SessionState:
         self.reply_state.clear()
         self.pending_cancel_reviews.clear()
         self.expecting_cancel_ids.clear()
+        self.ad_autopay_enabled = False
+        self.ad_sendmsg_enabled = False
         self.my_account_id = ""
         self.my_nick = ""
         self.paga_queue = None
