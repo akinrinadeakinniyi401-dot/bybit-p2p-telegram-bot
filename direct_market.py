@@ -289,10 +289,12 @@ def _fetch_pair_blocking(pair_key: str, cfg: dict):
         "size": "10",
         "page": "1",
         "amount": str(cfg["amount"]),
-        "vaMaker": True,
+        # All advertiser filters OFF so nothing is hidden from the ranking —
+        # bulkMaker/vaMaker/canTrade = True were hiding some Rank #1 ads.
+        "vaMaker": False,
         "authMaker": False,
-        "bulkMaker": True,
-        "canTrade": True,
+        "bulkMaker": False,
+        "canTrade": False,
         "verificationFilter": 0,
         "sortType": "OVERALL_RANKING",
         "sortStrategyCode": "DEFAULT_BUY",
