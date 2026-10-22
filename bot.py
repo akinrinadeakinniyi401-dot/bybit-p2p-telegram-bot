@@ -247,6 +247,24 @@ def _active_monitor_names(sess) -> list:
     if _autopay_on(sess):          names.append("Auto-Pay")
     return names
 
+# ── Ad Price Bot order engine (Auto Pay + Send Message, 1-minute "safe mode") ──
+# Both toggles live INSIDE the Ad Price Bot menu and share one light task
+# (ad_order_loop) that polls pending BUY orders once per minute. They are
+# separate from the main-menu Order Monitor / Auto-Pay, which stay locked out
+# while an ad runs exactly as before.
+AD_ORDER_ENGINE_SECONDS = 60
+AD_MSG_MAX_LEN          = 500
+
+def _ad_engines_on(sess) -> bool:
+    return bool(getattr(sess, "ad_autopay_enabled", False) or getattr(sess, "ad_sendmsg_enabled", False))
+
+def _main_order_flow_on(sess) -> bool:
+    """Main-menu Order Monitor or any main-menu Auto-Pay is on."""
+    return bool(sess.order_monitor_running or _autopay_on(sess))
+
+def _ad_msg_text(sess) -> str:
+    return str(sess.settings.get("ad_msg_text", "") or "").strip()
+
 def _set_ad_running(sess, slot_idx: int, val: bool):
     slot_idx = _valid_slot(sess, slot_idx)
     _usdt = _usdt_dedicated_slot(sess, slot_idx)
@@ -2009,6 +2027,7 @@ def back_section(section: str):
         "section_ads":     "📊 AD Price Bot",
         "section_orders":  "📦 Order Monitor",
         "section_autopay": "💳 Auto-Pay",
+        "ad_sendmsg_menu": "✉️ Send Message",
     }
     return [[InlineKeyboardButton(f"⬅️ Back — {labels.get(section,'Back')}", callback_data=section)]]
 
@@ -2026,6 +2045,7 @@ def back_prev(prev: str):
         "section_autopay": "💳 Auto-Pay",
         "main_menu":       "🏠 Main Menu",
         "post_ad_prompt":  "📢 Post/Remove Manager",
+        "ad_sendmsg_menu": "✉️ Send Message",
     }
     label = labels.get(prev, "⬅️ Back")
     return InlineKeyboardMarkup([[InlineKeyboardButton(f"⬅️ Back to {label}", callback_data=prev)]])
@@ -2361,6 +2381,16 @@ def ads_section_keyboard(uid: int = 0):
     if slot_idx == -1:
         rows.append([InlineKeyboardButton("📢 Post / Remove Ad", callback_data="post_ad_prompt")])
 
+    # Ad Price Bot order engine — Auto Pay (1-min) and Send Message. The
+    # whole row turns green once active so the state is visible at a glance.
+    if sess:
+        _ap_lbl = "🟢 Auto Pay: ON ✅" if sess.ad_autopay_enabled else "💳 Auto Pay"
+        _sm_lbl = "🟢 Send Message: ON ✅" if sess.ad_sendmsg_enabled else "✉️ Send Message"
+        rows.append([
+            InlineKeyboardButton(_ap_lbl, callback_data="toggle_ad_autopay"),
+            InlineKeyboardButton(_sm_lbl, callback_data="ad_sendmsg_menu"),
+        ])
+
     rows.append([InlineKeyboardButton(status, callback_data="toggle_refresh")])
 
     if total_ads < MAX_ADS_PER_USER:
@@ -2436,6 +2466,11 @@ def ads_section_text(uid: int = 0) -> str:
     slot_header = _ad_slot_label(slot_idx)
     multi_note = f" ({sess.total_ad_slots()} ads active)" if sess.total_ad_slots() > 1 else ""
 
+    _eng = []
+    if sess.ad_autopay_enabled: _eng.append("💳 Auto Pay")
+    if sess.ad_sendmsg_enabled: _eng.append("✉️ Send Message")
+    engine_line = (f"🟢 Order engine (checks every 1 min): {' + '.join(_eng)}\n" if _eng else "")
+
     return (
         f"📊 <b>AD PRICE BOT — {slot_header}{multi_note}</b>\n"
         f"<i>{acct_label}</i>\n\n"
@@ -2444,9 +2479,37 @@ def ads_section_text(uid: int = 0) -> str:
         f"🔀 Mode: <code>{_mode_display_label(mode)}</code> | ⏱ Every <code>{_ad_interval_label(s, ad_data)}</code>\n"
         f"{mode_info}\n"
         f"{ad_info}\n"
-        f"📈 Session price: <code>{cur}</code> | {status}\n\n"
+        f"📈 Session price: <code>{cur}</code> | {status}\n"
+        f"{engine_line}\n"
         f"<i>{hint}</i>"
     )
+
+
+def ad_sendmsg_text(uid: int) -> str:
+    sess = _s(uid)
+    msg  = _ad_msg_text(sess)
+    status = "🟢 ON — sending to every new BUY order" if sess.ad_sendmsg_enabled else "⚪ OFF"
+    preview = _esc(msg) if msg else "<i>— no message saved yet —</i>"
+    return (
+        "✉️ <b>SEND MESSAGE (Ad Price Bot)</b>\n\n"
+        f"Status: {status}\n\n"
+        "When ON, this message is sent automatically to the seller on every "
+        "<b>new BUY order</b> that arrives on your ads. New orders are checked "
+        "once every 1 minute to keep your API in safe mode.\n\n"
+        f"<b>Your message:</b>\n{preview}"
+    )
+
+
+def ad_sendmsg_keyboard(uid: int):
+    sess = _s(uid)
+    has_msg = bool(_ad_msg_text(sess))
+    tog = "🟢 Send Message: ON — tap to turn OFF" if sess.ad_sendmsg_enabled else "⚪ Send Message: OFF — tap to turn ON"
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(tog, callback_data="toggle_ad_sendmsg")],
+        [InlineKeyboardButton("✏️ Rewrite Message" if has_msg else "✏️ Set Message", callback_data="set_ad_msg")],
+        *([[InlineKeyboardButton("♻️ Reset Message", callback_data="reset_ad_msg")]] if has_msg else []),
+        *back_section("section_ads"),
+    ])
 
 
 def ads_dashboard_text(uid: int) -> str:
@@ -2500,6 +2563,7 @@ def orders_section_keyboard(uid: int = 0):
         [InlineKeyboardButton(chat_tog,                   callback_data="toggle_chat_monitor")],
         [InlineKeyboardButton("📋 Check Orders Now",      callback_data="check_orders_now")],
         [InlineKeyboardButton("🗑 Clear Seen Orders",     callback_data="clear_seen_orders")],
+        [InlineKeyboardButton("📈 Check Sell Price (USDT)", callback_data="check_sell_price")],
         [InlineKeyboardButton(sell_tog,                   callback_data="toggle_sell_msg")],
         [InlineKeyboardButton("✏️ Set Sell Message",      callback_data="set_sell_msg")],
         [InlineKeyboardButton("🔢 Set Message Count",     callback_data="set_sell_msg_count")],
@@ -5073,6 +5137,425 @@ async def _handle_buy_order(bot, chat_id, order_id):
                         )
     except Exception as e:
         logger.error(f"[BUY] _handle_buy_order {order_id} error: {e}")
+
+
+# ─────────────────────────────────────────
+# 🤖 AD PRICE BOT ORDER ENGINE — Auto Pay + Send Message (1-minute safe mode)
+# ─────────────────────────────────────────
+# One light task per user, started by either of the two Ad Price Bot
+# buttons. Every AD_ORDER_ENGINE_SECONDS it makes ONE request (pending BUY
+# orders) and only touches Bybit again when a genuinely new order shows up,
+# so a user's API key stays well inside Bybit's rate limits. Never runs
+# alongside the main-menu Order Monitor / Auto-Pay (the toggles enforce it).
+def _ad_done_ids(sess) -> list:
+    lst = sess.settings.get("ad_order_done")
+    if not isinstance(lst, list):
+        lst = []
+        sess.settings["ad_order_done"] = lst
+    return lst
+
+
+def _ad_mark_done(uid: int, order_id: str):
+    """Remember an order was already shown / messaged. Persisted with the
+    user's settings so a redeploy or Auto Resume never re-sends the message
+    or re-notifies for an order that's still sitting unpaid."""
+    sess = _s(uid)
+    lst = _ad_done_ids(sess)
+    if order_id not in lst:
+        lst.append(order_id)
+        del lst[:-100]
+        try:
+            _save_settings(uid)
+        except Exception as e:
+            logger.debug(f"[AdOrders] could not persist done ids for {uid}: {e}")
+
+
+async def _handle_ad_buy_order(bot, chat_id, order_id, show: bool, pay: bool, send_text: str):
+    """Handle one pending BUY order for the Ad Price Bot engine.
+      show      — first time we see it: notify the user + count it in the DB
+      pay       — Ad Auto Pay is on: mark it paid on Bybit
+      send_text — Send Message is on: message to send to the seller ('' = none)
+    Returns nothing; failures are logged and retried on the next cycle only
+    where retrying is safe (detail fetch / rate limit)."""
+    sess = _s(chat_id)
+    loop = asyncio.get_event_loop()
+    creds = get_user_creds(chat_id)
+
+    det = await loop.run_in_executor(None, partial(get_order_detail, order_id, creds=creds))
+    if det.get("retCode", -1) != 0:
+        logger.warning(f"[AdOrders] user={chat_id} order {order_id} detail failed: "
+                       f"{det.get('retCode')} {det.get('retMsg','')!r} — will retry next cycle")
+        return
+    od = det.get("result", {}) or {}
+    # 10 = waiting for the buyer (us) to pay. Anything else was already
+    # handled (paid by the user manually, cancelled, etc.) — nothing to do.
+    if str(od.get("status", "")) != "10":
+        _ad_mark_done(chat_id, order_id)
+        return
+
+    # ── 1. Send the order to the user + persist the buy count to the DB ──
+    if show:
+        try:
+            body = format_order_message(od, {}, uid=chat_id)
+        except Exception as _fe:
+            logger.debug(f"[AdOrders] format_order_message failed for {order_id}: {_fe}")
+            body = f"\nOrder: <code>{_esc(order_id)}</code>"
+        sent_msg = await bot.send_message(
+            chat_id=chat_id,
+            text=f"🛒 <b>BUY Order — Ad Price Bot</b>\n{body}",
+            reply_markup=order_buttons(order_id),
+            parse_mode="HTML",
+        )
+        sess.order_msg_ids[order_id] = sent_msg.message_id
+        try:
+            user_rec = db.get_user(chat_id)
+            if user_rec is not None:
+                db.update_user_stats(
+                    chat_id,
+                    total_buy_orders=(user_rec.get("total_buy_orders") or 0) + 1,
+                )
+        except Exception as _stat_err:
+            logger.debug(f"[Stats] Could not update buy count for {chat_id}: {_stat_err}")
+        _ad_mark_done(chat_id, order_id)
+
+    # ── 2. Auto Pay (mark paid) ──
+    paid_now = False
+    if pay and order_id not in sess.paid_order_ids:
+        pay_term = od.get("confirmedPayTerm", {}) or {}
+        if not pay_term:
+            terms = od.get("paymentTermList", []) or []
+            pay_term = terms[0] if terms else {}
+        ptype = str(pay_term.get("paymentType", ""))
+        pid   = str(pay_term.get("id", ""))
+        fails = sess.ad_pay_fail
+        if not (ptype and pid):
+            fails[order_id] = 3
+            await _safe_send(bot, chat_id=chat_id,
+                text=(f"⚠️ <b>Ad Auto Pay</b> — Order <code>{_esc(order_id)}</code>\n"
+                      "No payment method found on this order. Please mark it paid manually."),
+                parse_mode="HTML")
+        else:
+            pr = await loop.run_in_executor(
+                None, partial(mark_order_paid, order_id, ptype, pid, creds=creds))
+            rc = pr.get("retCode", -1)
+            if rc == 0:
+                sess.paid_order_ids.add(order_id)
+                _track_buy_volume(chat_id, order_id, od)
+                paid_now = True
+                await _remove_order_buttons(bot, chat_id, order_id)
+                await _safe_send(bot, chat_id=chat_id,
+                    text=f"💳 <b>Ad Auto Pay ✅</b> Order <code>{_esc(order_id)}</code> marked paid.",
+                    parse_mode="HTML")
+            elif rc == 10006:
+                # Rate limit — safe to retry on the next 1-minute cycle.
+                fails[order_id] = fails.get(order_id, 0) + 1
+                logger.warning(f"[AdOrders] user={chat_id} pay {order_id} rate-limited "
+                               f"(attempt {fails[order_id]}/3)")
+                if fails[order_id] >= 3:
+                    await _safe_send(bot, chat_id=chat_id,
+                        text=(f"❌ <b>Ad Auto Pay failed</b> — Order <code>{_esc(order_id)}</code>\n"
+                              "Bybit rate limit hit 3 times. Please mark it paid manually."),
+                        parse_mode="HTML")
+            else:
+                fails[order_id] = 3   # not retryable — tell the user once
+                await _safe_send(bot, chat_id=chat_id,
+                    text=(f"❌ <b>Ad Auto Pay failed</b> — Order <code>{_esc(order_id)}</code>\n"
+                          f"<code>{_esc(str(pr.get('retMsg',''))[:200])}</code>"),
+                    parse_mode="HTML")
+
+    # ── 3. Send Message — to the seller, once per new order ──
+    if show and send_text:
+        try:
+            mr = await loop.run_in_executor(
+                None, partial(send_chat_message, order_id, send_text, creds=creds))
+            if mr.get("retCode", -1) == 0:
+                logger.info(f"[AdOrders] user={chat_id} message sent on order {order_id}")
+            else:
+                logger.warning(f"[AdOrders] user={chat_id} message on {order_id} failed: "
+                               f"{mr.get('retCode')} {mr.get('retMsg','')!r}")
+                await _safe_send(bot, chat_id=chat_id,
+                    text=(f"⚠️ <b>Send Message</b> — couldn't message the seller on order "
+                          f"<code>{_esc(order_id)}</code>\n<code>{_esc(str(mr.get('retMsg',''))[:160])}</code>"),
+                    parse_mode="HTML")
+        except Exception as _me:
+            logger.warning(f"[AdOrders] user={chat_id} message on {order_id} raised: {_me}")
+
+
+async def ad_order_loop(bot, chat_id):
+    """Per-user 1-minute order engine for the Ad Price Bot (see block comment
+    above). Runs while either Ad Auto Pay or Send Message is on."""
+    sess = _s(chat_id)
+    sess.ad_order_running = True
+    logger.info(f"🤖 AD ORDER ENGINE STARTED for user {chat_id}")
+    _ip_notified = False
+    try:
+        while sess.ad_order_running and _ad_engines_on(sess):
+            try:
+                creds = get_user_creds(chat_id)
+                if not is_admin(chat_id) and not creds.get("key"):
+                    sess.ad_autopay_enabled = False
+                    sess.ad_sendmsg_enabled = False
+                    _maybe_snapshot_resume_state(chat_id)
+                    await _safe_send(bot, chat_id=chat_id,
+                        text=("❌ <b>Ad Price Bot Auto Pay / Send Message stopped.</b>\n\n"
+                              f"No Bybit API key found for Account {_get_user_slot_str(chat_id)}. "
+                              "Go to 🔑 <b>Set APIs</b> and add your API key first."),
+                        parse_mode="HTML")
+                    break
+
+                res = await asyncio.get_event_loop().run_in_executor(
+                    None, partial(get_pending_orders, creds=creds))
+                rc  = res.get("retCode", res.get("ret_code", -1))
+                msg = res.get("retMsg", res.get("ret_msg", ""))
+                if rc == 10010 or (rc != 0 and "IP" in str(msg).upper()):
+                    if not _ip_notified:
+                        _ip_notified = True
+                        ip = await _get_current_ip()
+                        await _safe_send(bot, chat_id=chat_id,
+                            text=("🚫 <b>Bybit IP Whitelist Error (10010)</b>\n\n"
+                                  f"Ad Price Bot Auto Pay / Send Message can't reach your account.\n"
+                                  f"👉 Add <code>{_esc(ip)}</code> to your Bybit API key's IP whitelist, "
+                                  "then switch them on again."),
+                            parse_mode="HTML")
+                    sess.ad_autopay_enabled = False
+                    sess.ad_sendmsg_enabled = False
+                    _maybe_snapshot_resume_state(chat_id)
+                    break
+                if rc == 0:
+                    _ip_notified = False
+                    items = (res.get("result", {}) or {}).get("items", []) or []
+                    done  = set(_ad_done_ids(sess))
+                    todo  = []
+                    for item in items:
+                        oid = item.get("id")
+                        if not oid:
+                            continue
+                        is_new   = oid not in done
+                        need_pay = (sess.ad_autopay_enabled
+                                    and oid not in sess.paid_order_ids
+                                    and sess.ad_pay_fail.get(oid, 0) < 3)
+                        if is_new or need_pay:
+                            todo.append((oid, is_new, need_pay))
+                    for n, (oid, is_new, need_pay) in enumerate(todo):
+                        if not (sess.ad_order_running and _ad_engines_on(sess)):
+                            break
+                        try:
+                            await _handle_ad_buy_order(
+                                bot, chat_id, oid,
+                                show=is_new,
+                                pay=bool(need_pay and sess.ad_autopay_enabled),
+                                send_text=(_ad_msg_text(sess) if sess.ad_sendmsg_enabled else ""),
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception as e:
+                            logger.error(f"[AdOrders] user={chat_id} order {oid} error: {e}")
+                        if n < len(todo) - 1:
+                            await asyncio.sleep(1.5)   # spread bursts, stay under the rate limit
+                else:
+                    logger.warning(f"[AdOrders] user={chat_id} pending-orders poll failed: {rc} {msg!r}")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"[AdOrders] Loop error for user {chat_id}: {e}")
+
+            for _ in range(AD_ORDER_ENGINE_SECONDS):
+                if not (sess.ad_order_running and _ad_engines_on(sess)):
+                    break
+                await asyncio.sleep(1)
+    except asyncio.CancelledError:
+        logger.info(f"[AdOrders] engine task cancelled for user {chat_id}")
+    finally:
+        sess.ad_order_running = False
+        logger.info(f"🤖 AD ORDER ENGINE STOPPED for user {chat_id}")
+
+
+def _ensure_ad_order_engine(bot, uid: int):
+    """Start the shared engine task if either toggle is on and it isn't running."""
+    sess = _s(uid)
+    if not _ad_engines_on(sess):
+        return
+    if sess.ad_order_task and not sess.ad_order_task.done():
+        return
+    sess.ad_order_running = True
+    sess.ad_order_task = asyncio.create_task(ad_order_loop(bot, uid))
+
+
+def _stop_ad_order_engine_if_idle(uid: int):
+    """Cancel the shared engine task once BOTH toggles are off."""
+    sess = _s(uid)
+    if _ad_engines_on(sess):
+        return
+    sess.ad_order_running = False
+    if sess.ad_order_task and not sess.ad_order_task.done():
+        sess.ad_order_task.cancel()
+    sess.ad_order_task = None
+
+
+# ─────────────────────────────────────────
+# 📈 CHECK SELL PRICE — USDT market scan (side 1), runs in the background
+# ─────────────────────────────────────────
+# Pulls ranks 1-300 of the live USDT market (3 requests of 100), keeps only
+# merchants with a high 30-day completed-order count, groups them by the
+# price they are advertising right now, and sends back the top 10 price
+# levels from highest downward — with how many strong merchants sit on each
+# and their 30-day order counts. Runs as its own task so the menu stays
+# responsive; the result arrives as a new message when it's ready.
+SELL_SCAN_MIN_30D_ORDERS = int(os.getenv("SELL_PRICE_MIN_30D_ORDERS", "500") or 500)
+SELL_SCAN_TOP_LEVELS     = 10
+SELL_SCAN_COOLDOWN_SECS  = 45
+_sell_scan_state: dict   = {}   # uid -> {"running": bool, "last": epoch_secs}
+
+
+def _sell_scan_bucket(price: Decimal, currency: str) -> Decimal:
+    """Group ads onto a price level. NGN rates are quoted in whole naira
+    (1450, 1380…), so ads within the same naira share a level; other
+    currencies group to 3 decimals."""
+    if currency.upper() == "NGN":
+        return price.quantize(Decimal("1"), rounding=ROUND_FLOOR)
+    return price.quantize(Decimal("0.001"), rounding=ROUND_FLOOR)
+
+
+def _sell_scan_fmt_price(p: Decimal, currency: str) -> str:
+    return f"{p:,.0f}" if currency.upper() == "NGN" else f"{p:.3f}"
+
+
+def _sell_scan_analyse(items: list, currency: str, min_orders: int) -> dict:
+    """Pure calculation (no I/O) so it can be checked on its own."""
+    prices = []
+    for it in items:
+        try:
+            prices.append(Decimal(str(it.get("price", ""))))
+        except Exception:
+            continue
+    prices = [p for p in prices if p > 0]
+    median = sorted(prices)[len(prices) // 2] if prices else None
+
+    from collections import Counter
+    price_counts = Counter(_sell_scan_bucket(p, currency) for p in prices)
+
+    levels: dict = {}          # bucket -> {merchant_key: orders}
+    qualifying_merchants = set()
+    for it in items:
+        try:
+            p = Decimal(str(it.get("price", "")))
+        except Exception:
+            continue
+        # Sanity filter: a decoy/typo price far from the market is never a
+        # real "top rate" — ignore anything >15% away from the median.
+        if median and (p <= 0 or abs(p - median) / median > Decimal("0.15")):
+            continue
+        try:
+            orders = int(float(str(it.get("recentOrderNum", 0) or 0)))
+        except (ValueError, TypeError):
+            orders = 0
+        if orders < min_orders:
+            continue
+        mkey = str(it.get("userId") or it.get("nickName") or it.get("id") or "")
+        if not mkey:
+            continue
+        qualifying_merchants.add(mkey)
+        bucket = _sell_scan_bucket(p, currency)
+        lvl = levels.setdefault(bucket, {})
+        lvl[mkey] = max(lvl.get(mkey, 0), orders)
+
+    rows = []
+    for bucket, merchants in levels.items():
+        counts = list(merchants.values())
+        rows.append({
+            "price":     bucket,
+            "merchants": len(counts),
+            "avg":       sum(counts) / len(counts),
+            "min":       min(counts),
+            "max":       max(counts),
+            "total":     sum(counts),
+            "ads":       price_counts.get(bucket, 0),
+        })
+    rows.sort(key=lambda r: r["price"], reverse=True)       # highest price first
+    most_common = price_counts.most_common(1)[0] if price_counts else None
+    best_volume = max(rows, key=lambda r: r["total"]) if rows else None
+    return {
+        "rows": rows[:SELL_SCAN_TOP_LEVELS],
+        "levels_total": len(rows),
+        "ads_scanned": len(items),
+        "qualifying_merchants": len(qualifying_merchants),
+        "most_common": most_common,
+        "best_volume": best_volume,
+    }
+
+
+async def _run_sell_price_scan(bot, chat_id: int, currency: str):
+    st = _sell_scan_state.setdefault(chat_id, {"running": False, "last": 0})
+    loop = asyncio.get_event_loop()
+    try:
+        creds = get_user_creds(chat_id, slot=_get_user_slot(chat_id))
+        items: list = []
+        err = ""
+        for page in range(1, 4):                      # ranks 1-300, 100 per page
+            resp = await loop.run_in_executor(
+                None, partial(get_market_ads, "USDT", currency, "1", page, 100, creds))
+            rc = resp.get("retCode", -1) if isinstance(resp, dict) else -1
+            if rc != 0:
+                err = str((resp or {}).get("retMsg") or (resp or {}).get("error") or f"retCode {rc}")
+                logger.warning(f"[SellScan] user={chat_id} page {page} failed: {rc} {err!r}")
+                break
+            page_items = (resp.get("result") or {}).get("items", []) or []
+            items.extend(page_items)
+            if len(page_items) < 100:
+                break
+            await asyncio.sleep(0.5)                  # gentle on the rate limit
+
+        kb = InlineKeyboardMarkup(back_section("section_orders"))
+        if not items:
+            await _safe_send(bot, chat_id=chat_id, reply_markup=kb, parse_mode="HTML",
+                text=("❌ <b>Check Sell Price failed</b>\n\n"
+                      f"<code>{_esc(err or 'No ads returned')}</code>\n\nPlease try again in a minute."))
+            return
+
+        res = await loop.run_in_executor(
+            None, partial(_sell_scan_analyse, items, currency, SELL_SCAN_MIN_30D_ORDERS))
+        sym = "₦" if currency.upper() == "NGN" else ""
+        lines = [
+            f"📈 <b>USDT/{_esc(currency)} — Top Sell Prices (side 1)</b>",
+            f"Scanned <code>{res['ads_scanned']}</code> ads · "
+            f"<code>{res['qualifying_merchants']}</code> merchants with "
+            f"≥ <code>{SELL_SCAN_MIN_30D_ORDERS:,}</code> completed orders (30 days)",
+            "",
+        ]
+        if not res["rows"]:
+            lines.append("No merchant met the 30-day order threshold in ranks 1-300.")
+        else:
+            medals = ["1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟"]
+            for i, r in enumerate(res["rows"]):
+                lines.append(
+                    f"{medals[i]} <b>{sym}{_sell_scan_fmt_price(r['price'], currency)}</b> — "
+                    f"{r['merchants']} merchant{'s' if r['merchants'] != 1 else ''} · "
+                    f"avg <code>{r['avg']:,.0f}</code> orders "
+                    f"(min <code>{r['min']:,}</code> · max <code>{r['max']:,}</code>)"
+                )
+            lines.append("")
+            if res["levels_total"] > len(res["rows"]):
+                lines.append(f"<i>Showing top {len(res['rows'])} of {res['levels_total']} price levels.</i>")
+        if res["most_common"]:
+            mc_p, mc_n = res["most_common"]
+            lines.append(f"📊 Most common price: <b>{sym}{_sell_scan_fmt_price(mc_p, currency)}</b> ({mc_n} ads)")
+        if res["best_volume"]:
+            bv = res["best_volume"]
+            lines.append(f"🏆 Strongest price (most 30-day orders combined): "
+                         f"<b>{sym}{_sell_scan_fmt_price(bv['price'], currency)}</b> "
+                         f"({bv['total']:,} orders across {bv['merchants']} merchant"
+                         f"{'s' if bv['merchants'] != 1 else ''})")
+        if err:
+            lines.append(f"\n⚠️ <i>Partial result — a later page failed: {_esc(err[:100])}</i>")
+        await _safe_send(bot, chat_id=chat_id, text="\n".join(lines),
+                         reply_markup=kb, parse_mode="HTML")
+    except Exception as e:
+        logger.error(f"[SellScan] user={chat_id} scan error: {e}")
+        await _safe_send(bot, chat_id=chat_id, parse_mode="HTML",
+            text="❌ <b>Check Sell Price failed</b> — something went wrong. Please try again.")
+    finally:
+        st["running"] = False
+        st["last"] = datetime.now().timestamp()
 
 
 async def _handle_sell_incoming(bot, chat_id, order_id):
@@ -8174,11 +8657,12 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
     # ── 💳 Toggle Auto-Pay ──
     elif data == "toggle_auto_pay":
-        if not _s(tuser.id).auto_pay_enabled and _any_ad_running(_s(tuser.id)):
-            await query.answer(
-                "⚠️ Ad Auto-Update is running. Stop it first — Auto-Pay can't run alongside the ad price bot.",
-                show_alert=True
-            )
+        if not _s(tuser.id).auto_pay_enabled and (_any_ad_running(_s(tuser.id)) or _ad_engines_on(_s(tuser.id))):
+            await edit_menu(query,
+                "⚠️ <b>Cannot turn on Auto-Pay</b>\n\n"
+                "The <b>Ad Price Bot</b> is running (or its Auto Pay / Send Message is on). "
+                "Stop it first — Auto-Pay can't run alongside it.",
+                InlineKeyboardMarkup(back_section("section_autopay")))
             return
         _s(tuser.id).auto_pay_enabled = not _s(tuser.id).auto_pay_enabled
         if _s(tuser.id).auto_pay_enabled and _s(tuser.id).flw_pay_enabled:
@@ -8190,11 +8674,12 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
     # ── 🟢 Toggle Flutterwave Pay ──
     elif data == "toggle_flw_pay":
-        if not _s(tuser.id).flw_pay_enabled and _any_ad_running(_s(tuser.id)):
-            await query.answer(
-                "⚠️ Ad Auto-Update is running. Stop it first — Auto-Pay can't run alongside the ad price bot.",
-                show_alert=True
-            )
+        if not _s(tuser.id).flw_pay_enabled and (_any_ad_running(_s(tuser.id)) or _ad_engines_on(_s(tuser.id))):
+            await edit_menu(query,
+                "⚠️ <b>Cannot turn on Auto-Pay</b>\n\n"
+                "The <b>Ad Price Bot</b> is running (or its Auto Pay / Send Message is on). "
+                "Stop it first — Auto-Pay can't run alongside it.",
+                InlineKeyboardMarkup(back_section("section_autopay")))
             return
         if not _s(tuser.id).flw_pay_enabled:
             # All users (including admin) must have all 3 FLW keys in DB
@@ -8217,11 +8702,12 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
 
     # ── 🟡 Toggle Paga Pay ──
     elif data == "toggle_paga_pay":
-        if not _s(tuser.id).paga_pay_enabled and _any_ad_running(_s(tuser.id)):
-            await query.answer(
-                "⚠️ Ad Auto-Update is running. Stop it first — Auto-Pay can't run alongside the ad price bot.",
-                show_alert=True
-            )
+        if not _s(tuser.id).paga_pay_enabled and (_any_ad_running(_s(tuser.id)) or _ad_engines_on(_s(tuser.id))):
+            await edit_menu(query,
+                "⚠️ <b>Cannot turn on Paga Pay</b>\n\n"
+                "The <b>Ad Price Bot</b> is running (or its Auto Pay / Send Message is on). "
+                "Stop it first — Auto-Pay can't run alongside it.",
+                InlineKeyboardMarkup(back_section("section_autopay")))
             return
         if not _s(tuser.id).paga_pay_enabled:
             _paga_key = db.get_api(tuser.id, "paga_principal")
@@ -8411,6 +8897,15 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             )
         else:
             # Conflict guard: block order monitor while ANY ad auto-update is running
+            if _ad_engines_on(_s(tuser.id)):
+                await edit_menu(query,
+                    "⚠️ <b>Cannot start Order Monitor</b>\n\n"
+                    "The <b>Ad Price Bot's Auto Pay / Send Message</b> is currently ON and already "
+                    "handles new BUY orders.\n\n"
+                    "Turn it off in the Ad Price Bot menu first, then start Order Monitor.",
+                    InlineKeyboardMarkup(back_section("section_orders"))
+                )
+                return
             if _any_ad_running(_s(tuser.id)):
                 await edit_menu(query,
                     "⚠️ <b>Cannot start Order Monitor</b>\n\n"
@@ -8446,6 +8941,36 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             txt = f"❌ `{result.get('retMsg','')}`"
         await edit_menu(query, txt + "\n\n" + orders_section_text(tuser.id), orders_section_keyboard(tuser.id))
 
+    # ── 📈 Check Sell Price (USDT market scan, runs in the background) ──
+    elif data == "check_sell_price":
+        await edit_menu(query,
+            "📈 <b>Check Sell Price (USDT)</b>\n\n"
+            "Scans the live USDT market (side 1, ranks 1-300), finds merchants with the most "
+            "completed orders in the last 30 days, and shows the top 10 prices they are "
+            "advertising — from highest down.\n\n"
+            "The scan runs in the background; the result is sent as a new message.\n\n"
+            "Which market?",
+            InlineKeyboardMarkup([
+                [InlineKeyboardButton("🇳🇬 USDT / NGN", callback_data="sell_price_scan_NGN"),
+                 InlineKeyboardButton("💵 USDT / USD", callback_data="sell_price_scan_USD")],
+                *back_section("section_orders"),
+            ]))
+
+    elif data in ("sell_price_scan_NGN", "sell_price_scan_USD"):
+        _cur = data.rsplit("_", 1)[1]
+        _st = _sell_scan_state.setdefault(tuser.id, {"running": False, "last": 0})
+        _wait = SELL_SCAN_COOLDOWN_SECS - (datetime.now().timestamp() - _st["last"])
+        if _st["running"]:
+            _msg = "⏳ A scan is already running — the result will arrive here shortly."
+        elif _wait > 0:
+            _msg = f"⏱ Please wait <code>{int(_wait)+1}s</code> before scanning again (keeps your API safe)."
+        else:
+            _st["running"] = True
+            asyncio.create_task(_run_sell_price_scan(context.bot, tuser.id, _cur))
+            _msg = (f"⏳ <b>Scanning USDT/{_cur}…</b>\nThis runs in the background — "
+                    "I'll send the result as a new message in a few seconds.")
+        await edit_menu(query, _msg + "\n\n" + orders_section_text(tuser.id), orders_section_keyboard(tuser.id))
+
     # ── 🗑 Clear Seen Orders ──
     elif data == "clear_seen_orders":
         _s(tuser.id).seen_order_ids.clear(); _s(tuser.id).seen_sell_ids.clear()
@@ -8453,6 +8978,80 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             "✅ All seen orders cleared. Bot will re-notify on next check.\n\n" + orders_section_text(tuser.id),
             orders_section_keyboard(tuser.id)
         )
+
+    # ── 💳 Ad Price Bot: Auto Pay (1-minute safe mode) ──
+    elif data == "toggle_ad_autopay":
+        _sa = _s(tuser.id)
+        if not _sa.ad_autopay_enabled and _main_order_flow_on(_sa):
+            await edit_menu(query,
+                "⚠️ <b>Cannot turn on Ad Auto Pay</b>\n\n"
+                "<b>Order Monitor / Auto-Pay</b> from the main menu is currently ON, "
+                "and both would handle the same orders.\n\n"
+                "Turn that off first, then switch Ad Auto Pay on.",
+                InlineKeyboardMarkup(back_section("section_ads")))
+            return
+        _sa.ad_autopay_enabled = not _sa.ad_autopay_enabled
+        if _sa.ad_autopay_enabled:
+            _ensure_ad_order_engine(context.bot, tuser.id)
+        else:
+            _stop_ad_order_engine_if_idle(tuser.id)
+        _maybe_snapshot_resume_state(tuser.id)
+        _note = ("🟢 <b>Ad Auto Pay ON</b> — new BUY orders are sent to you and marked paid, "
+                 "checked once every 1 minute.\n\n") if _sa.ad_autopay_enabled else "⚪ <b>Ad Auto Pay OFF</b>\n\n"
+        await edit_menu(query, _note + ads_section_text(tuser.id), ads_section_keyboard(tuser.id))
+
+    # ── ✉️ Ad Price Bot: Send Message menu ──
+    elif data == "ad_sendmsg_menu":
+        await edit_menu(query, ad_sendmsg_text(tuser.id), ad_sendmsg_keyboard(tuser.id))
+
+    elif data == "toggle_ad_sendmsg":
+        _sa = _s(tuser.id)
+        if not _sa.ad_sendmsg_enabled:
+            if not _ad_msg_text(_sa):
+                await edit_menu(query,
+                    "⚠️ <b>No message saved yet</b>\n\nTap <b>✏️ Set Message</b> first, then turn Send Message on.\n\n"
+                    + ad_sendmsg_text(tuser.id), ad_sendmsg_keyboard(tuser.id))
+                return
+            if _main_order_flow_on(_sa):
+                await edit_menu(query,
+                    "⚠️ <b>Cannot turn on Send Message</b>\n\n"
+                    "<b>Order Monitor / Auto-Pay</b> from the main menu is currently ON, "
+                    "and both would handle the same orders.\n\n"
+                    "Turn that off first, then switch Send Message on.",
+                    InlineKeyboardMarkup(back_section("ad_sendmsg_menu")))
+                return
+        _sa.ad_sendmsg_enabled = not _sa.ad_sendmsg_enabled
+        if _sa.ad_sendmsg_enabled:
+            _ensure_ad_order_engine(context.bot, tuser.id)
+        else:
+            _stop_ad_order_engine_if_idle(tuser.id)
+        _maybe_snapshot_resume_state(tuser.id)
+        await edit_menu(query, ad_sendmsg_text(tuser.id), ad_sendmsg_keyboard(tuser.id))
+
+    elif data == "set_ad_msg":
+        _btn_state["action"]       = "ad_msg_text"
+        _btn_state["prev_section"] = "ad_sendmsg_menu"
+        _cur = _ad_msg_text(_s(tuser.id))
+        await edit_menu(query,
+            "✏️ <b>" + ("Rewrite" if _cur else "Set") + " Send Message</b>\n\n"
+            + (f"Current:\n<i>{_esc(_cur)}</i>\n\n" if _cur else "")
+            + f"Send the message you want delivered to the seller on every new BUY order "
+              f"(max {AD_MSG_MAX_LEN} characters).",
+            InlineKeyboardMarkup(back_section("ad_sendmsg_menu")))
+
+    elif data == "reset_ad_msg":
+        _sa = _s(tuser.id)
+        _sa.settings["ad_msg_text"] = ""
+        _was_on = _sa.ad_sendmsg_enabled
+        _sa.ad_sendmsg_enabled = False
+        _stop_ad_order_engine_if_idle(tuser.id)
+        _save_settings(tuser.id)
+        _maybe_snapshot_resume_state(tuser.id)
+        await edit_menu(query,
+            "♻️ <b>Message reset.</b>"
+            + (" Send Message was turned OFF because there is nothing to send." if _was_on else "")
+            + "\n\n" + ad_sendmsg_text(tuser.id),
+            ad_sendmsg_keyboard(tuser.id))
 
     # ── ✉️ Toggle Sell Msg ──
     elif data == "toggle_sell_msg":
@@ -10848,6 +11447,23 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"FLW narration: <code>{text.strip()} payment to [receiver]</code>"
         )
 
+    elif action == "ad_msg_text":
+        val = text.strip()
+        if not val:
+            await update.message.reply_text("❌ The message can't be empty. Send the text you want.", parse_mode="HTML")
+        elif len(val) > AD_MSG_MAX_LEN:
+            await update.message.reply_text(
+                f"❌ Too long ({len(val)} characters). Keep it under {AD_MSG_MAX_LEN}.", parse_mode="HTML")
+        else:
+            _s(uid).settings["ad_msg_text"] = val
+            _save_settings(uid)
+            _state["action"] = None
+            await reply_with_back(
+                f"✅ <b>Send message saved!</b>\n\n<i>{_esc(val)}</i>\n\n"
+                + ("It will go to the seller on every new BUY order." if _s(uid).ad_sendmsg_enabled
+                   else "Open ✉️ Send Message and turn it ON to start using it.")
+            )
+
     elif action == "sell_custom_msg":
         _s(uid).sell_custom_msg = text
         _state["action"] = None
@@ -11241,6 +11857,7 @@ def _reset_user_session(sess) -> bool:
         sess.flw_pay_enabled       or sess.paga_pay_enabled or
         sess.buyer_protection_on   or sess.name_match_enabled or
         sess.sell_msg_enabled      or
+        sess.ad_autopay_enabled    or sess.ad_sendmsg_enabled or
         any(slot["running"] for slot in sess.extra_ad_slots) or  # Ad 2 / Ad 3
         sess.usdt_triad_running or
         (sess.usdt_ad2 is not None and sess.usdt_ad2["running"]) or
@@ -11294,6 +11911,16 @@ def _reset_user_session(sess) -> bool:
         _slot["running"] = False
         _slot["task"]    = None
         _slot["consecutive_failures"] = 0
+
+    # Ad Price Bot order engine (Auto Pay / Send Message) — stop the task and
+    # clear the toggles like every other feature. The saved MESSAGE TEXT lives
+    # in settings and is kept; the Auto Resume Agent restores the toggles.
+    sess.ad_autopay_enabled = False
+    sess.ad_sendmsg_enabled = False
+    sess.ad_order_running   = False
+    if sess.ad_order_task and not sess.ad_order_task.done():
+        sess.ad_order_task.cancel()
+    sess.ad_order_task = None
 
     # Deactivate all feature flags
     sess.auto_pay_enabled    = False
@@ -11479,6 +12106,30 @@ async def _resume_user_engines(bot, uid: int, snapshot: dict) -> list:
             setattr(sess, attr, True)
             resumed.append(label)
 
+    # Ad Price Bot order engine (Auto Pay / Send Message). Independent of the
+    # ad slots above — they run alongside the ad price bot by design — but
+    # never alongside the main-menu Order Monitor / Auto-Pay. The message
+    # text itself was already restored from the DB by _load_settings_from_disk.
+    if snapshot.get("ad_autopay") or snapshot.get("ad_sendmsg"):
+        if _main_order_flow_on(sess):
+            logger.warning(
+                f"[AutoResume] user {uid} — snapshot had Ad Auto Pay/Send Message together with "
+                f"Order Monitor/Auto-Pay (shouldn't be possible) — Ad engine skipped"
+            )
+        else:
+            if snapshot.get("ad_autopay") and not sess.ad_autopay_enabled:
+                sess.ad_autopay_enabled = True
+                resumed.append("Ad Auto Pay (1 min)")
+            if snapshot.get("ad_sendmsg") and not sess.ad_sendmsg_enabled:
+                if _ad_msg_text(sess):
+                    sess.ad_sendmsg_enabled = True
+                    resumed.append("Ad Send Message")
+                else:
+                    logger.warning(f"[AutoResume] user {uid} — Send Message was on but no message is saved, skipped")
+            if _ad_engines_on(sess):
+                _ensure_ad_order_engine(bot, uid)
+                logger.info(f"[AutoResume] user {uid} — Ad order engine resumed")
+
     # Refresh the on-disk snapshot to match what ACTUALLY came back up
     # (e.g. an ad slot whose fetch failed above shouldn't keep getting
     # "resumed" every cycle if it's genuinely broken).
@@ -11540,6 +12191,7 @@ def _user_has_active_engines(sess) -> bool:
         sess.buyer_protection_on    or
         sess.name_match_enabled     or
         sess.sell_msg_enabled       or
+        sess.ad_autopay_enabled     or sess.ad_sendmsg_enabled or
         sess.usdt_triad_running     or
         any(slot["running"] for slot in sess.extra_ad_slots) or
         (sess.usdt_ad2 is not None and sess.usdt_ad2["running"]) or
@@ -11678,6 +12330,7 @@ async def _session_auto_reset_loop(bot=None):
                                 "• Chat Monitor\n"
                                 "• Auto-Pay (Bybit / Flutterwave / Paga)\n"
                                 "• Sell Message\n"
+                                "• Ad Price Bot Auto Pay & Send Message\n"
                                 "• Buyer Protection & Name Match\n\n"
                                 "If you are currently trading, please tap /menu and "
                                 "re-enable the features you need.\n\n"
