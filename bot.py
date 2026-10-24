@@ -262,8 +262,18 @@ def _main_order_flow_on(sess) -> bool:
     """Main-menu Order Monitor or any main-menu Auto-Pay is on."""
     return bool(sess.order_monitor_running or _autopay_on(sess))
 
-def _ad_msg_text(sess) -> str:
-    return str(sess.settings.get("ad_msg_text", "") or "").strip()
+# Two saved messages, routed by the order's fiat currency: NGN orders get the
+# NGN message, USD orders the USD message. The NGN message keeps the original
+# "ad_msg_text" settings key, so a message saved before this split simply
+# becomes the NGN message. Both live in settings → persisted to the DB.
+_AD_MSG_KEYS = {"NGN": "ad_msg_text", "USD": "ad_msg_text_usd"}
+
+def _ad_msg_text(sess, cur: str = "NGN") -> str:
+    key = _AD_MSG_KEYS.get(str(cur).upper())
+    return str(sess.settings.get(key, "") or "").strip() if key else ""
+
+def _ad_any_msg(sess) -> bool:
+    return any(_ad_msg_text(sess, c) for c in _AD_MSG_KEYS)
 
 def _set_ad_running(sess, slot_idx: int, val: bool):
     slot_idx = _valid_slot(sess, slot_idx)
@@ -461,6 +471,218 @@ def _touch_last_fast_modify(sess, slot_idx: int):
         store = {}
         sess.last_fast_modify_ts_by_slot = store
     store[slot_idx] = asyncio.get_event_loop().time()
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# 📉 Down Price monitoring (floating mode, USD/BTC + USD/ETH only)
+# ─────────────────────────────────────────────────────────────────────────
+# Why: when Fast Update RAISES a floating ad's price, Bybit restarts its own
+# edit timer for that ad. The scheduled cycle exists to follow the market
+# back DOWN, so it must not start counting (and edit) until the spot price
+# has genuinely fallen far enough. Per ad slot, independently:
+#
+#   state "monitoring" — a Fast Update just raised the price. The cycle
+#       countdown is NOT running. Every fast-chase tick measures the gap
+#         gap = (ad's current live price) − (latest spot-derived price)
+#       i.e. how far the market-derived price has fallen BELOW what the ad is
+#       posting right now. Once  gap  >  the user's Down Price the state flips
+#       to "countdown". (A Fast Update raise lifts the ad to the derived price,
+#       so the gap restarts from ~0 — that is the "reference reset". If the ad
+#       already sits more than Down Price above the derived price, the
+#       countdown starts on the very next tick.)
+#   state "countdown"  — the normal cycle countdown (the user's configured
+#       interval) is running from `cd_started_ts`. If Fast Update raises the
+#       price again meanwhile, the countdown is cancelled and the state goes
+#       back to "monitoring" with a fresh reference.
+#
+# There is exactly ONE timer: `_down_gate` at the top of every scheduled
+# cycle. While a slot is monitored, auto_update_loop skips its own wait phase
+# and lets the gate decide when the next cycle may start.
+#
+# Everything lives in the slot's own settings dict under "down_price" (the
+# user's threshold) and "down_mon" (the state below) — both JSON-safe wall-
+# clock values — so _save_settings persists them to the DB and the Auto
+# Resume Agent / a redeploy restores them (see _down_init_on_start).
+#   down_mon = {"state", "ref" (ad price at the last raise), "derived" (latest
+#               spot-derived price), "gap", "last_edit_ts", "cd_started_ts"}
+_DOWN_STATE_MAX_AGE_SECS = 1800   # a persisted state older than this is ignored on restart
+_DOWN_PERSIST_MIN_GAP    = 15     # throttle DB writes while the market is moving
+_down_last_persist: dict = {}     # uid -> epoch of last write
+_down_dirty: set         = set()  # uids with a throttled write still pending
+
+
+def _down_threshold(s: dict, ad_data: dict):
+    """The user's Down Price (Decimal) if monitoring applies to this ad
+    right now — floating mode on USD/BTC or USD/ETH with a threshold set —
+    else None."""
+    if not s or not ad_data or s.get("mode") != "floating":
+        return None
+    pair = (str(ad_data.get("currencyId", "")).upper(), str(ad_data.get("tokenId", "")).upper())
+    if pair not in bybit.DOWN_PRICE_PAIRS:
+        return None
+    try:
+        val = Decimal(str(s.get("down_price") or "").strip() or "0")
+    except Exception:
+        return None
+    return val if val > 0 else None
+
+
+def _down_mon(s: dict) -> dict:
+    mon = s.get("down_mon")
+    if not isinstance(mon, dict):
+        mon = {}
+        s["down_mon"] = mon
+    return mon
+
+
+def _down_persist(uid: int, force: bool = False):
+    """Write settings (incl. down_mon) to the DB. Throttled while the
+    market is moving; transitions pass force=True."""
+    now = datetime.now().timestamp()
+    if not force and now - _down_last_persist.get(uid, 0) < _DOWN_PERSIST_MIN_GAP:
+        _down_dirty.add(uid)
+        return
+    _down_last_persist[uid] = now
+    _down_dirty.discard(uid)
+    try:
+        _save_settings(uid)
+    except Exception as e:
+        logger.debug(f"[DownPrice] persist failed for {uid}: {e}")
+
+
+def _down_flush(uid: int):
+    """Called every fast-chase tick — writes a throttled-away update once
+    the throttle window has passed."""
+    if uid in _down_dirty:
+        _down_persist(uid)
+
+
+def _down_record_edit(uid: int, s: dict):
+    """A successful ad edit just happened (scheduled cycle or Fast Update)."""
+    _down_mon(s)["last_edit_ts"] = datetime.now().timestamp()
+    _down_persist(uid)
+
+
+def _down_note_edit(uid: int, s: dict, ad_data: dict):
+    if _down_threshold(s, ad_data) is not None:
+        _down_record_edit(uid, s)
+
+
+def _down_on_fast_increase(uid: int, s: dict, posted_price: Decimal, derived: Decimal, label: str):
+    """Fast Update raised the price → the gap between the ad and the derived
+    price restarts from this post (reference := the price just posted) and
+    downward monitoring (re)starts. Cancels any running countdown."""
+    mon = _down_mon(s)
+    was = mon.get("state")
+    mon.update(state="monitoring", ref=str(posted_price), derived=str(derived), gap="0",
+               last_edit_ts=datetime.now().timestamp(), cd_started_ts=None)
+    logger.info(f"[DownPrice] {label} Fast Update raised the price to {posted_price} (derived {derived}) — "
+                f"reference reset, monitoring restarted (was {was or 'idle'}); cycle countdown cancelled")
+    _down_persist(uid)
+
+
+def _down_on_cycle_done(uid: int, s: dict):
+    """A scheduled cycle just finished → the normal countdown starts now —
+    UNLESS a Fast Update landed mid-cycle and put the slot back into
+    monitoring, in which case that state wins."""
+    mon = _down_mon(s)
+    if mon.get("state") == "monitoring":
+        return
+    mon["state"] = "countdown"
+    mon["cd_started_ts"] = datetime.now().timestamp()
+    _down_persist(uid)
+
+
+def _down_tick(uid: int, s: dict, ad_data: dict, derived: Decimal, cur_p: Decimal, label: str):
+    """One monitoring comparison (called every fast-chase tick):
+    gap = ad's current price − latest spot-derived price. Returns a
+    user-facing message string when the countdown has just started."""
+    thr = _down_threshold(s, ad_data)
+    if thr is None:
+        return None
+    mon = _down_mon(s)
+    gap = cur_p - derived
+    mon["derived"] = str(derived)
+    mon["gap"] = str(gap)
+    if mon.get("state") != "monitoring":
+        return None
+    if gap > thr:
+        mon["state"] = "countdown"
+        mon["cd_started_ts"] = datetime.now().timestamp()
+        logger.info(f"[DownPrice] {label} derived {derived} is {gap} below the ad's price {cur_p} "
+                    f"(> threshold {thr}) — cycle countdown started")
+        _down_persist(uid, force=True)
+        return (f"📉 <b>{label} — Down Price reached</b>\n"
+                f"Derived price <code>{derived:.2f}</code> is <code>{gap:.2f}</code> below your ad "
+                f"<code>{cur_p:.2f}</code> (threshold <code>{thr}</code>). Cycle countdown started.")
+    return None
+
+
+def _down_log_cycle_start(s: dict, ad_data: dict, label: str, cycle: int):
+    """Spec: record, at the start of every cycle, the reference price, the
+    latest market price, the threshold, the monitoring state and the last
+    successful edit time."""
+    thr = _down_threshold(s, ad_data)
+    if thr is None:
+        return
+    mon = _down_mon(s)
+    last = mon.get("last_edit_ts")
+    last_s = datetime.fromtimestamp(last).strftime("%H:%M:%S") if last else "n/a"
+    logger.info(f"[DownPrice] {label} cycle {cycle} start — ref={mon.get('ref')} derived={mon.get('derived')} gap={mon.get('gap')} "
+                f"threshold={thr} state={mon.get('state') or 'idle'} last_edit={last_s}")
+
+
+def _down_init_on_start(uid: int, s: dict, ad_data: dict, label: str, resumed: bool):
+    """Called when an ad's loop starts. A MANUAL start always begins clean
+    (the first cycle posts right away, exactly as before). An Auto Resume /
+    redeploy restart keeps a recent persisted state, so a slot that was
+    waiting for the market to fall keeps waiting instead of editing the
+    moment the bot comes back."""
+    if _down_threshold(s, ad_data) is None:
+        return
+    mon = _down_mon(s)
+    last = mon.get("last_edit_ts") or 0
+    fresh = (datetime.now().timestamp() - last) <= _DOWN_STATE_MAX_AGE_SECS
+    if resumed and fresh and mon.get("state") in ("monitoring", "countdown"):
+        logger.info(f"[DownPrice] {label} resumed with saved state={mon.get('state')} ref={mon.get('ref')}")
+        return
+    s["down_mon"] = {}
+    logger.info(f"[DownPrice] {label} started clean (resumed={resumed})")
+
+
+def _down_flag_resume(sess, slot_idx: int):
+    """Mark that this slot's loop is being restarted by Auto Resume."""
+    st = getattr(sess, "down_resume_slots", None)
+    if st is None:
+        st = set()
+        sess.down_resume_slots = st
+    st.add(slot_idx)
+
+
+async def _down_gate(sess, slot_idx: int, s: dict, ad_data: dict, interval_secs: int, label: str) -> bool:
+    """The single cycle timer for a monitored slot. Blocks while monitoring,
+    and for the remainder of the countdown (interval measured from when the
+    countdown started). Returns False only if the ad was stopped meanwhile."""
+    logged = False
+    while _ad_running(sess, slot_idx):
+        if _down_threshold(s, ad_data) is None:
+            return True
+        mon = _down_mon(s)
+        st = mon.get("state")
+        if st == "monitoring":
+            if not logged:
+                logger.info(f"[DownPrice] {label} holding next cycle — monitoring for a drop of "
+                            f"{s.get('down_price')} from ref {mon.get('ref')}")
+                logged = True
+            await asyncio.sleep(1)
+            continue
+        if st == "countdown" and mon.get("cd_started_ts"):
+            remaining = mon["cd_started_ts"] + interval_secs - datetime.now().timestamp()
+            if remaining > 0:
+                await asyncio.sleep(min(1.0, remaining))
+                continue
+        return True
+    return False
 
 
 async def _resync_price_from_bybit(ad_id: str, creds: dict, sess, slot_idx: int, fallback_price, tag: str):
@@ -1438,6 +1660,7 @@ async def _fast_chase_coordinator(bot, chat_id):
                     )
             if not any_running:
                 break
+            _down_flush(chat_id)
             await asyncio.sleep(_FAST_CHASE_POLL_SECS)
     except asyncio.CancelledError:
         logger.info(f"[FastChase] coordinator cancelled for user {chat_id}")
@@ -1522,9 +1745,18 @@ _FAST_CHASE_GAP_OVERRIDE = {
     ("USD", "ETH"): Decimal("0.5"),
 }
 
-def _fast_chase_gap(currency_id: str, token_id: str, reference_price=None) -> Decimal:
+# Ad 1 (the senior-most ad, nothing to defer to) on USD/BTC and USD/ETH no
+# longer waits for a $0.50 move before Fast Update acts: any rise of at least
+# one price step (0.01 — the smallest change Bybit will accept as a genuine
+# edit) is posted, so the Down Price reference is reset on EVERY real raise.
+# Ad 2/Ad 3 keep the $0.50 reaction gap.
+_FAST_CHASE_AD1_MIN_RISE = Decimal("0.01")
+
+def _fast_chase_gap(currency_id: str, token_id: str, reference_price=None, slot_idx=None) -> Decimal:
     override = _FAST_CHASE_GAP_OVERRIDE.get((currency_id.upper(), token_id.upper()))
     if override is not None:
+        if slot_idx == -1 and (currency_id.upper(), token_id.upper()) in bybit.DOWN_PRICE_PAIRS:
+            return _FAST_CHASE_AD1_MIN_RISE
         return override
     return get_min_price_gap(currency_id, token_id, reference_price)
 
@@ -1738,6 +1970,11 @@ def _load_settings_from_disk(uid: int):
     if saved:
         sess = get_session(uid)
         for k, v in saved.items():
+            # Down Price monitoring state is written to disk throttled, so the
+            # in-memory copy of a running ad is always at least as fresh —
+            # never let a /start roll it back to an older saved snapshot.
+            if k == "down_mon" and sess.settings.get("down_mon"):
+                continue
             sess.settings[k] = v
         # Back-fill: if only generic key exists, populate slot-keyed keys (slots 1 & 2)
         for field in ("ad_id", "bybit_uid"):
@@ -2358,6 +2595,12 @@ def ads_section_keyboard(uid: int = 0):
             _nudge_val = (s.get("manual_nudge") or "").strip()
             _nudge_label = f"↔️ Nudge Amount: {_nudge_val}" if _nudge_val else "↔️ Set Nudge Amount"
             rows.append([InlineKeyboardButton(_nudge_label, callback_data="set_manual_nudge")])
+        # Down Price monitoring — floating USD/BTC and USD/ETH only (any ad slot).
+        if (_cur, _tok) in bybit.DOWN_PRICE_PAIRS:
+            _dp_val = (s.get("down_price") or "").strip()
+            rows.append([InlineKeyboardButton(
+                f"📉 Down Price: ${_dp_val}" if _dp_val else "📉 Set Down Price",
+                callback_data="set_down_price")])
 
     # Dedicated BTC/NGN market list — same 1-300 windowed viewer the
     # USDT/USD ad_copy mode gets, but shown for BTC/NGN ads in ANY mode
@@ -2459,6 +2702,11 @@ def ads_section_text(uid: int = 0) -> str:
         mode_info = f"  📊 Float: `{float_pct}%`"
         if ad_data.get("currencyId","").upper() == "NGN":
             mode_info += f" | 💱 {cur_label}/USDT: `{local_ref}`"
+        _dp_thr = _down_threshold(s, ad_data)
+        if _dp_thr is not None:
+            _dp_state = (s.get("down_mon") or {}).get("state")
+            _dp_txt = {"monitoring": "watching for a drop", "countdown": "cycle countdown running"}.get(_dp_state, "ready")
+            mode_info += f"\n  📉 Down Price: `${_dp_thr}` — {_dp_txt}"
 
     hint = next_setup_hint(uid) if slot_idx == -1 else "Set this ad's Ad ID, fetch its details, then set its mode."
     user_slot_idx = _get_user_slot(uid)
@@ -2487,29 +2735,35 @@ def ads_section_text(uid: int = 0) -> str:
 
 def ad_sendmsg_text(uid: int) -> str:
     sess = _s(uid)
-    msg  = _ad_msg_text(sess)
     status = "🟢 ON — sending to every new BUY order" if sess.ad_sendmsg_enabled else "⚪ OFF"
-    preview = _esc(msg) if msg else "<i>— no message saved yet —</i>"
+    def _prev(cur):
+        m = _ad_msg_text(sess, cur)
+        return _esc(m) if m else "<i>— not set —</i>"
     return (
         "✉️ <b>SEND MESSAGE (Ad Price Bot)</b>\n\n"
         f"Status: {status}\n\n"
-        "When ON, this message is sent automatically to the seller on every "
-        "<b>new BUY order</b> that arrives on your ads. New orders are checked "
-        "once every 1 minute to keep your API in safe mode.\n\n"
-        f"<b>Your message:</b>\n{preview}"
+        "When ON, a message is sent automatically to the seller on every "
+        "<b>new BUY order</b>. The bot checks each order's currency and sends the "
+        "matching message — set one or both. New orders are checked once every "
+        "1 minute to keep your API in safe mode.\n\n"
+        f"🇳🇬 <b>NGN orders</b> (BTC/NGN, ETH/NGN, USDT/NGN, USDC/NGN):\n{_prev('NGN')}\n\n"
+        f"💵 <b>USD orders</b> (BTC/USD, ETH/USD, USDT/USD, USDC/USD):\n{_prev('USD')}"
     )
 
 
 def ad_sendmsg_keyboard(uid: int):
     sess = _s(uid)
-    has_msg = bool(_ad_msg_text(sess))
     tog = "🟢 Send Message: ON — tap to turn OFF" if sess.ad_sendmsg_enabled else "⚪ Send Message: OFF — tap to turn ON"
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(tog, callback_data="toggle_ad_sendmsg")],
-        [InlineKeyboardButton("✏️ Rewrite Message" if has_msg else "✏️ Set Message", callback_data="set_ad_msg")],
-        *([[InlineKeyboardButton("♻️ Reset Message", callback_data="reset_ad_msg")]] if has_msg else []),
-        *back_section("section_ads"),
-    ])
+    rows = [[InlineKeyboardButton(tog, callback_data="toggle_ad_sendmsg")]]
+    for cur, flag in (("NGN", "🇳🇬"), ("USD", "💵")):
+        has = bool(_ad_msg_text(sess, cur))
+        rows.append([InlineKeyboardButton(
+            f"{flag} Rewrite {cur} Message ✅" if has else f"{flag} Set {cur} Message",
+            callback_data=f"set_ad_msg_{cur.lower()}")])
+        if has:
+            rows.append([InlineKeyboardButton(f"♻️ Reset {cur} Message", callback_data=f"reset_ad_msg_{cur.lower()}")])
+    rows += back_section("section_ads")
+    return InlineKeyboardMarkup(rows)
 
 
 def ads_dashboard_text(uid: int) -> str:
@@ -5170,11 +5424,12 @@ def _ad_mark_done(uid: int, order_id: str):
             logger.debug(f"[AdOrders] could not persist done ids for {uid}: {e}")
 
 
-async def _handle_ad_buy_order(bot, chat_id, order_id, show: bool, pay: bool, send_text: str):
+async def _handle_ad_buy_order(bot, chat_id, order_id, show: bool, pay: bool, send_msg: bool):
     """Handle one pending BUY order for the Ad Price Bot engine.
       show      — first time we see it: notify the user + count it in the DB
       pay       — Ad Auto Pay is on: mark it paid on Bybit
-      send_text — Send Message is on: message to send to the seller ('' = none)
+      send_msg  — Send Message is on: send the saved NGN/USD message (chosen by
+                  the order's own currencyId from the order-detail call)
     Returns nothing; failures are logged and retried on the next cycle only
     where retrying is safe (detail fetch / rate limit)."""
     sess = _s(chat_id)
@@ -5264,7 +5519,14 @@ async def _handle_ad_buy_order(bot, chat_id, order_id, show: bool, pay: bool, se
                     parse_mode="HTML")
 
     # ── 3. Send Message — to the seller, once per new order ──
-    if show and send_text:
+    send_text = ""
+    if show and send_msg:
+        _ord_cur = str(od.get("currencyId", "")).upper().strip()
+        send_text = _ad_msg_text(sess, _ord_cur)
+        if not send_text:
+            logger.info(f"[AdOrders] user={chat_id} order {order_id} currency={_ord_cur or '?'} "
+                        f"— no message saved for it, nothing sent")
+    if send_text:
         try:
             mr = await loop.run_in_executor(
                 None, partial(send_chat_message, order_id, send_text, creds=creds))
@@ -5344,7 +5606,7 @@ async def ad_order_loop(bot, chat_id):
                                 bot, chat_id, oid,
                                 show=is_new,
                                 pay=bool(need_pay and sess.ad_autopay_enabled),
-                                send_text=(_ad_msg_text(sess) if sess.ad_sendmsg_enabled else ""),
+                                send_msg=bool(sess.ad_sendmsg_enabled),
                             )
                         except asyncio.CancelledError:
                             raise
@@ -5940,7 +6202,22 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                 return
 
             new_p = Decimal(new_p_str)
+
             cur_p = _ad_current_price(sess, slot_idx)
+
+            # ── Down Price monitoring tick (USD/BTC + USD/ETH floating) ──
+            # gap = the ad's current live price − this tick's spot-derived
+            # price (new_p, from the same fetch Fast Update already makes —
+            # no extra request).
+            _dn_thr = _down_threshold(s, ad_data)
+            if _dn_thr is not None and cur_p > 0:
+                try:
+                    _dn_msg = _down_tick(chat_id, s, ad_data, new_p, cur_p, _ad_slot_label(slot_idx))
+                    if _dn_msg and _should_notify_now(s, "down_price_hit", 60):
+                        await _safe_send(bot, chat_id=chat_id, text=_dn_msg, parse_mode="HTML")
+                except Exception as _dn_err:
+                    logger.warning(f"{tag} down-price tick failed: {_dn_err}")
+
             logger.info(f"{tag} spot-derived price={new_p} | current ad price={cur_p}")
             if cur_p <= 0:
                 logger.warning(f"{tag} skipped — no known current ad price yet")
@@ -5948,7 +6225,7 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
 
             currency = ad_data.get("currencyId", "")
             token    = ad_data.get("tokenId", "")
-            gap      = _fast_chase_gap(currency, token, new_p)
+            gap      = _fast_chase_gap(currency, token, new_p, slot_idx)
 
             chase_ceiling = _wants_live_ceiling(currency, token, float_pct)
             posted_price  = None
@@ -6458,6 +6735,17 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                 # on. Mirror that by restarting this slot's own scheduled-
                 # cycle timer too (see auto_update_loop's wait phase).
                 _touch_last_fast_modify(sess, slot_idx)
+                _dn_note = ""
+                if _dn_thr is not None:
+                    if posted_price > cur_p:
+                        # Fast Update RAISED the price → the ad-vs-derived gap
+                        # restarts from this post, back to monitoring,
+                        # countdown cancelled.
+                        _down_on_fast_increase(chat_id, s, posted_price, new_p, _ad_slot_label(slot_idx))
+                        _dn_note = (f"\n📉 Down-price watch restarted — countdown starts once the derived price "
+                                    f"falls more than <code>{_dn_thr}</code> below <code>{posted_price}</code>")
+                    else:
+                        _down_record_edit(chat_id, s)
                 now   = datetime.now().strftime("%H:%M:%S")
                 label = _ad_slot_label(slot_idx)
                 if collided_with:
@@ -6491,7 +6779,7 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                     )
                 _send_ok, _held = _edit_notice(s, _ad_interval_seconds(s, ad_data))
                 if _send_ok:
-                    await _safe_send(bot, chat_id=chat_id, text=text + _edit_notice_suffix(_held), parse_mode="HTML")
+                    await _safe_send(bot, chat_id=chat_id, text=text + _dn_note + _edit_notice_suffix(_held), parse_mode="HTML")
             else:
                 logger.info(f"{tag} poll complete — no update posted")
 
@@ -6564,11 +6852,25 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
         _set_ad_running(sess, slot_idx, False)
         return
 
+    # Down Price monitoring: a manual start begins clean; an Auto Resume /
+    # redeploy restart keeps a recent persisted monitoring/countdown state.
+    _dp_resumed = slot_idx in getattr(sess, "down_resume_slots", set())
+    getattr(sess, "down_resume_slots", set()).discard(slot_idx)
+    _down_init_on_start(chat_id, s, ad_data, label, _dp_resumed)
+
     cycle = 0
     try:
       while _ad_running(sess, slot_idx):
         try:
+            # ── Down Price gate — the ONE timer for monitored floating ads ──
+            # (USD/BTC + USD/ETH with a Down Price set). Holds this cycle
+            # while the market hasn't fallen far enough since the last Fast
+            # Update raise, then for the rest of the countdown. A no-op for
+            # every other ad/mode.
+            if not await _down_gate(sess, slot_idx, s, ad_data, interval_secs, label):
+                break
             cycle += 1
+            _down_log_cycle_start(s, ad_data, label, cycle)
             now  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             mode = s.get("mode","fixed")
             prefix = f"[{label}] " if sess.total_ad_slots() > 1 else ""
@@ -7364,6 +7666,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                 if posted_price is not None:
                     _reset_ad_failures(sess, slot_idx)
                     _set_ad_current_price(sess, slot_idx, posted_price)
+                    _down_note_edit(chat_id, s, ad_data)
                     if mode in ("ad_copy", "decodo_market"):
                         # ad_data["price"] is the actual source of truth the
                         # skip-checks above compare against — keep it in
@@ -7495,6 +7798,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                 if posted_price is not None:
                     _reset_ad_failures(sess, slot_idx)
                     _set_ad_current_price(sess, slot_idx, posted_price)
+                    _down_note_edit(chat_id, s, ad_data)
                     _send_ok, _held = _edit_notice(s, _ad_interval_seconds(s, ad_data))
                     if _send_ok:
                         await _safe_send(bot, chat_id=chat_id,
@@ -7533,6 +7837,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                         if correction_code == 0:
                             _reset_ad_failures(sess, slot_idx)
                             _set_ad_current_price(sess, slot_idx, new_p)
+                            _down_note_edit(chat_id, s, ad_data)
                             await _safe_send(bot, chat_id=chat_id,
                                 text=(
                                     f"⚠️ {prefix}<b>Cycle {cycle}</b> <code>{now}</code>\n"
@@ -7565,6 +7870,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                 else:
                     _reset_ad_failures(sess, slot_idx)
                     _set_ad_current_price(sess, slot_idx, submit_price)
+                    _down_note_edit(chat_id, s, ad_data)
                     # Only NOW — after Bybit has confirmed ret_code==0 — do
                     # we commit the copy-mode "last price" trackers. Doing
                     # this any earlier (before knowing the post succeeded)
@@ -7617,6 +7923,14 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
             # so this is a no-op for them and behaves exactly as before.
             loop_clock = asyncio.get_event_loop()
             wait_until = loop_clock.time() + interval_secs
+            if _down_threshold(s, ad_data) is not None:
+                # Down Price monitoring owns this slot's timer: the cycle just
+                # finished, so the countdown starts now (unless a Fast Update
+                # landed mid-cycle and put it back into monitoring), and the
+                # gate at the top of the loop does ALL the waiting — skipping
+                # this wait avoids a second, competing timer.
+                _down_on_cycle_done(chat_id, s)
+                wait_until = loop_clock.time()
             _seen_fast_modify_ts = _last_fast_modify_ts(sess, slot_idx) if mode == "floating" else None
             while _ad_running(sess, slot_idx) and loop_clock.time() < wait_until:
                 await asyncio.sleep(1)
@@ -9007,9 +9321,9 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
     elif data == "toggle_ad_sendmsg":
         _sa = _s(tuser.id)
         if not _sa.ad_sendmsg_enabled:
-            if not _ad_msg_text(_sa):
+            if not _ad_any_msg(_sa):
                 await edit_menu(query,
-                    "⚠️ <b>No message saved yet</b>\n\nTap <b>✏️ Set Message</b> first, then turn Send Message on.\n\n"
+                    "⚠️ <b>No message saved yet</b>\n\nSet the NGN and/or USD message first, then turn Send Message on.\n\n"
                     + ad_sendmsg_text(tuser.id), ad_sendmsg_keyboard(tuser.id))
                 return
             if _main_order_flow_on(_sa):
@@ -9028,29 +9342,31 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         _maybe_snapshot_resume_state(tuser.id)
         await edit_menu(query, ad_sendmsg_text(tuser.id), ad_sendmsg_keyboard(tuser.id))
 
-    elif data == "set_ad_msg":
-        _btn_state["action"]       = "ad_msg_text"
+    elif data in ("set_ad_msg_ngn", "set_ad_msg_usd"):
+        _cur_code = data.rsplit("_", 1)[1].upper()
+        _btn_state["action"]       = f"ad_msg_text_{_cur_code.lower()}"
         _btn_state["prev_section"] = "ad_sendmsg_menu"
-        _cur = _ad_msg_text(_s(tuser.id))
+        _cur = _ad_msg_text(_s(tuser.id), _cur_code)
         await edit_menu(query,
-            "✏️ <b>" + ("Rewrite" if _cur else "Set") + " Send Message</b>\n\n"
+            f"✏️ <b>{'Rewrite' if _cur else 'Set'} {_cur_code} Message</b>\n\n"
             + (f"Current:\n<i>{_esc(_cur)}</i>\n\n" if _cur else "")
-            + f"Send the message you want delivered to the seller on every new BUY order "
+            + f"Send the message to deliver to the seller on every new <b>{_cur_code}</b> BUY order "
               f"(max {AD_MSG_MAX_LEN} characters).",
             InlineKeyboardMarkup(back_section("ad_sendmsg_menu")))
 
-    elif data == "reset_ad_msg":
+    elif data in ("reset_ad_msg_ngn", "reset_ad_msg_usd"):
+        _cur_code = data.rsplit("_", 1)[1].upper()
         _sa = _s(tuser.id)
-        _sa.settings["ad_msg_text"] = ""
-        _was_on = _sa.ad_sendmsg_enabled
-        _sa.ad_sendmsg_enabled = False
-        _stop_ad_order_engine_if_idle(tuser.id)
+        _sa.settings[_AD_MSG_KEYS[_cur_code]] = ""
+        _off_note = ""
+        if _sa.ad_sendmsg_enabled and not _ad_any_msg(_sa):
+            _sa.ad_sendmsg_enabled = False
+            _stop_ad_order_engine_if_idle(tuser.id)
+            _off_note = " Send Message was turned OFF because there is nothing left to send."
         _save_settings(tuser.id)
         _maybe_snapshot_resume_state(tuser.id)
         await edit_menu(query,
-            "♻️ <b>Message reset.</b>"
-            + (" Send Message was turned OFF because there is nothing to send." if _was_on else "")
-            + "\n\n" + ad_sendmsg_text(tuser.id),
+            f"♻️ <b>{_cur_code} message reset.</b>{_off_note}\n\n" + ad_sendmsg_text(tuser.id),
             ad_sendmsg_keyboard(tuser.id))
 
     # ── ✉️ Toggle Sell Msg ──
@@ -9690,6 +10006,36 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             "Send the amount to add each cycle.\nExamples: `0.05` | `1` | `0.5`",
             InlineKeyboardMarkup(back_section("section_ads"))
         )
+
+    # ── 📉 Set Down Price (floating USD/BTC + USD/ETH, any ad slot) ──
+    elif data == "set_down_price":
+        sess = _s(tuser.id)
+        slot_idx = sess.editing_slot
+        s = _ad_settings(sess, slot_idx)
+        ad_data = _ad_data_of(sess, slot_idx)
+        _pair = (ad_data.get("currencyId","").upper(), ad_data.get("tokenId","").upper())
+        if not ad_data or _pair not in bybit.DOWN_PRICE_PAIRS or s.get("mode") != "floating":
+            await edit_menu(query,
+                "❌ Down Price is only available for <b>Floating</b> mode on <b>BTC/USD</b> and <b>ETH/USD</b> ads.\n"
+                "Fetch the ad details and set the mode to Floating first.",
+                InlineKeyboardMarkup(back_section("section_ads")))
+            return
+        _btn_state["action"]       = "down_price"
+        _btn_state["prev_section"] = "section_ads"
+        _cur_dp = (s.get("down_price") or "").strip()
+        await edit_menu(query,
+            f"📉 <b>Set Down Price — {_ad_slot_label(slot_idx)}</b>\n\n"
+            f"Pair: <code>{_esc(_pair[1])}/{_esc(_pair[0])}</code>\n"
+            f"Current: <code>{('$' + _cur_dp) if _cur_dp else '— not set —'}</code>\n\n"
+            "After Fast Update raises this ad's price, the bot measures the gap between your ad's "
+            "current price and the live market-derived price. Once the derived price is more than this "
+            "amount BELOW your ad, the normal cycle countdown starts — so the ad isn't edited before "
+            "Bybit's own timer has progressed. If Fast Update raises the price again during the "
+            "countdown, monitoring restarts.\n\n"
+            "Send the drop in dollars, e.g. <code>10</code> — the cycle interval you already set is used "
+            "for the countdown.\n"
+            "Send <code>0</code> or <code>clear</code> to turn Down Price off.",
+            InlineKeyboardMarkup(back_section("section_ads")))
 
     # ── ↔️ Set Manual Nudge Amount (Ad 2/Ad 3 only) ──
     elif data == "set_manual_nudge":
@@ -11253,6 +11599,33 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             await update.message.reply_text("❌ Send a positive number like `0.05`", parse_mode="HTML")
 
+    elif action == "down_price":
+        sess = _s(uid)
+        slot_idx = sess.editing_slot
+        s = _ad_settings(sess, slot_idx)
+        if text.strip().lower() in ("0", "clear", "none", "off", "reset"):
+            s["down_price"] = ""
+            s["down_mon"] = {}
+            _save_settings(uid)
+            _state["action"] = None
+            await reply_with_back(f"✅ <b>{_ad_slot_label(slot_idx)} Down Price turned off.</b>")
+        else:
+            ok, err, val = bybit.validate_down_price(text)
+            if not ok:
+                await update.message.reply_text(err, parse_mode="HTML")
+            else:
+                s["down_price"] = format(val.normalize(), "f")
+                # A new threshold starts from a clean state — the next Fast
+                # Update raise (re)starts monitoring from the live spot.
+                s["down_mon"] = {}
+                _save_settings(uid)
+                _state["action"] = None
+                await reply_with_back(
+                    f"✅ <b>{_ad_slot_label(slot_idx)} Down Price saved!</b>\n\n"
+                    f"<code>${_esc(s['down_price'])}</code> — after a Fast Update raise, the cycle countdown "
+                    f"({_ad_interval_label(s, _ad_data_of(sess, slot_idx))}) only starts once the derived price is more than that below your ad's price."
+                )
+
     elif action == "manual_nudge":
         sess = _s(uid)
         slot_idx = sess.editing_slot
@@ -11447,7 +11820,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"FLW narration: <code>{text.strip()} payment to [receiver]</code>"
         )
 
-    elif action == "ad_msg_text":
+    elif action in ("ad_msg_text_ngn", "ad_msg_text_usd"):
+        _cur_code = action.rsplit("_", 1)[1].upper()
         val = text.strip()
         if not val:
             await update.message.reply_text("❌ The message can't be empty. Send the text you want.", parse_mode="HTML")
@@ -11455,12 +11829,12 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 f"❌ Too long ({len(val)} characters). Keep it under {AD_MSG_MAX_LEN}.", parse_mode="HTML")
         else:
-            _s(uid).settings["ad_msg_text"] = val
+            _s(uid).settings[_AD_MSG_KEYS[_cur_code]] = val
             _save_settings(uid)
             _state["action"] = None
             await reply_with_back(
-                f"✅ <b>Send message saved!</b>\n\n<i>{_esc(val)}</i>\n\n"
-                + ("It will go to the seller on every new BUY order." if _s(uid).ad_sendmsg_enabled
+                f"✅ <b>{_cur_code} message saved!</b>\n\n<i>{_esc(val)}</i>\n\n"
+                + (f"It will go to the seller on every new {_cur_code} BUY order." if _s(uid).ad_sendmsg_enabled
                    else "Open ✉️ Send Message and turn it ON to start using it.")
             )
 
@@ -12054,6 +12428,7 @@ async def _resume_user_engines(bot, uid: int, snapshot: dict) -> list:
 
         _reset_ad_failures(sess, slot_idx)
         _set_ad_running(sess, slot_idx, True)
+        _down_flag_resume(sess, slot_idx)   # keep a saved Down Price monitoring state (see _down_init_on_start)
         task = asyncio.create_task(auto_update_loop(bot, uid, slot_idx))
         _set_ad_task(sess, slot_idx, task)
         resumed.append(f"{_ad_slot_label(slot_idx)} auto-update")
@@ -12121,7 +12496,7 @@ async def _resume_user_engines(bot, uid: int, snapshot: dict) -> list:
                 sess.ad_autopay_enabled = True
                 resumed.append("Ad Auto Pay (1 min)")
             if snapshot.get("ad_sendmsg") and not sess.ad_sendmsg_enabled:
-                if _ad_msg_text(sess):
+                if _ad_any_msg(sess):
                     sess.ad_sendmsg_enabled = True
                     resumed.append("Ad Send Message")
                 else:
