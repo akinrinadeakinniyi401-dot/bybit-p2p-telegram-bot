@@ -229,6 +229,33 @@ MIN_BTC_NGN_ADCOPY_INTERVAL_SECONDS = 3
 MIN_QUICK_MARKET_INTERVAL_SECONDS = 1
 
 
+# ─────────────────────────────────────────
+# 📉 Down Price monitoring (floating mode only)
+# ─────────────────────────────────────────
+# After Fast Update RAISES a floating ad's price, Bybit restarts its own
+# edit timer for that ad. Editing again before the market has actually
+# fallen is wasted/unsafe, so the scheduled cycle's countdown is held back
+# until the underlying spot price has dropped by the user's own "Down
+# Price" amount from the reference price recorded at that Fast Update.
+# (currency, token) pairs it applies to — USD/BTC and USD/ETH for now.
+DOWN_PRICE_PAIRS = {("USD", "BTC"), ("USD", "ETH")}
+MAX_DOWN_PRICE   = Decimal("100000")
+
+
+def validate_down_price(value) -> tuple[bool, str, "Decimal | None"]:
+    """Validate a user-entered Down Price threshold (a positive dollar
+    amount). Returns (ok, error_message, Decimal_value)."""
+    try:
+        val = Decimal(str(value).strip().lstrip("$"))
+    except Exception:
+        return False, "❌ Send a positive dollar amount like <code>10</code> or <code>7.5</code>.", None
+    if val <= 0:
+        return False, "❌ Down Price must be greater than 0.", None
+    if val > MAX_DOWN_PRICE:
+        return False, f"❌ Down Price can't be more than <code>{MAX_DOWN_PRICE}</code>.", None
+    return True, "", val
+
+
 def validate_interval(minutes) -> tuple[bool, str]:
     """Reject any update interval below the safe floor. Keeping this at
     2 minutes minimum, even for a single ad, keeps every combination of
