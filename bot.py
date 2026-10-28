@@ -3741,7 +3741,7 @@ async def _flw_autopay(bot, chat_id, order_id, order_detail):
                 f"transfer_id={transfer_id!r} status={final_status!r}"
             )
             await _update_order_message_final(
-                context.bot if hasattr(bot, "bot") else bot,
+                bot.bot if hasattr(bot, "bot") else bot,
                 chat_id, order_id, "Transfer Pending", "skipped"
             )
             await bot.send_message(chat_id=chat_id,
@@ -5207,10 +5207,7 @@ async def _handle_buy_order(bot, chat_id, order_id):
 
         # ── Persist cumulative buy order count to DB ──
         try:
-            user_rec = db.get_user(chat_id)
-            if user_rec is not None:
-                new_buy_count = (user_rec.get("total_buy_orders") or 0) + 1
-                db.update_user_stats(chat_id, total_buy_orders=new_buy_count)
+            db.increment_stat(chat_id, "total_buy_orders")
         except Exception as _stat_err:
             logger.debug(f"[Stats] Could not update buy count for {chat_id}: {_stat_err}")
 
@@ -5463,12 +5460,7 @@ async def _handle_ad_buy_order(bot, chat_id, order_id, show: bool, pay: bool, se
         )
         sess.order_msg_ids[order_id] = sent_msg.message_id
         try:
-            user_rec = db.get_user(chat_id)
-            if user_rec is not None:
-                db.update_user_stats(
-                    chat_id,
-                    total_buy_orders=(user_rec.get("total_buy_orders") or 0) + 1,
-                )
+            db.increment_stat(chat_id, "total_buy_orders")
         except Exception as _stat_err:
             logger.debug(f"[Stats] Could not update buy count for {chat_id}: {_stat_err}")
         _ad_mark_done(chat_id, order_id)
@@ -5949,10 +5941,7 @@ async def _handle_sell_paid(bot, chat_id, order_id):
 
         # ── Persist cumulative sell order count to DB ──
         try:
-            user_rec = db.get_user(chat_id)
-            if user_rec is not None:
-                new_sell_count = (user_rec.get("total_sell_orders") or 0) + 1
-                db.update_user_stats(chat_id, total_sell_orders=new_sell_count)
+            db.increment_stat(chat_id, "total_sell_orders")
         except Exception as _stat_err:
             logger.debug(f"[Stats] Could not update sell count for {chat_id}: {_stat_err}")
 
@@ -10750,17 +10739,20 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             await query.answer("❌ No broadcast draft found — start again with /broadcast.", show_alert=True)
             return
         user_state["broadcast_draft"] = None
+        _bc_target = user_state.get("broadcast_target") or {"mode": "all", "ids": []}
+        user_state["broadcast_target"] = None
         await query.answer("📢 Broadcasting — this runs in the background, you'll get a summary when it's done.", show_alert=True)
         try:
             await query.edit_message_reply_markup(reply_markup=None)   # clear buttons only — preview content untouched
         except Exception:
             pass
-        asyncio.create_task(_run_broadcast(context.bot, query.message.chat_id, draft))
+        asyncio.create_task(_run_broadcast(context.bot, query.message.chat_id, draft, _bc_target))
 
     elif data == "broadcast_cancel":
         if not is_admin(tuser.id):
             return
         user_state["broadcast_draft"] = None
+        user_state["broadcast_target"] = None
         await query.answer("❌ Broadcast cancelled.")
         try:
             await query.edit_message_reply_markup(reply_markup=None)
@@ -12764,21 +12756,99 @@ async def _db_session_cleanup_loop():
 # ─────────────────────────────────────────
 # 📢 BROADCAST — admin sends a promo to every user (text, photo, or video)
 # ─────────────────────────────────────────
+def _parse_broadcast_targets(args: list):
+    """Turn the words after /broadcast into a target spec.
+      /broadcast                          → everyone
+      /broadcast 123456                   → just that user
+      /broadcast 123456 789012 555,666    → those users (spaces / commas / newlines)
+      /broadcast all except 123456 789012 → everyone EXCEPT those users
+    Returns (target_dict, error_text_or_None)."""
+    import re as _re
+    raw = " ".join(args or []).strip()
+    if not raw:
+        return {"mode": "all", "ids": []}, None
+    mode = "ids"
+    low = raw.lower()
+    if low.startswith("all"):
+        rest = raw[3:].strip()
+        if rest.lower().startswith("except"):
+            mode, raw = "except", rest[6:].strip()
+        elif not rest:
+            return {"mode": "all", "ids": []}, None
+        else:
+            return None, "❌ Use <code>/broadcast all except 123 456</code> to exclude users."
+    tokens = [x for x in _re.split(r"[\s,;]+", raw) if x]
+    bad = [x for x in tokens if not x.isdigit()]
+    if bad:
+        return None, ("❌ These aren't valid Telegram IDs: "
+                      + ", ".join(f"<code>{_esc(b)}</code>" for b in bad[:5])
+                      + "\nIDs are numbers only, e.g. <code>/broadcast 8341141005 6846285954</code>")
+    ids = []
+    for x in tokens:
+        v = int(x)
+        if v not in ids:
+            ids.append(v)
+    if not ids:
+        return None, "❌ Give at least one Telegram ID."
+    return {"mode": mode, "ids": ids}, None
+
+
+def _resolve_broadcast_targets(target: dict):
+    """Resolve a target spec against the users on file.
+    Returns (user_ids_to_send, unknown_ids). Unknown IDs (never used the bot,
+    so Telegram wouldn't let us message them anyway) are reported, not sent."""
+    users = db.get_all_users() or []
+    known = [u.get("user_id") for u in users if u.get("user_id")]
+    known_set = set(known)
+    mode = (target or {}).get("mode", "all")
+    ids = (target or {}).get("ids", [])
+    if mode == "ids":
+        return [i for i in ids if i in known_set], [i for i in ids if i not in known_set]
+    if mode == "except":
+        skip = set(ids)
+        return [i for i in known if i not in skip], [i for i in ids if i not in known_set]
+    return known, []
+
+
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/broadcast — admin-only. Two-step flow: send the content you want
     broadcast (plain text, or a photo/video with caption), review a
-    preview, then confirm before it actually goes out to every user."""
+    preview, then confirm before it actually goes out.
+
+    Targets (all optional — plain /broadcast still means everyone):
+      /broadcast 123456                    one user
+      /broadcast 123456 789012             several users
+      /broadcast all except 123456 789012  everyone but these users"""
     uid = update.effective_user.id
     if not is_admin(uid):
         return
+    target, err = _parse_broadcast_targets(getattr(context, "args", None) or [])
+    if err:
+        await update.message.reply_text(err, parse_mode="HTML")
+        return
     user_state["broadcast_draft"] = None
+    user_state["broadcast_target"] = target
     user_state["action"] = "broadcast_awaiting_content"
+    ids_now, unknown = _resolve_broadcast_targets(target)
+    if target["mode"] == "ids":
+        who = f"<b>{len(ids_now)} selected user(s)</b>"
+    elif target["mode"] == "except":
+        who = f"<b>ALL users except {len(target['ids'])}</b> ({len(ids_now)} will receive it)"
+    else:
+        who = "<b>ALL users</b>"
+    note = ""
+    if unknown:
+        note = ("\n⚠️ Not found in the database (will be skipped): "
+                + ", ".join(f"<code>{i}</code>" for i in unknown[:10]))
     await update.message.reply_text(
         "📢 <b>Broadcast — Step 1/2</b>\n\n"
-        "Send the message you want to broadcast to ALL users. You can send:\n"
+        f"Sending to: {who}{note}\n\n"
+        "Send the message you want to broadcast. You can send:\n"
         "• Plain text\n"
         "• A photo with caption\n"
         "• A video with caption\n\n"
+        "<i>Target specific users: <code>/broadcast 123456 789012</code> · "
+        "skip users: <code>/broadcast all except 123456</code></i>\n\n"
         "Type <code>cancel</code> to cancel.",
         parse_mode="HTML"
     )
@@ -12814,12 +12884,20 @@ async def _show_broadcast_preview(update: Update, context: ContextTypes.DEFAULT_
     draft = user_state.get("broadcast_draft")
     if not draft:
         return
-    total_users = len(db.get_all_users())
+    _tgt = user_state.get("broadcast_target") or {"mode": "all", "ids": []}
+    _recipients, _unknown = _resolve_broadcast_targets(_tgt)
+    total_users = len(_recipients)
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"✅ Send to {total_users} users", callback_data="broadcast_confirm")],
+        [InlineKeyboardButton(f"✅ Send to {total_users} user{'s' if total_users != 1 else ''}", callback_data="broadcast_confirm")],
         [InlineKeyboardButton("❌ Cancel", callback_data="broadcast_cancel")],
     ])
-    note = f"\n\n📊 <b>Step 2/2</b> — this will be sent to {total_users} users. Confirm?"
+    _who = ""
+    if _tgt["mode"] == "ids":
+        _who = " (" + ", ".join(f"<code>{i}</code>" for i in _recipients[:10]) + (" …" if len(_recipients) > 10 else "") + ")"
+    elif _tgt["mode"] == "except":
+        _who = f" (everyone except {len(_tgt['ids'])} user(s))"
+    _unk = (f"\n⚠️ Skipped — not in database: " + ", ".join(f"<code>{i}</code>" for i in _unknown[:10])) if _unknown else ""
+    note = f"\n\n📊 <b>Step 2/2</b> — this will be sent to {total_users} user(s){_who}.{_unk}\nConfirm?"
 
     if draft["type"] == "text":
         await update.message.reply_text(f"📢 <b>Preview:</b>\n\n{draft['text']}{note}", parse_mode="HTML", reply_markup=keyboard)
@@ -12829,7 +12907,7 @@ async def _show_broadcast_preview(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_video(video=draft["file_id"], caption=f"{_esc(draft['text'])}{note}", parse_mode="HTML", reply_markup=keyboard)
 
 
-async def _run_broadcast(bot, admin_chat_id: int, draft: dict):
+async def _run_broadcast(bot, admin_chat_id: int, draft: dict, target: dict = None):
     """
     Sends the confirmed broadcast to every user on file, one at a time
     with a small delay to stay comfortably under Telegram's rate limits.
@@ -12838,11 +12916,11 @@ async def _run_broadcast(bot, admin_chat_id: int, draft: dict):
     flood-control response, waits exactly as long as Telegram asks, then
     retries that one user once before moving on.
     """
-    users = db.get_all_users()
+    recipients, _unknown = _resolve_broadcast_targets(target or {"mode": "all", "ids": []})
+    users = recipients
     sent = failed = 0
 
-    for user in users:
-        target_id = user.get("user_id")
+    for target_id in recipients:
         if not target_id:
             continue
         try:
@@ -12864,7 +12942,8 @@ async def _run_broadcast(bot, admin_chat_id: int, draft: dict):
 
     await bot.send_message(
         chat_id=admin_chat_id,
-        text=f"📢 <b>Broadcast complete!</b>\n\n✅ Sent: {sent}\n❌ Failed/blocked: {failed}\n👥 Total users: {len(users)}",
+        text=(f"📢 <b>Broadcast complete!</b>\n\n✅ Sent: {sent}\n❌ Failed/blocked: {failed}\n👥 Recipients: {len(users)}"
+              + (f"\n⚠️ Skipped (not in database): {len(_unknown)}" if _unknown else "")),
         parse_mode="HTML"
     )
 
@@ -13145,8 +13224,11 @@ async def cmd_userdata(update: Update, context: ContextTypes.DEFAULT_TYPE):
             uid = int(user.get("user_id") or user.get("id") or 0)
 
             # ── DB totals (persisted cumulatively by order monitor) ──
-            db_buy  = int(user.get("total_buy_orders",  0) or 0)
-            db_sell = int(user.get("total_sell_orders", 0) or 0)
+            _st = user.get("stats") or {}
+            db_buy  = max(int(_st.get("total_buy_orders", 0) or 0),
+                          int(user.get("total_buy_orders", 0) or 0))
+            db_sell = max(int(_st.get("total_sell_orders", 0) or 0),
+                          int(user.get("total_sell_orders", 0) or 0))
 
             # ── Live session totals (in-memory, current session only) ──
             # get_session(uid) is safe to call for any uid — returns empty session
