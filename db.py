@@ -356,6 +356,9 @@ def upgrade_user(user_id: int, days: int) -> dict:
         user["plan"]             = "pro"
         user["plan_expires"]     = expires.strftime("%Y-%m-%d %H:%M:%S")
         user["upgrade_pending"]  = False
+        user["ever_pro"]         = True
+        user["nudge_count"]      = 0          # renewed — restart the reminder cycle
+        user["last_upgrade_nudge"] = None
         _write_json(_user_path(user_id), user)
         logger.info(f"[DB] Upgraded user {user_id} → pro until {user['plan_expires']}")
         return user
@@ -365,6 +368,9 @@ def downgrade_user(user_id: int) -> dict:
         user = get_user(user_id)
         if not user:
             return {}
+        if user.get("plan") == "pro":
+            user["ever_pro"]       = True
+            user["pro_expired_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         user["plan"]         = "free"
         user["plan_expires"] = None
         _write_json(_user_path(user_id), user)
@@ -592,6 +598,164 @@ def get_auto_resume_agent_enabled(user_id: int) -> bool:
 
 
 # ─────────────────────────────────────────
+# Upgrade reminders for lapsed Pro users
+# ─────────────────────────────────────────
+# Who gets them: users who are NOT on an active Pro plan but used to be —
+# flagged ever_pro / pro_expired_at, still marked "pro" with a past expiry, or
+# (for accounts downgraded before those flags existed) who had saved an ad
+# setup. Never-engaged free users and active Pro users are skipped.
+# Cadence: once a day for the first 7 reminders, then once a week.
+def _had_setup(user: dict) -> bool:
+    ps = user.get("p2p_settings") or {}
+    return bool(ps.get("ad_id") or ps.get("ad_id_1") or user.get("p2p_extra_slots"))
+
+def get_upgrade_nudge_targets(admin_ids=()) -> list:
+    """[(user_id, first_name)] who are due a reminder right now."""
+    now = datetime.now()
+    out = []
+    for u in get_all_users():
+        uid = u.get("user_id")
+        if not uid or uid in admin_ids or u.get("nudge_blocked"):
+            continue
+        if is_pro(uid):
+            continue
+        if not (u.get("ever_pro") or u.get("pro_expired_at") or u.get("plan") == "pro" or _had_setup(u)):
+            continue
+        count = int(u.get("nudge_count") or 0)
+        gap_h = 24 if count < 7 else 24 * 7
+        last = _parse_ts(u.get("last_upgrade_nudge") or "")
+        if last and (now - last) < timedelta(hours=gap_h - 1):
+            continue
+        name = (u.get("display_name") or "").strip().split(" ")[0] or (u.get("username") or "").strip() or "there"
+        out.append((uid, name, count))
+    return out
+
+def mark_upgrade_nudged(user_id: int, blocked: bool = False):
+    with _lock:
+        user = get_user(user_id)
+        if not user:
+            return
+        if blocked:
+            user["nudge_blocked"] = True
+        else:
+            user["nudge_count"]        = int(user.get("nudge_count") or 0) + 1
+            user["last_upgrade_nudge"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        _write_json(_user_path(user_id), user)
+
+def ad456_warn_due(user_id: int) -> bool:
+    """True once, when the trial has <=1h left and the warning wasn't sent yet."""
+    with _lock:
+        user = get_user(user_id)
+        if not user:
+            return False
+        st = ad456_status(user_id)
+        if st["state"] != "trial":
+            return False
+        ends = _parse_ts(st["trial_ends"])
+        if not ends or (ends - datetime.now()) > timedelta(hours=1):
+            return False
+        if user.get("ad456_warned_for") == user.get("ad456_trial_started"):
+            return False
+        user["ad456_warned_for"] = user.get("ad456_trial_started")
+        _write_json(_user_path(user_id), user)
+        return True
+
+
+# ─────────────────────────────────────────
+# Ad 4 / Ad 5 / Ad 6 access (Pro only: 1-day trial, then admin approval)
+# ─────────────────────────────────────────
+# One access record covers all three extra ads. Lifecycle:
+#   free plan            → locked
+#   Pro, never used      → "available" (trial begins on the first start)
+#   trial running        → "trial" (24h from the first start)
+#   trial over           → "trial_expired" → user may request access
+#   admin approved       → "approved" until THIS Pro plan's expiry (pegged
+#                          at approval time, like Auto Resume / Permanent IP)
+AD456_TRIAL_HOURS = 24
+
+def _parse_ts(v):
+    try:
+        return datetime.strptime(v, "%Y-%m-%d %H:%M:%S")
+    except Exception:
+        return None
+
+def ad456_status(user_id: int) -> dict:
+    """{"state": locked|available|trial|trial_expired|pending|rejected|approved,
+        "trial_ends": str|None, "expires": str|None}"""
+    user = get_user(user_id)
+    if not user or not is_pro(user_id):
+        return {"state": "locked", "trial_ends": None, "expires": None}
+    now = datetime.now()
+    req = user.get("ad456_request_status", "none")
+    exp = user.get("ad456_expires")
+    if req == "approved":
+        exp_dt = _parse_ts(exp) if exp else None
+        if exp is None or (exp_dt and exp_dt > now):
+            return {"state": "approved", "trial_ends": None, "expires": exp}
+    started = _parse_ts(user.get("ad456_trial_started") or "")
+    ends = None
+    if started:
+        ends_dt = started + timedelta(hours=AD456_TRIAL_HOURS)
+        ends = ends_dt.strftime("%Y-%m-%d %H:%M:%S")
+        if now < ends_dt:
+            return {"state": "trial", "trial_ends": ends, "expires": None}
+        if req == "pending":
+            return {"state": "pending", "trial_ends": ends, "expires": None}
+        if req == "rejected":
+            return {"state": "rejected", "trial_ends": ends, "expires": None}
+        return {"state": "trial_expired", "trial_ends": ends, "expires": None}
+    return {"state": "available", "trial_ends": None, "expires": None}
+
+def ad456_has_access(user_id: int) -> bool:
+    """True while the trial is running or admin approval is active
+    (or the user has not started their trial yet — see ad456_status)."""
+    return ad456_status(user_id)["state"] in ("available", "trial", "approved")
+
+def start_ad456_trial(user_id: int) -> bool:
+    """Begin the 1-day trial. Returns True only the first time."""
+    with _lock:
+        user = get_user(user_id)
+        if not user or not is_pro(user_id) or user.get("ad456_trial_started"):
+            return False
+        user["ad456_trial_started"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        _write_json(_user_path(user_id), user)
+        logger.info(f"[DB] Ad 4-6 trial started for user {user_id}")
+        return True
+
+def request_ad456_access(user_id: int) -> bool:
+    with _lock:
+        user = get_user(user_id)
+        if not user:
+            return False
+        user["ad456_request_status"] = "pending"
+        user["ad456_requested_at"]   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        _write_json(_user_path(user_id), user)
+        return True
+
+def approve_ad456_access(user_id: int):
+    """Approve; expiry = this user's current plan_expires. None if not Pro."""
+    with _lock:
+        user = get_user(user_id)
+        if not user or not is_pro(user_id):
+            return None
+        user["ad456_request_status"] = "approved"
+        user["ad456_expires"]        = user.get("plan_expires")
+        _write_json(_user_path(user_id), user)
+        logger.info(f"[DB] Ad 4-6 access approved for user {user_id}, expires {user['ad456_expires'] or 'lifetime'}")
+        return user
+
+def reject_ad456_access(user_id: int) -> dict:
+    with _lock:
+        user = get_user(user_id)
+        if not user:
+            return {}
+        user["ad456_request_status"] = "rejected"
+        user["ad456_expires"]        = None
+        _write_json(_user_path(user_id), user)
+        return user
+
+
+# ─────────────────────────────────────────
 # Auto Resume Agent — engine snapshot
 # ─────────────────────────────────────────
 # What the user had actively running, captured continuously so it
@@ -659,6 +823,28 @@ def increment_stat(user_id: int, stat: str, amount: int = 1):
         user["stats"][stat] = user["stats"].get(stat, 0) + amount
         user["stats"]["last_active"] = _now()
         _write_json(_user_path(user_id), user)
+
+
+def count_order_once(user_id: int, stat: str, order_id) -> bool:
+    """Increment a lifetime order counter ONCE per order id.
+    Remembers the last 300 counted ids per stat so a restart / re-poll of the
+    same order can never be counted twice. Returns True if it was counted."""
+    with _lock:
+        user = get_user(user_id)
+        if not user:
+            return False
+        st = user.setdefault("stats", {})
+        key = "_counted_" + stat
+        seen = st.get(key) or []
+        oid = str(order_id)
+        if oid in seen:
+            return False
+        seen.append(oid)
+        st[key] = seen[-300:]
+        st[stat] = int(st.get(stat, 0) or 0) + 1
+        st["last_active"] = _now()
+        _write_json(_user_path(user_id), user)
+        return True
 
 
 def update_user_stats(user_id: int, **kwargs):
