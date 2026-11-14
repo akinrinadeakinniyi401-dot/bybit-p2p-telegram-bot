@@ -1496,6 +1496,117 @@ def _ad_slot_label(slot_idx: int) -> str:
         return "USDT AD3"
     return "Ad 1" if slot_idx == -1 else f"Ad {slot_idx + 2}"
 
+# ─────────────────────────────────────────────────────────────────────────
+# Ad 4 / Ad 5 / Ad 6 — Pro-only extra ads (extra_ad_slots index 2 / 3 / 4)
+#   Ad 4, Ad 5 → BTC/USD only        Ad 6 → USDT/USD only
+# Access: 1-day trial on first start, then admin approval (until plan expiry).
+# ─────────────────────────────────────────────────────────────────────────
+AD456_SLOTS      = (2, 3, 4)
+AD456_RULES      = {2: ("BTC", "USD"), 3: ("BTC", "USD"), 4: ("USDT", "USD")}
+AD456_MAX_BTCUSD = 4          # BTC/USD ads allowed to run at once (Ad 1-5 combined)
+
+def _is_ad456(slot_idx: int) -> bool:
+    return slot_idx in AD456_SLOTS
+
+def _ad_pair(ad_data: dict):
+    return (str(ad_data.get("tokenId", "")).upper(), str(ad_data.get("currencyId", "")).upper())
+
+def _ad456_pair_error(slot_idx: int, ad_data: dict):
+    """None if the loaded ad fits this slot, else a user-facing explanation."""
+    rule = AD456_RULES.get(slot_idx)
+    if rule is None:
+        return None
+    tok, cur = _ad_pair(ad_data)
+    if (tok, cur) == rule:
+        return None
+    return (f"❌ <b>{_ad_slot_label(slot_idx)} only accepts {rule[0]}/{rule[1]} ads.</b>\n\n"
+            f"The ad you fetched is <code>{tok or '?'}/{cur or '?'}</code>, so it was <b>not loaded</b>.\n"
+            f"Set the Ad ID of a <b>{rule[0]}/{rule[1]}</b> ad here — other pairs belong in Ad 1, Ad 2 or Ad 3"
+            + (" (Ad 4 and Ad 5 take BTC/USD, Ad 6 takes USDT/USD)." if True else "."))
+
+def _running_pair_slots(sess, tok: str, cur: str, exclude=None) -> list:
+    """Slot indices (incl. hidden USDT AD2/AD3) currently RUNNING this pair."""
+    out = []
+    for i in list(range(-1, len(sess.extra_ad_slots))) + [-2, -3]:
+        if i == exclude:
+            continue
+        if i in (-2, -3) and (sess.usdt_ad2 if i == -2 else sess.usdt_ad3) is None:
+            continue
+        if not _ad_running(sess, i):
+            continue
+        if _ad_pair(_ad_data_of(sess, i)) == (tok, cur):
+            out.append(i)
+    return out
+
+def _ad_pair_conflict(sess, slot_idx: int, ad_data: dict):
+    """Start-time rules for the new ads. Returns an HTML reason or None.
+      • Ad 6 (USDT/USD) cannot run while any other USDT/USD ad is running, and
+        no other USDT/USD ad can start while Ad 6 runs — Bybit rejects two ads
+        of the same pair posting the same price.
+      • At most AD456_MAX_BTCUSD BTC/USD ads at once."""
+    pair = _ad_pair(ad_data)
+    if pair == ("USDT", "USD"):
+        others = _running_pair_slots(sess, "USDT", "USD", exclude=slot_idx)
+        if slot_idx == 4 and others:
+            return ("⚠️ <b>Cannot start Ad 6</b>\n\n"
+                    f"<b>{', '.join(_ad_slot_label(i) for i in others)}</b> is already running a USDT/USD ad.\n\n"
+                    "Ads of the same currency can't post the same price — Bybit rejects it — so only "
+                    "<b>one USDT/USD ad</b> can be active alongside Ad 6. Stop that ad first.")
+        if slot_idx != 4 and 4 in others:
+            return ("⚠️ <b>Cannot start this USDT/USD ad</b>\n\n"
+                    "<b>Ad 6</b> is already running USDT/USD. Ads of the same currency can't post the same "
+                    "price — Bybit rejects it — so only one USDT/USD ad can be active. Stop Ad 6 first.")
+    if pair == ("BTC", "USD"):
+        others = _running_pair_slots(sess, "BTC", "USD", exclude=slot_idx)
+        if len(others) >= AD456_MAX_BTCUSD:
+            return (f"⚠️ <b>Cannot start {_ad_slot_label(slot_idx)}</b>\n\n"
+                    f"{len(others)} BTC/USD ads are already running — the maximum is {AD456_MAX_BTCUSD}. "
+                    "Stop one of them first.")
+    return None
+
+def _ad456_st(uid: int) -> dict:
+    """Access status; admins always have access."""
+    if is_admin(uid):
+        return {"state": "approved", "trial_ends": None, "expires": None}
+    return db.ad456_status(uid)
+
+def _ad456_request_keyboard(uid: int):
+    st = _ad456_st(uid)["state"]
+    rows = []
+    if st in ("trial_expired", "rejected"):
+        rows.append([InlineKeyboardButton("📨 Request Access", callback_data="request_ad456")])
+    elif st == "locked":
+        rows.append([InlineKeyboardButton("⬆️ Upgrade to Pro", callback_data="upgrade_plan")])
+    rows += back_section("section_ads")
+    return InlineKeyboardMarkup(rows)
+
+def _ad456_block_text(uid: int) -> str:
+    st = _ad456_st(uid)
+    s = st["state"]
+    if s == "locked":
+        return ("🔒 <b>Ad 4, Ad 5 and Ad 6 are Pro features</b>\n\n"
+                "Upgrade to Pro to unlock them — every Pro user gets a free <b>1-day trial</b> "
+                "the first time they start one.")
+    if s == "pending":
+        return ("⏳ <b>Access request pending</b>\n\nYour request for Ad 4 / Ad 5 / Ad 6 has been sent to the admin. "
+                "You'll be notified as soon as it's reviewed.")
+    note = "\n\n⚠️ Your previous request was declined — you can ask again." if s == "rejected" else ""
+    return ("⏰ <b>Your Ad 4 / Ad 5 / Ad 6 trial has ended</b>\n\n"
+            "Ad 4, Ad 5 and Ad 6 are stopped. Request access from the admin to keep using them — "
+            "if approved, they stay active until your Pro plan expires." + note)
+
+def _stop_ad_slot_runtime(sess, slot_idx: int):
+    """Stop one slot the same way the Stop button does."""
+    _set_ad_running(sess, slot_idx, False)
+    try:
+        _tk = sess.extra_ad_slots[slot_idx].get("task")
+        if _tk and not _tk.done():
+            _tk.cancel()
+    except Exception:
+        pass
+    _set_ad_task(sess, slot_idx, None)
+    _set_ad_current_price(sess, slot_idx, Decimal("0"))
+
 def _increment_ad_failures(sess, slot_idx: int) -> int:
     slot_idx = _valid_slot(sess, slot_idx)
     _usdt = _usdt_dedicated_slot(sess, slot_idx)
@@ -1607,7 +1718,7 @@ async def _fast_chase_coordinator(bot, chat_id):
     try:
         while True:
             any_running = False
-            for slot_idx in (-1, 0, 1):
+            for slot_idx in [-1] + list(range(len(sess.extra_ad_slots))):
                 # Only ever look at a slot index that actually exists.
                 # _ad_running/_ad_settings/_ad_data_of all route through
                 # _valid_slot(), which — for a DIFFERENT, legitimate reason
@@ -2494,12 +2605,24 @@ def ads_section_keyboard(uid: int = 0):
     # ── Ad slot switcher — only shown once the user has more than 1 ad ──
     if total_ads > 1:
         switch_row = []
-        for i in range(-1, total_ads - 1):
+        for i in range(-1, min(total_ads, 3) - 1):      # Ad 1 / Ad 2 / Ad 3
             label = _ad_slot_label(i)
             if i == slot_idx:
                 label = f"• {label} •"
             switch_row.append(InlineKeyboardButton(label, callback_data=f"edit_ad_{i+2}"))
         rows.append(switch_row)
+    # Second row — Ad 4 / Ad 5 / Ad 6 (Pro: 1-day trial, then admin approval)
+    _acc = _ad456_st(uid)["state"] if uid else "locked"
+    _row2 = []
+    for i in AD456_SLOTS:
+        label = _ad_slot_label(i)
+        if i == slot_idx:
+            label = f"• {label} •"
+        elif _acc in ("locked", "trial_expired", "pending", "rejected"):
+            label = f"🔒 {label}"
+        _row2.append(InlineKeyboardButton(label, callback_data=f"edit_ad_{i+2}"))
+    rows.append(_row2)
+    if total_ads > 1:
         rows.append([InlineKeyboardButton("🗂 All My Ads (Dashboard)", callback_data="ads_dashboard")])
 
     if slot_idx == -1:
@@ -2709,6 +2832,19 @@ def ads_section_text(uid: int = 0) -> str:
             mode_info += f"\n  📉 Down Price: `${_dp_thr}` — {_dp_txt}"
 
     hint = next_setup_hint(uid) if slot_idx == -1 else "Set this ad's Ad ID, fetch its details, then set its mode."
+    if _is_ad456(slot_idx):
+        _r = AD456_RULES[slot_idx]
+        hint = f"{_ad_slot_label(slot_idx)} accepts <b>{_r[0]}/{_r[1]}</b> ads only. " + hint
+        _a = _ad456_st(uid)
+        if _a["state"] == "available":
+            hint += "\n🎁 Starting it activates your free 1-day trial of Ad 4/5/6."
+        elif _a["state"] == "trial":
+            hint += f"\n🎁 Trial ends: {_a['trial_ends']}"
+        elif _a["state"] == "approved":
+            hint += f"\n✅ Access approved" + (f" until {_a['expires']}" if _a["expires"] else " (lifetime Pro)")
+        if slot_idx == 2 or slot_idx == 3:
+            if not (_ad_settings(sess, slot_idx).get("manual_nudge") or "").strip():
+                hint += "\n↔️ No Nudge Amount set — the built-in nudge is used to keep this ad below the ads above it."
     user_slot_idx = _get_user_slot(uid)
     acct_label = bybit.BYBIT_ACCOUNTS[user_slot_idx]["label"] if (bybit.BYBIT_ACCOUNTS and user_slot_idx < len(bybit.BYBIT_ACCOUNTS)) else f"Account {acct_slot}"
     slot_header = _ad_slot_label(slot_idx)
@@ -2769,7 +2905,8 @@ def ad_sendmsg_keyboard(uid: int):
 def ads_dashboard_text(uid: int) -> str:
     """All-ads-at-a-glance view — coin/pair + status per ad, per user's request."""
     sess = _s(uid)
-    lines = [f"🗂 <b>All My Ads ({sess.total_ad_slots()} active)</b>\n"]
+    _cfg = 1 + sum(1 for sl in sess.extra_ad_slots if sl["settings"].get("ad_id"))
+    lines = [f"🗂 <b>All My Ads ({_cfg} set up)</b>\n"]
     for i in range(-1, len(sess.extra_ad_slots)):
         ad_data = _ad_data_of(sess, i)
         running = _ad_running(sess, i)
@@ -2782,6 +2919,13 @@ def ads_dashboard_text(uid: int) -> str:
             pair, price = "not loaded yet", "—"
         mode = _mode_display_label(s.get("mode", "fixed"))
         lines.append(f"{icon} <b>{_ad_slot_label(i)}</b> — {pair} | 💲{price} | {mode} | {'Running' if running else 'Stopped'}")
+    _a = _ad456_st(uid)
+    if _a["state"] == "trial":
+        lines.append(f"\n🎁 Ad 4/5/6 trial ends: <code>{_a['trial_ends']}</code>")
+    elif _a["state"] == "approved" and not is_admin(uid):
+        lines.append("\n✅ Ad 4/5/6 access: " + (f"until <code>{_a['expires']}</code>" if _a["expires"] else "lifetime Pro"))
+    elif _a["state"] in ("trial_expired", "rejected", "pending"):
+        lines.append("\n🔒 Ad 4/5/6 trial ended — request access from the Ad 4/5/6 buttons.")
     return "\n".join(lines)
 
 
@@ -5207,7 +5351,7 @@ async def _handle_buy_order(bot, chat_id, order_id):
 
         # ── Persist cumulative buy order count to DB ──
         try:
-            db.increment_stat(chat_id, "total_buy_orders")
+            db.count_order_once(chat_id, "total_buy_orders", order_id)
         except Exception as _stat_err:
             logger.debug(f"[Stats] Could not update buy count for {chat_id}: {_stat_err}")
 
@@ -5460,7 +5604,7 @@ async def _handle_ad_buy_order(bot, chat_id, order_id, show: bool, pay: bool, se
         )
         sess.order_msg_ids[order_id] = sent_msg.message_id
         try:
-            db.increment_stat(chat_id, "total_buy_orders")
+            db.count_order_once(chat_id, "total_buy_orders", order_id)
         except Exception as _stat_err:
             logger.debug(f"[Stats] Could not update buy count for {chat_id}: {_stat_err}")
         _ad_mark_done(chat_id, order_id)
@@ -5941,7 +6085,7 @@ async def _handle_sell_paid(bot, chat_id, order_id):
 
         # ── Persist cumulative sell order count to DB ──
         try:
-            db.increment_stat(chat_id, "total_sell_orders")
+            db.count_order_once(chat_id, "total_sell_orders", order_id)
         except Exception as _stat_err:
             logger.debug(f"[Stats] Could not update sell count for {chat_id}: {_stat_err}")
 
@@ -9573,6 +9717,11 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             None, partial(get_ad_details, s["ad_id"], creds=_creds)
         )
         ret_code = result.get("retCode", result.get("ret_code",-1))
+        if ret_code == 0 and _is_ad456(slot_idx):
+            _pair_err = _ad456_pair_error(slot_idx, result.get("result", {}) or {})
+            if _pair_err:
+                await edit_menu(query, _pair_err, InlineKeyboardMarkup(back_section("section_ads")))
+                return
         if ret_code == 0:
             ad_data = _ad_data_of(sess, slot_idx)
             ad_data.clear()
@@ -11007,6 +11156,23 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
                     ads_section_keyboard(tuser.id)
                 )
                 return
+            # ── Ad 4/5/6: pair rule + access (trial / approval) ──
+            if _is_ad456(slot_idx):
+                _pe = _ad456_pair_error(slot_idx, ad_data)
+                if _pe:
+                    await edit_menu(query, _pe, InlineKeyboardMarkup(back_section("section_ads")))
+                    return
+                if _ad456_st(tuser.id)["state"] not in ("available", "trial", "approved"):
+                    await edit_menu(query, _ad456_block_text(tuser.id), _ad456_request_keyboard(tuser.id))
+                    return
+            # ── Same-pair rules (USDT/USD single-ad with Ad 6, BTC/USD max 4) ──
+            _conf = _ad_pair_conflict(sess, slot_idx, ad_data)
+            if _conf:
+                await edit_menu(query, _conf, InlineKeyboardMarkup(back_section("section_ads")))
+                return
+            _trial_just_started = False
+            if _is_ad456(slot_idx) and not is_admin(tuser.id) and _ad456_st(tuser.id)["state"] == "available":
+                _trial_just_started = db.start_ad456_trial(tuser.id)
             _reset_ad_failures(sess, slot_idx)
             _set_ad_running(sess, slot_idx, True)   # set BEFORE create_task, no await in between — closes the race
             _is_usdt_triad_slot = (
@@ -11026,6 +11192,14 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
                 task = asyncio.create_task(auto_update_loop(context.bot, chat_id, slot_idx))
                 _set_ad_task(sess, slot_idx, task)
             _maybe_snapshot_resume_state(tuser.id)
+            if _trial_just_started:
+                _nm = _esc(tuser.first_name or tuser.username or "there")
+                await _safe_send(context.bot, chat_id=chat_id, parse_mode="HTML", text=(
+                    f"🎉🥳 <b>Congratulations, {_nm}!</b> 🎊\n\n"
+                    f"You've unlocked a <b>1-day free trial</b> of <b>Ad 4, Ad 5 and Ad 6</b>! 🚀🔥\n"
+                    f"⏳ Your trial ends: <code>{_ad456_st(tuser.id)['trial_ends']}</code>\n\n"
+                    f"After that you can request access from the admin to keep using them — "
+                    f"if approved, they stay active until your Pro plan expires. 💎"))
             await edit_menu(query,
                 f"🟢 <b>{label} price update started!</b>\n🔀 <code>{_mode_display_label(mode)}</code> | ⏱ every <code>{_ad_interval_label(s, ad_data)}</code>\n\n"
                 + ads_section_text(tuser.id),
@@ -11033,12 +11207,73 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             )
 
     # ── 🔀 Multi-ad: switch which ad the menu is editing ──
-    elif data in ("edit_ad_1", "edit_ad_2", "edit_ad_3"):
+    elif data in ("edit_ad_1", "edit_ad_2", "edit_ad_3", "edit_ad_4", "edit_ad_5", "edit_ad_6"):
         sess = _s(tuser.id)
-        target = int(data[-1]) - 2   # "edit_ad_1" -> -1, "edit_ad_2" -> 0, "edit_ad_3" -> 1
-        if target == -1 or target < len(sess.extra_ad_slots):
+        target = int(data[-1]) - 2   # "edit_ad_1" -> -1, "edit_ad_2" -> 0 ... "edit_ad_6" -> 4
+        if _is_ad456(target):
+            # Pro-only. Expired trial / free / pending → pop-up with the request button.
+            if _ad456_st(tuser.id)["state"] not in ("available", "trial", "approved"):
+                if sess.editing_slot in AD456_SLOTS:
+                    sess.editing_slot = -1
+                await edit_menu(query, _ad456_block_text(tuser.id), _ad456_request_keyboard(tuser.id))
+                return
+            # Positions are fixed (Ad 4 = extra index 2), so create any missing
+            # earlier slots as empty placeholders.
+            while len(sess.extra_ad_slots) <= target:
+                sess.add_ad_slot()
+            _save_settings(tuser.id)
+            sess.editing_slot = target
+        elif target == -1 or target < len(sess.extra_ad_slots):
             sess.editing_slot = target
         await edit_menu(query, ads_section_text(tuser.id), ads_section_keyboard(tuser.id))
+
+    # ── 📨 Request Ad 4/5/6 access (after the trial) ──
+    elif data == "request_ad456":
+        st = _ad456_st(tuser.id)["state"]
+        if st == "pending":
+            await edit_menu(query, _ad456_block_text(tuser.id), _ad456_request_keyboard(tuser.id))
+            return
+        if st not in ("trial_expired", "rejected"):
+            await edit_menu(query, "ℹ️ You don't need to request access right now.", InlineKeyboardMarkup(back_section("section_ads")))
+            return
+        db.request_ad456_access(tuser.id)
+        uname = f"@{tuser.username}" if tuser.username else "(no username)"
+        admin_text = (
+            f"📨 <b>Ad 4 / Ad 5 / Ad 6 access requested</b>\n\n"
+            f"User: <code>{tuser.id}</code> {uname} — {_esc(tuser.first_name or '')}\n"
+            f"Plan: {sub.plan_badge(tuser.id)}\n\n"
+            f"✅ Approve: <code>/approvead456 {tuser.id}</code>\n"
+            f"❌ Reject: <code>/rejectad456 {tuser.id}</code>"
+        )
+        _kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Approve", callback_data=f"ad456_ok_{tuser.id}"),
+            InlineKeyboardButton("❌ Reject",  callback_data=f"ad456_no_{tuser.id}"),
+        ]])
+        for admin_id in list(_admin_chat_ids):
+            try:
+                await context.bot.send_message(chat_id=admin_id, text=admin_text, parse_mode="HTML", reply_markup=_kb)
+            except Exception as e:
+                logger.warning(f"[Ad456] Failed to notify admin {admin_id}: {e}")
+        await edit_menu(query,
+            "📨 <b>Request sent</b>\n\nYour Ad 4 / Ad 5 / Ad 6 access request has been sent to the admin — "
+            "you'll be notified here once it's reviewed.",
+            InlineKeyboardMarkup(back_section("section_ads")))
+
+    # ── Admin: inline Approve / Reject on a request ──
+    elif data.startswith("ad456_ok_") or data.startswith("ad456_no_"):
+        if not is_admin(tuser.id):
+            await query.answer("Admin only.", show_alert=True)
+            return
+        _ok = data.startswith("ad456_ok_")
+        try:
+            _target = int(data.rsplit("_", 1)[1])
+        except ValueError:
+            return
+        _msg = await _ad456_decide(context.bot, _target, _ok)
+        try:
+            await query.edit_message_text(_msg, parse_mode="HTML")
+        except Exception:
+            pass
 
     # ── ➕ Add another ad slot (up to MAX_ADS_PER_USER) ──
     elif data == "add_ad_slot":
@@ -12230,6 +12465,12 @@ def _reset_user_session(sess) -> bool:
         (sess.usdt_ad3 is not None and sess.usdt_ad3["running"])
     )
     if not was_active:
+        # Idle user: still drop the in-memory dedupe caches so they don't
+        # accumulate stale ids between resets.
+        sess.seen_order_ids = set()
+        sess.paid_order_ids = set()
+        sess.seen_sell_ids  = set()
+        sess.released_ids   = set()
         return False
 
     # Stop all background tasks
@@ -12390,6 +12631,14 @@ async def _resume_user_engines(bot, uid: int, snapshot: dict) -> list:
         # taken. Never guess or create a slot here; just skip it.
         if slot_idx != -1 and slot_idx >= len(sess.extra_ad_slots):
             logger.warning(f"[AutoResume] user {uid} — slot {slot_idx} no longer exists, skipping")
+            continue
+        if _is_ad456(slot_idx) and not is_admin(uid) and _ad456_st(uid)["state"] not in ("available", "trial", "approved"):
+            logger.info(f"[AutoResume] user {uid} — {_ad_slot_label(slot_idx)} skipped: Ad 4-6 access ended")
+            if uid not in _ad456_notified_expired:
+                _ad456_notified_expired.add(uid)
+                await _safe_send(bot, chat_id=uid, parse_mode="HTML",
+                    text="⏰ <b>" + _ad_slot_label(slot_idx) + " was not resumed</b>\n\n" + _ad456_block_text(uid),
+                    reply_markup=_ad456_request_keyboard(uid))
             continue
         s = _ad_settings(sess, slot_idx)
         if s.get("ad_id") != ad_id:
@@ -13099,6 +13348,154 @@ async def cmd_rejectip(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────
+# 📨 Ad 4 / Ad 5 / Ad 6 access — admin approval + trial-expiry enforcement
+# ─────────────────────────────────────────
+async def _ad456_decide(bot, target_uid: int, approve: bool) -> str:
+    """Apply an admin decision, notify the user, return text for the admin."""
+    if approve:
+        if not sub.is_pro(target_uid):
+            return (f"❌ User <code>{target_uid}</code> isn't on an active Pro plan — nothing to tie "
+                    f"the access expiry to. Approval NOT applied.")
+        upd = db.approve_ad456_access(target_uid)
+        if not upd:
+            return f"❌ Could not approve user <code>{target_uid}</code>."
+        exp = upd.get("ad456_expires")
+        exp_s = f"until {exp}" if exp else "for the lifetime of their Pro plan"
+        try:
+            await bot.send_message(chat_id=target_uid, parse_mode="HTML", text=(
+                f"✅ <b>Ad 4 / Ad 5 / Ad 6 access approved</b> 🎉\n\n"
+                f"You can use them {exp_s} (same day your Pro plan ends).\n"
+                f"Open 📊 AD Price Bot → Ad 4 / Ad 5 / Ad 6 to start them again."))
+        except Exception as e:
+            logger.warning(f"[Ad456] notify approve failed for {target_uid}: {e}")
+        return f"✅ Ad 4-6 access approved for <code>{target_uid}</code>, active {exp_s}."
+    db.reject_ad456_access(target_uid)
+    try:
+        await bot.send_message(chat_id=target_uid, parse_mode="HTML",
+            text="❌ <b>Ad 4 / Ad 5 / Ad 6 access request declined</b>\n\nContact the admin for details.")
+    except Exception as e:
+        logger.warning(f"[Ad456] notify reject failed for {target_uid}: {e}")
+    return f"❌ Ad 4-6 access rejected for <code>{target_uid}</code>."
+
+async def cmd_approvead456(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("❌ Admin only.")
+        return
+    try:
+        uid = int(context.args[0])
+    except Exception:
+        await update.message.reply_text("Usage: /approvead456 <user_id>")
+        return
+    await update.message.reply_text(await _ad456_decide(context.bot, uid, True), parse_mode="HTML")
+
+async def cmd_rejectad456(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("❌ Admin only.")
+        return
+    try:
+        uid = int(context.args[0])
+    except Exception:
+        await update.message.reply_text("Usage: /rejectad456 <user_id>")
+        return
+    await update.message.reply_text(await _ad456_decide(context.bot, uid, False), parse_mode="HTML")
+
+
+# ── Daily upgrade reminder for lapsed Pro users ──
+_UPGRADE_NUDGES = [
+    "👋 Hi {n}! It's been a few days and I'm still here, ready to handle your Bybit P2P ads. "
+    "Your Pro plan has ended, so I've stopped managing them. Upgrade and I'll pick up exactly where we left off. 🚀",
+    "{n}, I miss managing your ads! 📈 While your Pro plan is off, your prices aren't being chased and "
+    "every missed move is a missed sale. Upgrade and let me get back to work for you. 💪",
+    "Hey {n} 👋 Your ads are sitting still without me. Fast Update, Auto Pay and your Ad 4/5/6 are all "
+    "waiting for you — reactivate Pro and I'll continue managing your P2P ads right away. ✨",
+    "{n}, good news: everything you set up is still saved. 🔐 One upgrade and I'm back managing your "
+    "Bybit P2P ads — no setup needed. Ready when you are! 🙌",
+    "Hi {n}! 💼 Other merchants' bots are catching the top rank while yours is idle. "
+    "Upgrade to Pro and I'll start defending your position again. 🏆",
+]
+
+async def _upgrade_nudge_loop(bot):
+    """Hourly check; sends each lapsed Pro user one reminder per day (weekly
+    after the first 7), only between 09:00 and 20:00 Lagos time."""
+    import random
+    await asyncio.sleep(120)
+    while True:
+        try:
+            hour = (datetime.utcnow().hour + 1) % 24          # Africa/Lagos = UTC+1
+            if 9 <= hour < 20:
+                targets = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: db.get_upgrade_nudge_targets(tuple(ADMIN_IDS)))
+                sent = 0
+                for uid, name, count in targets:
+                    text = _UPGRADE_NUDGES[count % len(_UPGRADE_NUDGES)].format(n=_esc(name))
+                    kb = InlineKeyboardMarkup([[InlineKeyboardButton("⬆️ Upgrade to Pro", callback_data="upgrade_plan")]])
+                    try:
+                        await bot.send_message(chat_id=uid, text=text, parse_mode="HTML", reply_markup=kb)
+                        db.mark_upgrade_nudged(uid)
+                        sent += 1
+                    except Forbidden:
+                        db.mark_upgrade_nudged(uid, blocked=True)     # blocked the bot — never retry
+                    except RetryAfter as e:
+                        await asyncio.sleep(float(getattr(e, "retry_after", 5)) + 1)
+                        break                                          # resume next hour
+                    except Exception as e:
+                        logger.debug(f"[UpgradeNudge] {uid}: {e}")
+                    await asyncio.sleep(0.1)
+                if sent:
+                    logger.info(f"[UpgradeNudge] sent {sent} reminder(s)")
+        except Exception as e:
+            logger.error(f"[UpgradeNudge] loop error: {e}")
+        await asyncio.sleep(3600)
+
+
+_ad456_notified_expired: set = set()
+
+async def _enforce_ad456_access(bot, sess) -> bool:
+    """Stop any running Ad 4/5/6 for a user without access. Returns True if
+    anything was stopped. Used by the watchdog and the Auto Resume path."""
+    uid = sess.user_id
+    if is_admin(uid) or _ad456_st(uid)["state"] in ("available", "trial", "approved"):
+        _ad456_notified_expired.discard(uid)
+        return False
+    stopped = []
+    if sess.editing_slot in AD456_SLOTS:
+        sess.editing_slot = -1          # don't leave a locked ad's menu open
+    for i in AD456_SLOTS:
+        if i < len(sess.extra_ad_slots) and _ad_running(sess, i):
+            _stop_ad_slot_runtime(sess, i)
+            stopped.append(_ad_slot_label(i))
+    if not stopped:
+        return False
+    _maybe_snapshot_resume_state(uid)
+    logger.info(f"[Ad456] user {uid} access ended — stopped {stopped}")
+    if uid not in _ad456_notified_expired:
+        _ad456_notified_expired.add(uid)
+        await _safe_send(bot, chat_id=uid, parse_mode="HTML",
+            text=("⏰ <b>" + ", ".join(stopped) + " stopped</b>\n\n" + _ad456_block_text(uid)),
+            reply_markup=_ad456_request_keyboard(uid))
+    return True
+
+async def _ad456_watchdog_loop(bot):
+    """Every 60s: stop Ad 4/5/6 for anyone whose trial ended / approval lapsed."""
+    while True:
+        await asyncio.sleep(60)
+        try:
+            for _sess in list(get_all_sessions()):
+                if any(i < len(_sess.extra_ad_slots) and _ad_running(_sess, i) for i in AD456_SLOTS):
+                    await _enforce_ad456_access(bot, _sess)
+                    # 1-hour heads-up before the trial ends (sent once).
+                    if not is_admin(_sess.user_id) and db.ad456_warn_due(_sess.user_id):
+                        _u = db.get_user(_sess.user_id) or {}
+                        _nm = _esc((_u.get("display_name") or "").split(" ")[0] or "there")
+                        await _safe_send(bot, chat_id=_sess.user_id, parse_mode="HTML", text=(
+                            f"⏳ <b>{_nm}, your Ad 4 / 5 / 6 trial ends in about 1 hour.</b>\n\n"
+                            f"They'll stop automatically when it ends. Tap <b>📨 Request Access</b> in "
+                            f"Ad 4 / 5 / 6 now so the admin can approve it before then."))
+        except Exception as e:
+            logger.error(f"[Ad456] watchdog error: {e}")
+
+
+# ─────────────────────────────────────────
 # 🤖 /approveresume, /rejectresume — Admin approval for Auto Resume Agent
 # ─────────────────────────────────────────
 async def cmd_approveresume(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -13230,21 +13627,12 @@ async def cmd_userdata(update: Update, context: ContextTypes.DEFAULT_TYPE):
             db_sell = max(int(_st.get("total_sell_orders", 0) or 0),
                           int(user.get("total_sell_orders", 0) or 0))
 
-            # ── Live session totals (in-memory, current session only) ──
-            # get_session(uid) is safe to call for any uid — returns empty session
-            # if the user has no active session (sets will be empty → 0 counts).
-            try:
-                sess      = get_session(uid)
-                live_buy  = len(getattr(sess, "seen_order_ids", None) or set())
-                live_sell = len(getattr(sess, "seen_sell_ids",  None) or set())
-            except Exception:
-                live_buy  = 0
-                live_sell = 0
-
-            # Take whichever is higher — DB may lag if session hasn't flushed yet,
-            # live session resets to 0 after cleanup, so max() covers both cases.
-            total_buy  = max(db_buy,  live_buy)
-            total_sell = max(db_sell, live_sell)
+            # DB is the single source of truth. The in-memory seen-id sets are
+            # NOT used: they double-count sells (each paid sell stores two
+            # keys), include orders merely polled, and only clear while a
+            # feature is active — which inflated counts for idle users.
+            total_buy  = db_buy
+            total_sell = db_sell
 
             row_data = [
                 uid,
@@ -13325,6 +13713,8 @@ def start_bot():
     application.add_handler(CommandHandler("approvewithdraw",  cmd_approvewithdraw))
     application.add_handler(CommandHandler("approveip", cmd_approveip))
     application.add_handler(CommandHandler("rejectip",  cmd_rejectip))
+    application.add_handler(CommandHandler("approvead456", cmd_approvead456))
+    application.add_handler(CommandHandler("rejectad456",  cmd_rejectad456))
     application.add_handler(CommandHandler("approveresume", cmd_approveresume))
     application.add_handler(CommandHandler("rejectresume",  cmd_rejectresume))
     application.add_handler(CommandHandler("rejectwithdraw",   cmd_rejectwithdraw))
@@ -13373,6 +13763,8 @@ def start_bot():
         # (and independently of the Auto Resume Agent, which would
         # otherwise keep an expired user's engines alive indefinitely).
         asyncio.create_task(_plan_expiry_watchdog_loop(app.bot))
+        asyncio.create_task(_ad456_watchdog_loop(app.bot))
+        asyncio.create_task(_upgrade_nudge_loop(app.bot))
 
         # Auto Resume Agent — startup pass. A redeploy restarts this whole
         # process, wiping every in-memory session — this is what actually
