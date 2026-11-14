@@ -2268,7 +2268,7 @@ def get_user_creds(user_id: int, slot: int | None = None) -> dict | None:
 
     if key and secret:
         logger.debug(f"[Creds] User {user_id} slot {slot_str} — DB key found")
-        creds = {"key": key, "secret": secret}
+        creds = {"key": key, "secret": secret, "uid": user_id}
         if proxy_url:
             creds["proxy_url"] = proxy_url
         return creds
@@ -2281,7 +2281,7 @@ def get_user_creds(user_id: int, slot: int | None = None) -> dict | None:
 
     # Non-admin: return sentinel (empty strings) — callers show "No API set" error
     logger.info(f"[Creds] User {user_id} slot {slot_str} — NO API KEY SAVED")
-    creds = {"key": "", "secret": ""}
+    creds = {"key": "", "secret": "", "uid": user_id}
     if proxy_url:
         creds["proxy_url"] = proxy_url
     return creds
@@ -8206,13 +8206,18 @@ async def edit_menu(query, text: str, keyboard: InlineKeyboardMarkup):
     try:
         await query.edit_message_caption(caption=text, reply_markup=keyboard, parse_mode="HTML")
         return
-    except Exception:
-        pass
-    # Try text edit (for plain text messages)
+    except Exception as _ce:
+        # Same content re-sent (double tap / refresh) — nothing to change and
+        # nothing to re-send. Previously this fell through and posted a
+        # DUPLICATE menu message.
+        if "not modified" in str(_ce).lower():
+            return
     try:
         await query.edit_message_text(text=text, reply_markup=keyboard, parse_mode="HTML")
         return
     except Exception as e:
+        if "not modified" in str(e).lower():
+            return
         logger.warning(f"[edit_menu] edit failed: {e}")
     # Last resort — send as new message
     try:
@@ -8326,12 +8331,18 @@ async def edit_menu_html(query, text: str, keyboard: InlineKeyboardMarkup):
     try:
         await query.edit_message_caption(caption=text, reply_markup=keyboard, parse_mode="HTML")
         return
-    except Exception:
-        pass
+    except Exception as _ce:
+        # Same content re-sent (double tap / refresh) — nothing to change and
+        # nothing to re-send. Previously this fell through and posted a
+        # DUPLICATE menu message.
+        if "not modified" in str(_ce).lower():
+            return
     try:
         await query.edit_message_text(text=text, reply_markup=keyboard, parse_mode="HTML")
         return
     except Exception as e:
+        if "not modified" in str(e).lower():
+            return
         logger.warning(f"[edit_menu_html] edit failed: {e}")
     try:
         await query.message.reply_text(text=text, reply_markup=keyboard, parse_mode="HTML")
