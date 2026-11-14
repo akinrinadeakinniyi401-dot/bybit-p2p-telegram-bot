@@ -437,6 +437,33 @@ def _resolve_proxies(creds: dict | None):
     return None
 
 
+# ── Process-wide request counter (diagnostics for 10006) ──
+# Bybit enforces limits per endpoint/key AND per source IP. On a shared host
+# every user's traffic leaves from the same IP, so a 10006 can come from the
+# IP's total volume rather than from this user's own edits. Logging how many
+# requests the whole process sent in the last 1s / 5s whenever a 10006
+# arrives shows which of the two it is.
+from collections import deque as _deque
+_req_times = _deque(maxlen=5000)
+_req_times_lock = threading.Lock()
+
+def _note_request():
+    with _req_times_lock:
+        _req_times.append(time.monotonic())
+
+def _load_str() -> str:
+    now = time.monotonic()
+    with _req_times_lock:
+        n1 = sum(1 for x in _req_times if now - x <= 1.0)
+        n5 = sum(1 for x in _req_times if now - x <= 5.0)
+    return f"process-wide load: {n1} req in last 1s, {n5} in last 5s (all users)"
+
+def _log_if_10006(res: dict, endpoint: str, creds):
+    if str(res.get("retCode", res.get("ret_code", -1))) == "10006":
+        logger.warning(f"[Bybit]{_uid_tag(creds)} 10006 on {endpoint.split('/')[-1]} | {_load_str()}")
+    return res
+
+
 def _uid_tag(creds: dict | None) -> str:
     """' u=<telegram id>' for log lines (creds carry the id — see bot.get_user_creds)."""
     uid = (creds or {}).get("uid")
@@ -450,8 +477,9 @@ def _post(endpoint: str, body: dict, creds: dict | None = None) -> dict:
     payload = json.dumps(body, separators=(',', ':'))
     headers = _get_headers(api_key, api_secret, payload)
     try:
+        _note_request()
         response = requests.post(url, headers=headers, data=payload, timeout=10, proxies=_resolve_proxies(creds))
-        return parse_response(response, f" [{endpoint.split('/')[-1]}{_uid_tag(creds)}]")
+        return _log_if_10006(parse_response(response, f" [{endpoint.split('/')[-1]}{_uid_tag(creds)}]"), endpoint, creds)
     except requests.exceptions.Timeout:
         return {"retCode": -1, "retMsg": "Request timed out"}
     except Exception as e:
@@ -466,8 +494,9 @@ def _get_auth(endpoint: str, params: dict | None = None,
     url     = BASE_URL + endpoint
     headers = _get_headers(api_key, api_secret, "")
     try:
+        _note_request()
         response = requests.get(url, headers=headers, params=params, timeout=10, proxies=_resolve_proxies(creds))
-        return parse_response(response, f" [{endpoint.split('/')[-1]}{_uid_tag(creds)}]")
+        return _log_if_10006(parse_response(response, f" [{endpoint.split('/')[-1]}{_uid_tag(creds)}]"), endpoint, creds)
     except Exception as e:
         logger.error(f"[Bybit] GET {endpoint} error: {e}")
         return {"error": str(e)}
@@ -918,12 +947,16 @@ def get_chat_messages(order_id: str, page: str = "1", size: str = "30",
 # several ads of one user can fire together, so even a single ad tripped
 # 10006. Every edit for one API key now goes through one lock and leaves at
 # least `gap` seconds after the previous one STARTED. The gap begins at
-# BYBIT_MODIFY_MIN_GAP_SECS (1.1s) and is re-learned from Bybit's own
-# X-Bapi-Limit header: gap = 1/limit + 0.1 (limit=1 → 1.1s, limit=10 → 0.2s).
+# BYBIT_MODIFY_MIN_GAP_SECS (1.25s) and is re-learned from Bybit's own
+# X-Bapi-Limit header: gap = 1/limit + 0.25 (limit=1 → 1.25s, limit=10 → 0.35s).
 # If Bybit reports remaining=0 we also wait for its reset time. A 10006 that
 # still gets through waits for Bybit's reset, then retries (up to 3 times).
-_MODIFY_MIN_GAP       = float(os.getenv("BYBIT_MODIFY_MIN_GAP_SECS", "1.1") or 1.1)
+_MODIFY_MIN_GAP       = float(os.getenv("BYBIT_MODIFY_MIN_GAP_SECS", "1.25") or 1.25)
 _MODIFY_10006_RETRIES = 3
+# Safety margin on top of 1/limit: Bybit counts when it RECEIVES a request, and
+# network latency varies, so two edits sent exactly 1/limit apart can still
+# land inside the same window.
+_MODIFY_JITTER_MARGIN = 0.25
 _modify_gates: dict   = {}
 _modify_gates_lock    = threading.Lock()
 
@@ -952,7 +985,7 @@ def _paced_modify(ad_id: str, body: dict, creds: dict | None) -> dict:
             res  = _post("/v5/p2p/item/update", body, creds=creds)
             rate = res.get("_rate") or {}
             if rate.get("limit"):
-                gate["gap"] = max(1.0 / rate["limit"] + 0.1, 0.2)
+                gate["gap"] = max(1.0 / rate["limit"] + _MODIFY_JITTER_MARGIN, 0.3)
             if rate.get("remaining") == 0 and rate.get("reset_in"):
                 gate["blocked_until"] = time.monotonic() + rate["reset_in"] + 0.05
             if str(res.get("retCode", res.get("ret_code", -1))) != "10006":
