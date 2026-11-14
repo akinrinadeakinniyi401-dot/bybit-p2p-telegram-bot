@@ -374,7 +374,14 @@ class SessionState:
             task = slot.get("task")
             if task and not task.done():
                 task.cancel()
-            self.extra_ad_slots.pop(index)
+            # Ad 4/5/6 live at fixed positions (extra index 2/3/4). If any
+            # slot sits after this one (and Ad 4+ exist at all), clear it in
+            # place instead of popping — popping would shift Ad 4 into Ad 3's
+            # position and break the per-slot currency rules.
+            if len(self.extra_ad_slots) > 2 and index < len(self.extra_ad_slots) - 1:
+                self.extra_ad_slots[index] = _default_extra_ad_slot()
+            else:
+                self.extra_ad_slots.pop(index)
 
     def stop_ad_slot(self, index: int):
         """Stop slot #1 (index -1, by convention) or an extra slot (0-based
