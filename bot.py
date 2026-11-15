@@ -2060,7 +2060,13 @@ def _save_settings(uid: int):
         # a save again.
         return {k: v for k, v in d.items() if not str(k).startswith(("_notify_last_", "_notify_count_"))}
 
-    db.save_settings(uid, _persistable(sess.settings))
+    _main_settings = _persistable(sess.settings)
+    # "Set Sell Message" / "Set Message Count" (Order Monitor) live on the session
+    # as attributes — store them in the persisted settings so they survive the
+    # 2-hour reset, a redeploy and the Auto Resume Agent.
+    _main_settings["sell_custom_msg"] = sess.sell_custom_msg
+    _main_settings["sell_msg_count"]  = int(sess.sell_msg_count or 1)
+    db.save_settings(uid, _main_settings)
     db.save_extra_slots(uid, [_persistable(slot["settings"]) for slot in sess.extra_ad_slots])
     if sess.usdt_ad2 is not None:
         db.save_usdt_ad_slot(uid, "2", _persistable(sess.usdt_ad2["settings"]))
@@ -2080,6 +2086,15 @@ def _load_settings_from_disk(uid: int):
     saved = db.load_settings(uid)
     if saved:
         sess = get_session(uid)
+        # Restore the sell message + count (see _save_settings).
+        if isinstance(saved.get("sell_custom_msg"), str) and saved["sell_custom_msg"].strip():
+            sess.sell_custom_msg = saved["sell_custom_msg"]
+        try:
+            _smc = int(saved.get("sell_msg_count") or 0)
+            if 1 <= _smc <= 5:
+                sess.sell_msg_count = _smc
+        except (TypeError, ValueError):
+            pass
         for k, v in saved.items():
             # Down Price monitoring state is written to disk throttled, so the
             # in-memory copy of a running ad is always at least as fresh —
@@ -9016,7 +9031,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         _s(tuser.id).current_price = Decimal("0"); _s(tuser.id).ad_data.clear()
         _s(tuser.id).seen_order_ids = set(); _s(tuser.id).paid_order_ids = set()
         _s(tuser.id).seen_sell_ids = set(); _s(tuser.id).released_ids = set()
-        _s(tuser.id).sell_msg_enabled = False; _s(tuser.id).sell_msg_count = 1
+        _s(tuser.id).sell_msg_enabled = False   # message text + count are saved settings — kept
         # Reset ONLY this user's slot — NOT global
         _s(tuser.id).selected_slot = 0
         for k, v in [("ad_id",""),("bybit_uid",""),("mode","fixed"),
@@ -12078,6 +12093,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif action == "sell_custom_msg":
         _s(uid).sell_custom_msg = text
+        _save_settings(uid)
         _state["action"] = None
         preview = text[:80] + "..." if len(text) > 80 else text
         await reply_with_back(
@@ -12090,6 +12106,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             val = int(text)
             if val < 1 or val > 5: raise ValueError
             _s(uid).sell_msg_count = val
+            _save_settings(uid)
             _state["action"] = None
             await reply_with_back(f"✅ <b>Message count saved!</b>\n\nWill send <code>{_esc(str(val))}x</code> per sell order.")
         except Exception:
@@ -12546,8 +12563,7 @@ def _reset_user_session(sess) -> bool:
     sess.paga_pay_enabled    = False
     sess.buyer_protection_on = False
     sess.name_match_enabled  = False
-    sess.sell_msg_enabled    = False
-    sess.sell_msg_count      = 1
+    sess.sell_msg_enabled    = False   # message text + count are saved settings — kept
 
     # Clear volatile order / chat runtime state (dedupe caches, not settings)
     sess.seen_chat_msgs.clear()
