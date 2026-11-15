@@ -977,10 +977,12 @@ def _paced_modify(ad_id: str, body: dict, creds: dict | None) -> dict:
     res: dict = {}
     with gate["lock"]:
         for attempt in range(_MODIFY_10006_RETRIES + 1):
+            gap_eff = gate["gap"] + gate.get("penalty", 0.0)
             now  = time.monotonic()
-            wait = max(gate["gap"] - (now - gate["last"]), gate.get("blocked_until", 0.0) - now)
+            wait = max(gap_eff - (now - gate["last"]), gate.get("blocked_until", 0.0) - now)
             if wait > 0:
                 time.sleep(wait)
+            since_prev = time.monotonic() - gate["last"] if gate["last"] else None
             gate["last"] = time.monotonic()          # time the request STARTS
             res  = _post("/v5/p2p/item/update", body, creds=creds)
             rate = res.get("_rate") or {}
@@ -989,11 +991,20 @@ def _paced_modify(ad_id: str, body: dict, creds: dict | None) -> dict:
             if rate.get("remaining") == 0 and rate.get("reset_in"):
                 gate["blocked_until"] = time.monotonic() + rate["reset_in"] + 0.05
             if str(res.get("retCode", res.get("ret_code", -1))) != "10006":
+                # Success (or a normal rejection): let any penalty fade.
+                gate["penalty"] = max(0.0, gate.get("penalty", 0.0) - 0.1)
                 return res
+            # Rejected even though we paced it — Bybit is stricter than its own
+            # header suggests (or the clocks differ). Widen this key's gap.
+            gate["penalty"] = min(gate.get("penalty", 0.0) + 0.5, 3.0)
+            logger.warning(
+                f"[Bybit]{_uid_tag(creds)} 10006 despite pacing — previous edit started "
+                f"{'?' if since_prev is None else f'{since_prev:.2f}s'} earlier (gap={gap_eff:.2f}s); "
+                f"gap widened to {gate['gap'] + gate['penalty']:.2f}s | {_rate_str(rate)}")
             if attempt < _MODIFY_10006_RETRIES:
                 logger.warning(f"[Bybit]{_uid_tag(creds)} MODIFY {ad_id} hit rate limit (10006) — "
-                               f"waiting for reset, retry {attempt + 1}/{_MODIFY_10006_RETRIES} | {_rate_str(rate)}")
-                time.sleep(max((rate.get("reset_in") or 0) + 0.1, gate["gap"]))
+                               f"waiting for reset, retry {attempt + 1}/{_MODIFY_10006_RETRIES}")
+                time.sleep(max((rate.get("reset_in") or 0) + 0.1, gate["gap"] + gate["penalty"]))
     return res
 
 
