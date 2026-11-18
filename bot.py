@@ -418,6 +418,28 @@ def _set_last_ceiling_attempt(sess, slot_idx: int, value):
         sess.last_ceiling_attempt_by_slot = store
     store[slot_idx] = value
 
+# NGN fast-chase: the spot-derived (formula) price and Bybit's real ceiling are
+# on DIFFERENT scales for NGN (Bybit's own NGN reference differs from the
+# user's NGN/USDT ref — e.g. formula 94,006,803 vs real ceiling 94,378,381),
+# so "formula − real ceiling" is permanently hugely negative and never clears
+# the threshold. For NGN the question that actually matters is "has the
+# spot-derived price RISEN since the last time we probed/posted", so this keeps
+# the formula value as of the last probe per slot and fast-chase compares
+# fresh formula values against THAT (formula vs formula). USD keeps its
+# original ceiling comparison untouched (its formula and ceiling line up).
+def _uses_formula_baseline(currency_id: str) -> bool:
+    return str(currency_id).upper() == "NGN"
+
+def _formula_baseline(sess, slot_idx: int):
+    return getattr(sess, "formula_baseline_by_slot", {}).get(slot_idx)
+
+def _set_formula_baseline(sess, slot_idx: int, value):
+    store = getattr(sess, "formula_baseline_by_slot", None)
+    if store is None:
+        store = {}
+        sess.formula_baseline_by_slot = store
+    store[slot_idx] = value
+
 def _required_fresh_move(sess, slot_idx: int, currency: str, token: str, reference_price, fallback_gap):
     """How much the underlying raw ceiling needs to have moved past what
     this slot already probed/resolved a post from before it's worth
@@ -574,7 +596,7 @@ def _down_on_fast_increase(uid: int, s: dict, posted_price: Decimal, derived: De
     downward monitoring (re)starts. Cancels any running countdown."""
     mon = _down_mon(s)
     was = mon.get("state")
-    mon.update(state="monitoring", ref=str(posted_price), derived=str(derived), gap="0",
+    mon.update(state="monitoring", ref=str(posted_price), ref_derived=str(derived), derived=str(derived), gap="0",
                last_edit_ts=datetime.now().timestamp(), cd_started_ts=None)
     logger.info(f"[DownPrice] {label} Fast Update raised the price to {posted_price} (derived {derived}) — "
                 f"reference reset, monitoring restarted (was {was or 'idle'}); cycle countdown cancelled")
@@ -602,6 +624,16 @@ def _down_tick(uid: int, s: dict, ad_data: dict, derived: Decimal, cur_p: Decima
         return None
     mon = _down_mon(s)
     gap = cur_p - derived
+    # NGN: the ad's price is Bybit's real ceiling, which isn't on the same
+    # scale as the spot-derived formula price — so measure the fall of the
+    # derived price from the derived price recorded at the last raise.
+    if str(ad_data.get("currencyId", "")).upper() == "NGN":
+        _rd = mon.get("ref_derived")
+        if _rd not in (None, ""):
+            try:
+                gap = Decimal(str(_rd)) - derived
+            except Exception:
+                pass
     mon["derived"] = str(derived)
     mon["gap"] = str(gap)
     if mon.get("state") != "monitoring":
@@ -1866,7 +1898,9 @@ _FAST_CHASE_AD1_MIN_RISE = Decimal("0.01")
 def _fast_chase_gap(currency_id: str, token_id: str, reference_price=None, slot_idx=None) -> Decimal:
     override = _FAST_CHASE_GAP_OVERRIDE.get((currency_id.upper(), token_id.upper()))
     if override is not None:
-        if slot_idx == -1 and (currency_id.upper(), token_id.upper()) in bybit.DOWN_PRICE_PAIRS:
+        # USD only — NGN/BTC keeps its ₦1,500 reaction gap on every slot
+        # (a 0.01 gap there would probe Bybit on every tick of ordinary jitter).
+        if slot_idx == -1 and currency_id.upper() == "USD" and (currency_id.upper(), token_id.upper()) in bybit.DOWN_PRICE_PAIRS:
             return _FAST_CHASE_AD1_MIN_RISE
         return override
     return get_min_price_gap(currency_id, token_id, reference_price)
@@ -2733,11 +2767,12 @@ def ads_section_keyboard(uid: int = 0):
             _nudge_val = (s.get("manual_nudge") or "").strip()
             _nudge_label = f"↔️ Nudge Amount: {_nudge_val}" if _nudge_val else "↔️ Set Nudge Amount"
             rows.append([InlineKeyboardButton(_nudge_label, callback_data="set_manual_nudge")])
-        # Down Price monitoring — floating USD/BTC and USD/ETH only (any ad slot).
+        # Down Price monitoring — floating USD/BTC, USD/ETH and NGN/BTC (any ad slot).
         if (_cur, _tok) in bybit.DOWN_PRICE_PAIRS:
             _dp_val = (s.get("down_price") or "").strip()
+            _dp_sym = "₦" if _cur == "NGN" else "$"
             rows.append([InlineKeyboardButton(
-                f"📉 Down Price: ${_dp_val}" if _dp_val else "📉 Set Down Price",
+                f"📉 Down Price: {_dp_sym}{_dp_val}" if _dp_val else "📉 Set Down Price",
                 callback_data="set_down_price")])
 
     # Dedicated BTC/NGN market list — same 1-300 windowed viewer the
@@ -6626,10 +6661,22 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
 
                 else:
                     if last_known is not None:
-                        formula_diff = new_p - last_known
+                        _fb = _formula_baseline(sess, slot_idx) if _uses_formula_baseline(currency) else None
+                        if _uses_formula_baseline(currency):
+                            if _fb is None:
+                                # No probe baseline yet for this slot — adopt the
+                                # current spot-derived price as the reference
+                                # (free, no API call) so the NEXT rise is caught.
+                                _set_formula_baseline(sess, slot_idx, new_p)
+                                logger.info(f"{tag} chase-ceiling | NGN baseline initialised at spot-derived {new_p} (no API call)")
+                                return
+                            formula_diff = new_p - _fb
+                        else:
+                            formula_diff = new_p - last_known
                         logger.info(
-                            f"{tag} chase-ceiling | fetched price={new_p} vs last known real ceiling={last_known} "
-                            f"diff={formula_diff} threshold={gap}"
+                            f"{tag} chase-ceiling | fetched price={new_p} vs "
+                            + (f"last probed spot-derived price={_fb} " if _uses_formula_baseline(currency) else f"last known real ceiling={last_known} ")
+                            + f"diff={formula_diff} threshold={gap}"
                         )
                         if formula_diff < gap:
                             logger.info(
@@ -6656,7 +6703,8 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                             _prior_attempt = None
                         if _prior_attempt is not None:
                             _required = _required_fresh_move(sess, slot_idx, currency, token, new_p, gap)
-                            if new_p - _prior_attempt < _required:
+                            _fresh_moved = (new_p - _fb) if _fb is not None else (new_p - _prior_attempt)
+                            if _fresh_moved < _required:
                                 # We already ran a full probe off essentially this
                                 # same underlying ceiling recently. Gated on THIS
                                 # ad's own real spacing requirement, not one flat
@@ -6694,6 +6742,8 @@ async def _try_fast_chase(bot, chat_id, sess, slot_idx, ad_data, s, float_pct, c
                     # no longer happen at all — the correction logic stays
                     # in place regardless, as a second layer of defense.
                     probe_price = (new_p * Decimal("50")).quantize(_quant, rounding=ROUND_HALF_UP)
+                    if _uses_formula_baseline(currency):
+                        _set_formula_baseline(sess, slot_idx, new_p)   # reference for the next NGN rise check
                     _record_modify_slot(sess, slot_idx)
                     logger.info(f"{tag} chase-ceiling probe — submitting {probe_price}")
                     result = await asyncio.get_event_loop().run_in_executor(
@@ -7628,6 +7678,7 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
             # were silently burning through this ad's modify-rate budget,
             # which then made LATER cycles appear to "do nothing" while they
             # were actually just waiting for that budget to free up.
+            _pre_collision_p = new_p   # raw value before any sibling-collision nudge (NGN fast-chase baseline)
             if sess.total_ad_slots() > 1 and mode not in ("ad_copy", "browserbase_market", "decodo_market"):
                 new_p, _cycle_collided = _resolve_price_collision(
                     sess, slot_idx,
@@ -7660,6 +7711,12 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
             # accepted band.
             if chase_ceiling:
                 probe_price = (new_p * Decimal("50")).quantize(_quant, rounding=ROUND_HALF_UP)
+                if _uses_formula_baseline(ad_data.get("currencyId", "")):
+                    # NGN fast-chase compares fresh spot-derived prices against
+                    # THIS value (see _formula_baseline) — record what the
+                    # scheduled probe was based on. new_p may have been
+                    # collision-nudged above, so use the pre-nudge number.
+                    _set_formula_baseline(sess, slot_idx, _pre_collision_p)
                 submit_price, submit_str = probe_price, str(probe_price)
             else:
                 submit_price, submit_str = new_p, new_p_str
@@ -10180,23 +10237,26 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
         _pair = (ad_data.get("currencyId","").upper(), ad_data.get("tokenId","").upper())
         if not ad_data or _pair not in bybit.DOWN_PRICE_PAIRS or s.get("mode") != "floating":
             await edit_menu(query,
-                "❌ Down Price is only available for <b>Floating</b> mode on <b>BTC/USD</b> and <b>ETH/USD</b> ads.\n"
+                "❌ Down Price is only available for <b>Floating</b> mode on <b>BTC/USD</b>, <b>ETH/USD</b> and <b>BTC/NGN</b> ads.\n"
                 "Fetch the ad details and set the mode to Floating first.",
                 InlineKeyboardMarkup(back_section("section_ads")))
             return
         _btn_state["action"]       = "down_price"
         _btn_state["prev_section"] = "section_ads"
         _cur_dp = (s.get("down_price") or "").strip()
+        _dp_sym = "₦" if _pair[0] == "NGN" else "$"
+        _dp_unit = "naira" if _pair[0] == "NGN" else "dollars"
+        _dp_ex = "1500000" if _pair[0] == "NGN" else "10"
         await edit_menu(query,
             f"📉 <b>Set Down Price — {_ad_slot_label(slot_idx)}</b>\n\n"
             f"Pair: <code>{_esc(_pair[1])}/{_esc(_pair[0])}</code>\n"
-            f"Current: <code>{('$' + _cur_dp) if _cur_dp else '— not set —'}</code>\n\n"
+            f"Current: <code>{(_dp_sym + _cur_dp) if _cur_dp else '— not set —'}</code>\n\n"
             "After Fast Update raises this ad's price, the bot measures the gap between your ad's "
             "current price and the live market-derived price. Once the derived price is more than this "
             "amount BELOW your ad, the normal cycle countdown starts — so the ad isn't edited before "
             "Bybit's own timer has progressed. If Fast Update raises the price again during the "
             "countdown, monitoring restarts.\n\n"
-            "Send the drop in dollars, e.g. <code>10</code> — the cycle interval you already set is used "
+            f"Send the drop in {_dp_unit}, e.g. <code>{_dp_ex}</code> — the cycle interval you already set is used "
             "for the countdown.\n"
             "Send <code>0</code> or <code>clear</code> to turn Down Price off.",
             InlineKeyboardMarkup(back_section("section_ads")))
@@ -11863,7 +11923,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _state["action"] = None
             await reply_with_back(f"✅ <b>{_ad_slot_label(slot_idx)} Down Price turned off.</b>")
         else:
-            ok, err, val = bybit.validate_down_price(text)
+            _dp_cur = str(_ad_data_of(sess, slot_idx).get("currencyId", "USD")).upper()
+            _dp_sym = "₦" if _dp_cur == "NGN" else "$"
+            ok, err, val = bybit.validate_down_price(text, _dp_cur)
             if not ok:
                 await update.message.reply_text(err, parse_mode="HTML")
             else:
@@ -11875,7 +11937,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 _state["action"] = None
                 await reply_with_back(
                     f"✅ <b>{_ad_slot_label(slot_idx)} Down Price saved!</b>\n\n"
-                    f"<code>${_esc(s['down_price'])}</code> — after a Fast Update raise, the cycle countdown "
+                    f"<code>{_dp_sym}{_esc(s['down_price'])}</code> — after a Fast Update raise, the cycle countdown "
                     f"({_ad_interval_label(s, _ad_data_of(sess, slot_idx))}) only starts once the derived price is more than that below your ad's price."
                 )
 
