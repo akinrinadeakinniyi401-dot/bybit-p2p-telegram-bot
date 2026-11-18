@@ -958,7 +958,7 @@ def get_chat_messages(order_id: str, page: str = "1", size: str = "30",
 # If Bybit reports remaining=0 we also wait for its reset time. A 10006 that
 # still gets through waits for Bybit's reset, then retries (up to 3 times).
 _MODIFY_MIN_GAP       = float(os.getenv("BYBIT_MODIFY_MIN_GAP_SECS", "1.25") or 1.25)
-_MODIFY_10006_RETRIES = 3
+_MODIFY_10006_RETRIES = 4
 # Safety margin on top of 1/limit: Bybit counts when it RECEIVES a request, and
 # network latency varies, so two edits sent exactly 1/limit apart can still
 # land inside the same window.
@@ -1000,17 +1000,19 @@ def _paced_modify(ad_id: str, body: dict, creds: dict | None) -> dict:
                 # Success (or a normal rejection): let any penalty fade.
                 gate["penalty"] = max(0.0, gate.get("penalty", 0.0) - 0.1)
                 return res
-            # Rejected even though we paced it — Bybit is stricter than its own
-            # header suggests (or the clocks differ). Widen this key's gap.
-            gate["penalty"] = min(gate.get("penalty", 0.0) + 0.5, 3.0)
+            # Bybit confirmed (Nov 2026) that 10006 here means the PLATFORM-wide limit
+            # for this endpoint was reached — not this key's own traffic — and the
+            # request should simply be repeated after a few seconds. So widening this
+            # key's own gap would only slow the user down for nothing; instead wait
+            # a little longer on each successive retry.
             logger.warning(
-                f"[Bybit]{_uid_tag(creds)} 10006 despite pacing — previous edit started "
-                f"{'?' if since_prev is None else f'{since_prev:.2f}s'} earlier (gap={gap_eff:.2f}s); "
-                f"gap widened to {gate['gap'] + gate['penalty']:.2f}s | {_rate_str(rate)}")
+                f"[Bybit]{_uid_tag(creds)} 10006 (platform-wide limit) — previous edit started "
+                f"{'?' if since_prev is None else f'{since_prev:.2f}s'} earlier (gap={gap_eff:.2f}s) | {_rate_str(rate)}")
             if attempt < _MODIFY_10006_RETRIES:
+                _pause = max((rate.get("reset_in") or 0) + 0.1, gate["gap"]) + attempt * 1.0
                 logger.warning(f"[Bybit]{_uid_tag(creds)} MODIFY {ad_id} hit rate limit (10006) — "
-                               f"waiting for reset, retry {attempt + 1}/{_MODIFY_10006_RETRIES}")
-                time.sleep(max((rate.get("reset_in") or 0) + 0.1, gate["gap"] + gate["penalty"]))
+                               f"retry {attempt + 1}/{_MODIFY_10006_RETRIES} in {_pause:.1f}s")
+                time.sleep(_pause)
     return res
 
 
