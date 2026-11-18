@@ -239,21 +239,27 @@ MIN_QUICK_MARKET_INTERVAL_SECONDS = 1
 # until the underlying spot price has dropped by the user's own "Down
 # Price" amount from the reference price recorded at that Fast Update.
 # (currency, token) pairs it applies to — USD/BTC and USD/ETH for now.
-DOWN_PRICE_PAIRS = {("USD", "BTC"), ("USD", "ETH")}
+DOWN_PRICE_PAIRS = {("USD", "BTC"), ("USD", "ETH"), ("NGN", "BTC")}
 MAX_DOWN_PRICE   = Decimal("100000")
+MAX_DOWN_PRICE_NGN = Decimal("100000000")   # NGN/BTC trades at ~₦94M, so ₦ amounts are far larger than $ amounts
 
 
-def validate_down_price(value) -> tuple[bool, str, "Decimal | None"]:
-    """Validate a user-entered Down Price threshold (a positive dollar
-    amount). Returns (ok, error_message, Decimal_value)."""
+def validate_down_price(value, currency: str = "USD") -> tuple[bool, str, "Decimal | None"]:
+    """Validate a user-entered Down Price threshold (a positive amount in the
+    ad's own currency — $ for USD ads, ₦ for NGN ads). Returns
+    (ok, error_message, Decimal_value)."""
+    is_ngn = str(currency).upper() == "NGN"
+    sym    = "₦" if is_ngn else "$"
+    cap    = MAX_DOWN_PRICE_NGN if is_ngn else MAX_DOWN_PRICE
+    example = "<code>1500000</code> or <code>2500000.5</code>" if is_ngn else "<code>10</code> or <code>7.5</code>"
     try:
-        val = Decimal(str(value).strip().lstrip("$"))
+        val = Decimal(str(value).strip().lstrip(sym).replace(",", ""))
     except Exception:
-        return False, "❌ Send a positive dollar amount like <code>10</code> or <code>7.5</code>.", None
+        return False, f"❌ Send a positive {sym} amount like {example}.", None
     if val <= 0:
         return False, "❌ Down Price must be greater than 0.", None
-    if val > MAX_DOWN_PRICE:
-        return False, f"❌ Down Price can't be more than <code>{MAX_DOWN_PRICE}</code>.", None
+    if val > cap:
+        return False, f"❌ Down Price can't be more than <code>{cap}</code>.", None
     return True, "", val
 
 
