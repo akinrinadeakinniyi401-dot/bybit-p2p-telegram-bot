@@ -2337,6 +2337,50 @@ def get_user_creds(user_id: int, slot: int | None = None) -> dict | None:
 
 
 # ─────────────────────────────────────────
+# 📋 Ad details fetch — retries Bybit's platform-wide rate limit
+# ─────────────────────────────────────────
+# Bybit confirmed 10006 on these endpoints means the PLATFORM-wide limit for the
+# endpoint was reached (not this user's own traffic) and the request should be
+# repeated after a few seconds. So a fetch that hits it is retried with a
+# growing wait (using Bybit's own reset time when it gives one) instead of
+# being reported as a failure or — in Auto Resume — silently skipped.
+_FETCH_RETRY_WAITS = (1.5, 2.5, 4.0, 6.0, 8.0, 12.0)
+
+def _is_transient_bybit_error(result: dict) -> bool:
+    rc  = result.get("retCode", result.get("ret_code", None))
+    msg = str(result.get("retMsg", result.get("ret_msg", "")) or result.get("error", "")).lower()
+    if str(rc) == "10006":
+        return True
+    if rc in (None, -1):
+        return any(x in msg for x in ("timed out", "timeout", "too many", "cdn block", "connection", "temporar"))
+    return False
+
+def _rate_wait_seconds(result: dict, attempt: int) -> float:
+    """Seconds to wait before retrying: Bybit's own reset time if it sent one,
+    otherwise a growing schedule, plus a little jitter so many users retrying
+    together don't all land on the same instant."""
+    base = _FETCH_RETRY_WAITS[min(attempt, len(_FETCH_RETRY_WAITS) - 1)]
+    reset_in = ((result.get("_rate") or {}).get("reset_in")) or 0
+    return max(base, reset_in + 0.3) + random.uniform(0.0, 0.8)
+
+async def _fetch_ad_with_retry(ad_id: str, creds, attempts: int = 5, tag: str = "") -> dict:
+    """get_ad_details with retry on rate limit / transient errors. Returns the
+    last Bybit result (success or the final failure)."""
+    result: dict = {}
+    for i in range(max(1, attempts)):
+        result = await asyncio.get_event_loop().run_in_executor(
+            None, partial(get_ad_details, ad_id, creds=creds))
+        if result.get("retCode", result.get("ret_code", -1)) == 0:
+            return result
+        if not _is_transient_bybit_error(result) or i == attempts - 1:
+            return result
+        wait = _rate_wait_seconds(result, i)
+        logger.info(f"{tag} fetch ad {ad_id} hit rate limit/transient error — retry {i + 1}/{attempts - 1} in {wait:.1f}s")
+        await asyncio.sleep(wait)
+    return result
+
+
+# ─────────────────────────────────────────
 # 🏠 MAIN MENU
 # ─────────────────────────────────────────
 def main_menu_keyboard(uid: int = 0):
@@ -8136,6 +8180,24 @@ async def auto_update_loop(bot, chat_id, slot_idx: int = -1):
                 # this wait avoids a second, competing timer.
                 _down_on_cycle_done(chat_id, s)
                 wait_until = loop_clock.time()
+            # ── Rate-limited cycle → quick retry ──
+            # A cycle that ended on Bybit's 10006 shouldn't leave the ad stale for
+            # a whole interval. Retry in ~5-9s, up to 6 times in a row, then fall
+            # back to the normal interval.
+            _rr = getattr(sess, "rate_retry_slots", None)
+            _rc = getattr(sess, "rate_retry_count", None)
+            if _rc is None:
+                _rc = {}; sess.rate_retry_count = _rc
+            if _rr is not None and slot_idx in _rr:
+                _rr.discard(slot_idx)
+                _rc[slot_idx] = _rc.get(slot_idx, 0) + 1
+                if _rc[slot_idx] <= 6:
+                    _quick = 5.0 + random.uniform(0.0, 4.0)
+                    wait_until = min(wait_until, loop_clock.time() + _quick)
+                    logger.info(f"[{label}] Cycle {cycle} rate-limited (10006) for user {chat_id} — retrying in {_quick:.0f}s "
+                                f"({_rc[slot_idx]}/6)")
+            else:
+                _rc[slot_idx] = 0
             _seen_fast_modify_ts = _last_fast_modify_ts(sess, slot_idx) if mode == "floating" else None
             while _ad_running(sess, slot_idx) and loop_clock.time() < wait_until:
                 await asyncio.sleep(1)
@@ -8204,6 +8266,15 @@ async def _handle_ad_cycle_failure(bot, chat_id, sess, slot_idx, label, cycle, r
         return False
 
     if ret_code == 10006:
+        # Ask the loop to try again in a few seconds instead of waiting out a
+        # whole interval (Bybit: platform-wide limit — "repeat in a few seconds").
+        try:
+            _rr = getattr(sess, "rate_retry_slots", None)
+            if _rr is None:
+                _rr = set(); sess.rate_retry_slots = _rr
+            _rr.add(slot_idx)
+        except Exception:
+            pass
         # Bybit's account-wide request-rate limit ("Too many visits"). Purely
         # transient and not this ad's fault — it must NEVER count towards the
         # 2-in-a-row auto-stop (that stopped users' ads for a momentary
@@ -9796,9 +9867,7 @@ async def _button_handler_inner(update: Update, context: ContextTypes.DEFAULT_TY
             )
             return
         await edit_menu(query, "⏳ Loading ad from Bybit...", ads_section_keyboard(tuser.id))
-        result   = await asyncio.get_event_loop().run_in_executor(
-            None, partial(get_ad_details, s["ad_id"], creds=_creds)
-        )
+        result   = await _fetch_ad_with_retry(s["ad_id"], _creds, attempts=4, tag=f"[Fetch u={tuser.id}]")
         ret_code = result.get("retCode", result.get("ret_code",-1))
         if ret_code == 0 and _is_ad456(slot_idx):
             _pair_err = _ad456_pair_error(slot_idx, result.get("result", {}) or {})
@@ -12671,11 +12740,161 @@ def _maybe_snapshot_resume_state(uid: int):
     it's safe to call after every toggle handler regardless."""
     try:
         if db.get_auto_resume_agent_enabled(uid):
-            snap = _s(uid).snapshot_active_engines()
+            snap = _snapshot_with_account(_s(uid))
             if snap:
                 db.save_resume_snapshot(uid, snap)
     except Exception as e:
         logger.debug(f"[AutoResume] snapshot failed for user {uid}: {e}")
+
+
+_last_resume_reason: dict = {}      # (uid, slot_idx) -> last failure text
+_resume_verify_tasks: dict = {}     # uid -> asyncio.Task
+
+def _snapshot_with_account(sess) -> dict:
+    """snapshot_active_engines() plus which Bybit ACCOUNT slot (1/2) the user was
+    on — selected_slot isn't persisted anywhere, so after a redeploy a user on
+    account 2 would otherwise resume against account 1's keys and fail."""
+    snap = sess.snapshot_active_engines()
+    if snap:
+        snap["account_slot"] = int(getattr(sess, "selected_slot", 0) or 0)
+    return snap
+
+
+def _ad_slot_alive(sess, slot_idx: int) -> bool:
+    """Running flag set AND its task (if it has one) hasn't finished/crashed."""
+    if not _ad_running(sess, slot_idx):
+        return False
+    if slot_idx in (-2, -3):
+        return True
+    # USDT/USD ads coordinated by the shared rank-rotation task have no task of their own.
+    if getattr(sess, "usdt_triad_running", False) and slot_idx in _usdt_triad_participants(sess):
+        return True
+    try:
+        t = sess.refresh_task if slot_idx == -1 else sess.extra_ad_slots[slot_idx].get("task")
+    except Exception:
+        return True
+    return t is None or not t.done()
+
+
+async def _resume_one_ad_slot(bot, uid: int, sess, creds, slot_idx: int, ad_id: str):
+    """Try to bring ONE ad slot back. Returns (status, reason):
+         "ok"    — started (or already running)
+         "retry" — failed for a transient reason (rate limit, timeout…); try again
+         "skip"  — can't/shouldn't be resumed (slot removed, ad changed, no access)"""
+    if slot_idx != -1 and slot_idx >= len(sess.extra_ad_slots) and slot_idx not in (-2, -3):
+        logger.warning(f"[AutoResume] user {uid} — slot {slot_idx} no longer exists, skipping")
+        return "skip", "slot removed"
+    if _is_ad456(slot_idx) and not is_admin(uid) and _ad456_st(uid)["state"] not in ("available", "trial", "approved"):
+        logger.info(f"[AutoResume] user {uid} — {_ad_slot_label(slot_idx)} skipped: Ad 4-6 access ended")
+        if uid not in _ad456_notified_expired:
+            _ad456_notified_expired.add(uid)
+            await _safe_send(bot, chat_id=uid, parse_mode="HTML",
+                text="⏰ <b>" + _ad_slot_label(slot_idx) + " was not resumed</b>\n\n" + _ad456_block_text(uid),
+                reply_markup=_ad456_request_keyboard(uid))
+        return "skip", "Ad 4-6 access ended"
+    s = _ad_settings(sess, slot_idx)
+    if s.get("ad_id") != ad_id:
+        logger.warning(f"[AutoResume] user {uid} — {_ad_slot_label(slot_idx)}'s ad_id changed since snapshot, skipping")
+        return "skip", "ad id changed"
+    if _ad_slot_alive(sess, slot_idx):
+        return "ok", ""
+    if _ad_running(sess, slot_idx):
+        # flagged running but its task died — clear so it can be started cleanly
+        _set_ad_running(sess, slot_idx, False)
+    try:
+        result = await _fetch_ad_with_retry(ad_id, creds, attempts=6, tag=f"[AutoResume u={uid}]")
+    except Exception as e:
+        logger.warning(f"[AutoResume] user {uid} — {_ad_slot_label(slot_idx)} fetch raised {e}")
+        return "retry", f"fetch error: {e}"
+    ret_code = result.get("retCode", result.get("ret_code", -1))
+    if ret_code != 0:
+        msg = str(result.get("retMsg", result.get("ret_msg", "")))
+        logger.warning(f"[AutoResume] user {uid} — {_ad_slot_label(slot_idx)} fetch failed ({ret_code}: {msg})")
+        return ("retry" if _is_transient_bybit_error(result) else "skip"), f"{ret_code}: {msg}"
+    if _ad_slot_alive(sess, slot_idx):
+        return "ok", ""            # user started it manually while we were fetching
+    ad_data = _ad_data_of(sess, slot_idx)
+    ad_data.clear()
+    ad_data.update(result.get("result", {}))
+    _reset_ad_failures(sess, slot_idx)
+    _set_ad_running(sess, slot_idx, True)
+    _down_flag_resume(sess, slot_idx)   # keep a saved Down Price monitoring state (see _down_init_on_start)
+    task = asyncio.create_task(auto_update_loop(bot, uid, slot_idx))
+    _set_ad_task(sess, slot_idx, task)
+    logger.info(f"[AutoResume] user {uid} — {_ad_slot_label(slot_idx)} resumed (ad {ad_id})")
+    return "ok", ""
+
+
+_RESUME_VERIFY_DELAYS = (45, 60, 90, 120, 180, 240)   # seconds between checks (~12 min total)
+
+def _start_resume_verify(bot, uid: int, pending: list):
+    old = _resume_verify_tasks.get(uid)
+    if old is not None and not old.done():
+        old.cancel()
+    _resume_verify_tasks[uid] = asyncio.create_task(_resume_verify_task(bot, uid, list(pending)))
+
+
+async def _resume_verify_task(bot, uid: int, pending: list):
+    """After a resume pass, confirm every revived ad is still really running and
+    keep retrying the ones that failed to start (rate limit on fetch, first
+    cycle dying, auto-stop…). Ads confirmed alive are left alone from then on,
+    so a later manual Stop by the user is never undone."""
+    confirmed, failed_reason = set(), {}
+    try:
+        sess = get_session(uid)
+        waiting = list(pending)
+        for rnd, delay in enumerate(_RESUME_VERIFY_DELAYS):
+            await asyncio.sleep(delay + random.uniform(0, 3))
+            creds = get_user_creds(uid, slot=_get_user_slot(uid))
+            still = []
+            for slot_idx, ad_id in waiting:
+                if _ad_slot_alive(sess, slot_idx):
+                    confirmed.add(slot_idx)
+                    continue
+                status, reason = await _resume_one_ad_slot(bot, uid, sess, creds, slot_idx, ad_id)
+                if status == "ok":
+                    logger.info(f"[AutoResume] user {uid} — {_ad_slot_label(slot_idx)} recovered on verify round {rnd + 1}")
+                    confirmed.add(slot_idx)
+                elif status == "retry":
+                    failed_reason[slot_idx] = reason
+                    still.append((slot_idx, ad_id))
+                else:
+                    failed_reason[slot_idx] = reason
+            waiting = still
+            # Late-recovered USDT/USD ads must join the shared rank-rotation task
+            # (same as the first pass) instead of running as independent loops.
+            try:
+                if len(_usdt_triad_participants(sess)) >= 2 and not getattr(sess, "usdt_triad_running", False):
+                    await _usdt_triad_reconcile(bot, uid, sess)
+            except Exception as _te:
+                logger.debug(f"[AutoResume] triad reconcile after verify failed: {_te}")
+            if not waiting:
+                break
+        # Everything we could bring back is back → now it's safe to refresh the snapshot.
+        try:
+            if not waiting:
+                _cur = _snapshot_with_account(sess)
+                if _cur:
+                    db.save_resume_snapshot(uid, _cur)
+        except Exception:
+            pass
+        if waiting:
+            lines = "\n".join(f"• {_ad_slot_label(i)} — {_esc(failed_reason.get(i, 'unknown'))}" for i, _ in waiting)
+            logger.warning(f"[AutoResume] user {uid} — could not restart after retries: {[i for i, _ in waiting]}")
+            await _safe_send(bot, chat_id=uid, parse_mode="HTML", text=(
+                "⚠️ <b>Auto Resume couldn't restart these ads</b>\n\n" + lines +
+                "\n\nBybit is rate-limiting requests right now. Open 📊 AD Price Bot and tap "
+                "<b>Start Auto-Update</b> on them. Your saved resume list is kept, so the next reset will try again."))
+        elif any(r for r in failed_reason.values()):
+            await _safe_send(bot, chat_id=uid, parse_mode="HTML",
+                text="✅ <b>Auto Resume</b> — the ads that were delayed by Bybit's rate limit are now running.")
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.error(f"[AutoResume] verify task error for user {uid}: {e}", exc_info=True)
+    finally:
+        if _resume_verify_tasks.get(uid) is asyncio.current_task():
+            _resume_verify_tasks.pop(uid, None)
 
 
 async def _resume_user_engines(bot, uid: int, snapshot: dict) -> list:
@@ -12702,68 +12921,37 @@ async def _resume_user_engines(bot, uid: int, snapshot: dict) -> list:
     # the ad_id-match guard below, and gets skipped as "changed since
     # snapshot" — which is exactly why USDT AD2/AD3 were never resumed
     # after a redeploy.
-    _load_settings_from_disk(uid)
     sess = get_session(uid)
+    # Restore the Bybit account (1/2) the user was on BEFORE loading per-account
+    # settings and keys; it isn't persisted anywhere else (see _snapshot_with_account).
+    try:
+        _acc = snapshot.get("account_slot")
+        if _acc in (0, 1):
+            sess.selected_slot = _acc
+    except Exception:
+        pass
+    _load_settings_from_disk(uid)
     resumed = []
 
     creds = get_user_creds(uid, slot=_get_user_slot(uid))
 
     ad_slots = snapshot.get("ad_slots") or []
     any_ad_resumed = False
+    pending_ads = []        # (slot_idx, ad_id) that must be retried / verified
     for entry in ad_slots:
         slot_idx = entry.get("slot_idx")
         ad_id    = entry.get("ad_id")
         if slot_idx is None or not ad_id:
             continue
-        # Bounds check — the persisted extra slots might not have been
-        # restored yet, or the user removed a slot since the snapshot was
-        # taken. Never guess or create a slot here; just skip it.
-        if slot_idx != -1 and slot_idx >= len(sess.extra_ad_slots):
-            logger.warning(f"[AutoResume] user {uid} — slot {slot_idx} no longer exists, skipping")
-            continue
-        if _is_ad456(slot_idx) and not is_admin(uid) and _ad456_st(uid)["state"] not in ("available", "trial", "approved"):
-            logger.info(f"[AutoResume] user {uid} — {_ad_slot_label(slot_idx)} skipped: Ad 4-6 access ended")
-            if uid not in _ad456_notified_expired:
-                _ad456_notified_expired.add(uid)
-                await _safe_send(bot, chat_id=uid, parse_mode="HTML",
-                    text="⏰ <b>" + _ad_slot_label(slot_idx) + " was not resumed</b>\n\n" + _ad456_block_text(uid),
-                    reply_markup=_ad456_request_keyboard(uid))
-            continue
-        s = _ad_settings(sess, slot_idx)
-        if s.get("ad_id") != ad_id:
-            # Settings drifted (ad_id changed) since the snapshot was taken —
-            # don't force a stale ad_id back onto a slot the user has since
-            # reconfigured.
-            logger.warning(f"[AutoResume] user {uid} — {_ad_slot_label(slot_idx)}'s ad_id changed since snapshot, skipping")
-            continue
-        if _ad_running(sess, slot_idx):
-            continue   # already running somehow — nothing to do
-        try:
-            result = await asyncio.get_event_loop().run_in_executor(
-                None, partial(get_ad_details, ad_id, creds=creds)
-            )
-            ret_code = result.get("retCode", result.get("ret_code", -1))
-            if ret_code != 0:
-                logger.warning(
-                    f"[AutoResume] user {uid} — {_ad_slot_label(slot_idx)} fetch failed "
-                    f"({result.get('retMsg', result.get('ret_msg',''))}), not starting auto-update"
-                )
-                continue
-            ad_data = _ad_data_of(sess, slot_idx)
-            ad_data.clear()
-            ad_data.update(result.get("result", {}))
-        except Exception as e:
-            logger.warning(f"[AutoResume] user {uid} — {_ad_slot_label(slot_idx)} fetch raised {e}, not starting auto-update")
-            continue
-
-        _reset_ad_failures(sess, slot_idx)
-        _set_ad_running(sess, slot_idx, True)
-        _down_flag_resume(sess, slot_idx)   # keep a saved Down Price monitoring state (see _down_init_on_start)
-        task = asyncio.create_task(auto_update_loop(bot, uid, slot_idx))
-        _set_ad_task(sess, slot_idx, task)
-        resumed.append(f"{_ad_slot_label(slot_idx)} auto-update")
-        any_ad_resumed = True
-        logger.info(f"[AutoResume] user {uid} — {_ad_slot_label(slot_idx)} resumed (ad {ad_id})")
+        status, reason = await _resume_one_ad_slot(bot, uid, sess, creds, slot_idx, ad_id)
+        if status == "ok":
+            resumed.append(f"{_ad_slot_label(slot_idx)} auto-update")
+            any_ad_resumed = True
+            pending_ads.append((slot_idx, ad_id))      # still verified below
+        elif status == "retry":
+            pending_ads.append((slot_idx, ad_id))
+            _last_resume_reason[(uid, slot_idx)] = reason
+        # "skip" = permanently not resumable (slot gone, ad changed, no access)
 
     # If 2+ of {USDT AD1, USDT AD2, USDT AD3} just got individually
     # resumed above, hand them over to the shared rank-rotation
@@ -12835,13 +13023,23 @@ async def _resume_user_engines(bot, uid: int, snapshot: dict) -> list:
                 _ensure_ad_order_engine(bot, uid)
                 logger.info(f"[AutoResume] user {uid} — Ad order engine resumed")
 
-    # Refresh the on-disk snapshot to match what ACTUALLY came back up
-    # (e.g. an ad slot whose fetch failed above shouldn't keep getting
-    # "resumed" every cycle if it's genuinely broken).
+    # Refresh the on-disk snapshot — but NEVER with an empty/partial one while any
+    # ad is still waiting to be retried. This used to overwrite the saved
+    # snapshot with whatever came back in this pass, so a single rate-limited
+    # fetch (nothing started) wrote an EMPTY snapshot and Auto Resume had nothing
+    # left to bring back at the next reset — the "auto resume never came back"
+    # bug. The snapshot is only refreshed once every ad is confirmed running.
     try:
-        db.save_resume_snapshot(uid, sess.snapshot_active_engines())
+        _cur = _snapshot_with_account(sess)
+        if _cur and not pending_ads:
+            db.save_resume_snapshot(uid, _cur)
     except Exception:
         pass
+
+    # Cross-check every ad that was (or should have been) revived: confirm it is
+    # really running, and retry the ones that aren't — see _resume_verify_task.
+    if pending_ads:
+        _start_resume_verify(bot, uid, pending_ads)
 
     return resumed
 
@@ -12849,24 +13047,38 @@ async def _resume_user_engines(bot, uid: int, snapshot: dict) -> list:
 async def _auto_resume_agent_run_for_all(bot, context_label: str = "scheduled"):
     """Resume every eligible user's saved engines in one pass — used both
     right after the 2-hour scheduled reset and once at bot startup (to
-    cover a full redeploy, which wipes _sessions entirely). Silently
-    skips anyone without Auto Resume Agent approved+enabled or with
-    nothing saved to resume."""
-    resumed_count = 0
-    for user in db.get_all_users():
+    cover a full redeploy, which wipes _sessions entirely). Users are processed
+    a few at a time (a user waiting out a Bybit rate limit must not hold up
+    everyone behind them), and every skip is logged with its reason."""
+    sem = asyncio.Semaphore(4)
+    results = {"resumed": 0}
+
+    async def _one(user):
         uid = user.get("user_id")
-        if not uid or not db.get_auto_resume_agent_enabled(uid):
-            continue
+        if not uid:
+            return
+        if not user.get("auto_resume_enabled") and not user.get("auto_resume_snapshot"):
+            return                                  # never opted in — nothing to say
+        if not db.get_auto_resume_agent_enabled(uid):
+            # Explain WHY, so "it's on but didn't resume" is diagnosable from the log.
+            _st = db.auto_resume_agent_status(uid)["status"]
+            why = ("plan not active" if not db.is_pro(uid) else
+                   f"approval {_st}" if _st != "approved" else "switched OFF by the user")
+            if user.get("auto_resume_snapshot"):
+                logger.info(f"[AutoResume] user {uid} — skipped ({why})")
+            return
         snapshot = db.get_resume_snapshot(uid)
         if not snapshot:
-            continue
-        try:
-            resumed = await _resume_user_engines(bot, uid, snapshot)
-        except Exception as e:
-            logger.error(f"[AutoResume] user {uid} — resume failed ({context_label}): {e}")
-            continue
+            logger.info(f"[AutoResume] user {uid} — skipped (no saved snapshot — nothing was running at the last reset)")
+            return
+        async with sem:
+            try:
+                resumed = await _resume_user_engines(bot, uid, snapshot)
+            except Exception as e:
+                logger.error(f"[AutoResume] user {uid} — resume failed ({context_label}): {e}", exc_info=True)
+                return
         if resumed and bot:
-            resumed_count += 1
+            results["resumed"] += 1
             try:
                 await bot.send_message(
                     chat_id=uid,
@@ -12880,8 +13092,10 @@ async def _auto_resume_agent_run_for_all(bot, context_label: str = "scheduled"):
                 )
             except Exception as e:
                 logger.debug(f"[AutoResume] Could not notify user {uid}: {e}")
-    if resumed_count:
-        logger.info(f"[AutoResume] {context_label} pass — resumed engines for {resumed_count} user(s)")
+
+    await asyncio.gather(*[_one(u) for u in db.get_all_users()], return_exceptions=True)
+    if results["resumed"]:
+        logger.info(f"[AutoResume] {context_label} pass — resumed engines for {results['resumed']} user(s)")
 
 
 def _user_has_active_engines(sess) -> bool:
@@ -12995,59 +13209,63 @@ async def _session_auto_reset_loop(bot=None):
             notified = 0
 
             for _sess in get_all_sessions():
-                # Always trim memory sets regardless of active state
-                if len(_sess.seen_order_ids) > MAX_IDS:
-                    _sess.seen_order_ids = set(list(_sess.seen_order_ids)[-MAX_IDS:])
-                if len(_sess.paid_order_ids) > MAX_IDS:
-                    _sess.paid_order_ids = set(list(_sess.paid_order_ids)[-MAX_IDS:])
-                if len(_sess.seen_sell_ids) > MAX_IDS:
-                    _sess.seen_sell_ids = set(list(_sess.seen_sell_ids)[-MAX_IDS:])
-                if len(_sess.released_ids) > MAX_IDS:
-                    _sess.released_ids = set(list(_sess.released_ids)[-MAX_IDS:])
-                if len(_sess.seen_chat_msgs) > 30:
-                    _keep_keys = list(_sess.seen_chat_msgs.keys())[-30:]
-                    _sess.seen_chat_msgs = {k: _sess.seen_chat_msgs[k] for k in _keep_keys}
-                if len(_sess.unpaid_log) > 100:
-                    _sess.unpaid_log = _sess.unpaid_log[-100:]
-                if hasattr(_sess, "order_msg_ids") and len(_sess.order_msg_ids) > 200:
-                    _keep = list(_sess.order_msg_ids.items())[-200:]
-                    _sess.order_msg_ids = dict(_keep)
+                try:
+                    # Always trim memory sets regardless of active state
+                    if len(_sess.seen_order_ids) > MAX_IDS:
+                        _sess.seen_order_ids = set(list(_sess.seen_order_ids)[-MAX_IDS:])
+                    if len(_sess.paid_order_ids) > MAX_IDS:
+                        _sess.paid_order_ids = set(list(_sess.paid_order_ids)[-MAX_IDS:])
+                    if len(_sess.seen_sell_ids) > MAX_IDS:
+                        _sess.seen_sell_ids = set(list(_sess.seen_sell_ids)[-MAX_IDS:])
+                    if len(_sess.released_ids) > MAX_IDS:
+                        _sess.released_ids = set(list(_sess.released_ids)[-MAX_IDS:])
+                    if len(_sess.seen_chat_msgs) > 30:
+                        _keep_keys = list(_sess.seen_chat_msgs.keys())[-30:]
+                        _sess.seen_chat_msgs = {k: _sess.seen_chat_msgs[k] for k in _keep_keys}
+                    if len(_sess.unpaid_log) > 100:
+                        _sess.unpaid_log = _sess.unpaid_log[-100:]
+                    if hasattr(_sess, "order_msg_ids") and len(_sess.order_msg_ids) > 200:
+                        _keep = list(_sess.order_msg_ids.items())[-200:]
+                        _sess.order_msg_ids = dict(_keep)
 
-                # Snapshot what's active BEFORE resetting wipes it — this is
-                # the ONLY moment the "true" pre-reset state is still known
-                # for a user who has Auto Resume Agent enabled. Cheap no-op
-                # for everyone else (see _maybe_snapshot_resume_state).
-                _maybe_snapshot_resume_state(_sess.user_id)
+                    # Snapshot what's active BEFORE resetting wipes it — this is
+                    # the ONLY moment the "true" pre-reset state is still known
+                    # for a user who has Auto Resume Agent enabled. Cheap no-op
+                    # for everyone else (see _maybe_snapshot_resume_state).
+                    _maybe_snapshot_resume_state(_sess.user_id)
 
-                # Reset any user who has at least one active feature, then notify
-                was_reset = _reset_user_session(_sess)
-                if was_reset and bot:
-                    try:
-                        await bot.send_message(
-                            chat_id=_sess.user_id,
-                            text=(
-                                "🔄 Scheduled System Reset\n\n"
-                                "The bot performs an automatic reset every 2 hours to maintain "
-                                "optimal performance and prevent API rate-limit issues.\n\n"
-                                "Your running features have been stopped. This includes:\n"
-                                "• AD Price Bot (all active ads)\n"
-                                "• Order Monitor\n"
-                                "• Chat Monitor\n"
-                                "• Auto-Pay (Bybit / Flutterwave / Paga)\n"
-                                "• Sell Message\n"
-                                "• Ad Price Bot Auto Pay & Send Message\n"
-                                "• Buyer Protection & Name Match\n\n"
-                                "If you are currently trading, please tap /menu and "
-                                "re-enable the features you need.\n\n"
-                                "✅ Your ad settings — including Ad 2/Ad 3 and fetched ad "
-                                "details — API keys, and account settings are all kept "
-                                "exactly as you left them. You won't need to set anything "
-                                "up again, just restart the features above."
+                    # Reset any user who has at least one active feature, then notify
+                    was_reset = _reset_user_session(_sess)
+                    if was_reset and bot:
+                        try:
+                            await bot.send_message(
+                                chat_id=_sess.user_id,
+                                text=(
+                                    "🔄 Scheduled System Reset\n\n"
+                                    "The bot performs an automatic reset every 2 hours to maintain "
+                                    "optimal performance and prevent API rate-limit issues.\n\n"
+                                    "Your running features have been stopped. This includes:\n"
+                                    "• AD Price Bot (all active ads)\n"
+                                    "• Order Monitor\n"
+                                    "• Chat Monitor\n"
+                                    "• Auto-Pay (Bybit / Flutterwave / Paga)\n"
+                                    "• Sell Message\n"
+                                    "• Ad Price Bot Auto Pay & Send Message\n"
+                                    "• Buyer Protection & Name Match\n\n"
+                                    "If you are currently trading, please tap /menu and "
+                                    "re-enable the features you need.\n\n"
+                                    "✅ Your ad settings — including Ad 2/Ad 3 and fetched ad "
+                                    "details — API keys, and account settings are all kept "
+                                    "exactly as you left them. You won't need to set anything "
+                                    "up again, just restart the features above."
+                                )
                             )
-                        )
-                        notified += 1
-                    except Exception as _notify_err:
-                        logger.debug(f"[AutoReset] Could not notify user {_sess.user_id}: {_notify_err}")
+                            notified += 1
+                        except Exception as _notify_err:
+                            logger.debug(f"[AutoReset] Could not notify user {_sess.user_id}: {_notify_err}")
+                except Exception as _sess_err:
+                    # One user's bad state must never abort the cleanup/resume pass for everyone else.
+                    logger.error(f"[AutoReset] user {getattr(_sess, 'user_id', '?')} reset failed: {_sess_err}", exc_info=True)
 
             # Global dict trimming
             global _order_final_states, _order_action_locks, _flw_transfer_registry
@@ -13077,9 +13295,16 @@ async def _session_auto_reset_loop(bot=None):
             # running, right after the reset above stopped it. Runs after
             # the full reset pass (not interleaved with it) so every
             # snapshot is captured before anything starts getting resumed.
+        except Exception as e:
+            logger.error(f"[AutoReset] Error: {e}", exc_info=True)
+        # Auto Resume Agent — bring back whatever eligible users had running,
+        # right after the reset above stopped it. Deliberately OUTSIDE the cleanup
+        # try-block: an error anywhere in the cleanup used to skip this call and
+        # no user got anything resumed that cycle.
+        try:
             await _auto_resume_agent_run_for_all(bot, "scheduled 2-hour")
         except Exception as e:
-            logger.error(f"[AutoReset] Error: {e}")
+            logger.error(f"[AutoResume] scheduled pass failed: {e}", exc_info=True)
 async def _db_session_cleanup_loop():
     """Clear old disk session files every 12 hours."""
     while True:
