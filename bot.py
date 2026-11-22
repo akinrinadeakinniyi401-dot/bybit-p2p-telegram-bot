@@ -13881,6 +13881,134 @@ async def cmd_rejectresume(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────
+# 📋 /listusers — Admin user list with inline buttons (overrides admin_commands import)
+# ─────────────────────────────────────────
+# The old version cut one big HTML message at 4000 chars, which could slice a
+# <code> tag in half ("can't find end tag") once the list grew. This one escapes
+# every field, packs whole lines into pages (<=3500 chars) and navigates with
+# buttons:  ◀ Prev | 1/3 | Next ▶   and   All · Pro · Free · Expired · New
+# Callback data is "lu:<filter>:<page>" (stateless — recomputed on every tap).
+_LU_FILTERS = (("all", "All"), ("pro", "💎 Pro"), ("free", "Free"), ("expired", "⌛ Expired"), ("new", "🆕 New"))
+_LU_PAGE_CHARS = 3500
+
+
+def _lu_build(flt: str, page: int):
+    """Return (text, InlineKeyboardMarkup) for one page of the user list."""
+    if flt not in dict(_LU_FILTERS):
+        flt = "all"
+    all_users = db.get_all_users() or []
+
+    def _is_pro(u):
+        try:
+            return db.is_pro(int(u.get("user_id") or 0))
+        except Exception:
+            return False
+
+    def _created(u):
+        return str(u.get("created_at") or "")
+
+    pro_flags = {id(u): _is_pro(u) for u in all_users}
+    week_ago = (datetime.now() - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+    if flt == "pro":
+        users = [u for u in all_users if pro_flags[id(u)]]
+    elif flt == "free":
+        users = [u for u in all_users if not pro_flags[id(u)]]
+    elif flt == "expired":
+        users = [u for u in all_users if not pro_flags[id(u)]
+                 and (u.get("ever_pro") or u.get("pro_expired_at") or u.get("plan") == "pro")]
+    elif flt == "new":
+        users = [u for u in all_users if _created(u) >= week_ago]
+    else:
+        users = list(all_users)
+    users.sort(key=_created, reverse=True)       # newest first
+
+    pro_n = sum(1 for v in pro_flags.values() if v)
+    label = dict(_LU_FILTERS)[flt]
+    head = (f"👥 <b>Users — {_esc(label)}</b> ({len(users)})\n"
+            f"Total {len(all_users)} · 💎 Pro {pro_n} · Free {len(all_users) - pro_n}\n")
+
+    lines = []
+    for n, u in enumerate(users, 1):
+        uid   = u.get("user_id")
+        name  = _esc((u.get("display_name") or u.get("full_name") or "").strip()[:30]) or "—"
+        uname = f"@{_esc(str(u.get('username')))}" if u.get("username") else "no username"
+        if pro_flags[id(u)]:
+            exp = u.get("plan_expires")
+            plan = f"💎 Pro · {_esc(str(exp)[:10])}" if exp else "💎 Pro · lifetime"
+        else:
+            plan = "Free"
+        lines.append(f"{n}. <code>{uid}</code> {name} ({uname}) — {plan}")
+
+    pages, cur, size = [], [], 0
+    for ln in lines:
+        if size + len(ln) + 1 > _LU_PAGE_CHARS and cur:
+            pages.append(cur); cur, size = [], 0
+        cur.append(ln); size += len(ln) + 1
+    if cur:
+        pages.append(cur)
+    total_pages = max(1, len(pages))
+    page = max(0, min(page, total_pages - 1))
+
+    body = "\n".join(pages[page]) if pages else "No users match."
+    text = f"{head}\n{body}"
+
+    rows = []
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("◀ Prev", callback_data=f"lu:{flt}:{page-1}"))
+        nav.append(InlineKeyboardButton(f"📄 {page+1}/{total_pages}", callback_data=f"lu:{flt}:{page}"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton("Next ▶", callback_data=f"lu:{flt}:{page+1}"))
+        rows.append(nav)
+    fb = [InlineKeyboardButton(("✓ " if k == flt else "") + lbl, callback_data=f"lu:{k}:0")
+          for k, lbl in _LU_FILTERS]
+    rows.append(fb[:3])
+    rows.append(fb[3:])
+    return text, InlineKeyboardMarkup(rows)
+
+
+async def cmd_listusers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("❌ Admin only.")
+        return
+    flt = (context.args[0].lower() if getattr(context, "args", None) else "all")
+    text, kb = _lu_build(flt, 0)
+    try:
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
+    except Exception as e:
+        logger.warning(f"[ListUsers] HTML send failed ({e}) — resending as plain text")
+        import re as _re
+        await update.message.reply_text(_re.sub(r"<[^>]+>", "", text), reply_markup=kb)
+
+
+async def listusers_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    if q.from_user.id not in ADMIN_IDS:
+        await q.answer("Admin only.", show_alert=True)
+        return
+    try:
+        _, flt, pg = q.data.split(":")
+        pg = int(pg)
+    except Exception:
+        await q.answer()
+        return
+    text, kb = _lu_build(flt, pg)
+    try:
+        await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+    except Exception as e:
+        if "not modified" not in str(e).lower():
+            logger.warning(f"[ListUsers] edit failed ({e}) — retrying as plain text")
+            try:
+                import re as _re
+                await q.edit_message_text(_re.sub(r"<[^>]+>", "", text), reply_markup=kb)
+            except Exception as e2:
+                if "not modified" not in str(e2).lower():
+                    logger.warning(f"[ListUsers] plain edit failed: {e2}")
+    await q.answer()
+
+
+# ─────────────────────────────────────────
 # 📊 /userdata — Admin export (overrides admin_commands import)
 # Includes total_buy_orders + total_sell_orders from DB and live session.
 # ─────────────────────────────────────────
@@ -14034,6 +14162,7 @@ def start_bot():
     application.add_handler(CommandHandler("rejectwithdraw",   cmd_rejectwithdraw))
     application.add_handler(CommandHandler("broadcast",        broadcast_command))
 
+    application.add_handler(CallbackQueryHandler(listusers_callback, pattern=r"^lu:"))
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.PHOTO | filters.VIDEO, broadcast_media_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
